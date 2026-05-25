@@ -5817,7 +5817,9 @@ with st.spinner("Loading…"):
     try:
         a = run_analysis("BTC-USD")
     except Exception as e:
+        import traceback
         st.error(f"Analysis failed: {e}")
+        st.code(traceback.format_exc())
         st.stop()
 
 if not a:
