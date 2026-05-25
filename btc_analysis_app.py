@@ -5765,7 +5765,8 @@ with st.sidebar:
     _refresh_count = st_autorefresh(interval=5 * 60 * 1000, key="autorefresh_main")
     if _refresh_count > 0:
         st.cache_data.clear()
-    _last_refreshed = _dt.now(_tz.utc).strftime("%H:%M:%S UTC")
+    _SGT = _tz(offset=__import__("datetime").timedelta(hours=8))
+    _last_refreshed = _dt.now(_SGT).strftime("%H:%M:%S SGT")
     st.caption(f"Auto-refreshes every 5 min · Liquidity every 2 min")
     st.caption(f"🕐 Last refreshed: {_last_refreshed}")
     st.divider()
@@ -6437,7 +6438,8 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
         try:
             _ts = _dt.fromisoformat(_r["ts"]).timestamp()
             if _ts >= _cutoff_72h:
-                _local_ts = _dt.fromisoformat(_r["ts"]).astimezone().replace(tzinfo=None)
+                _sgt = _tz(offset=__import__("datetime").timedelta(hours=8))
+                _local_ts = _dt.fromisoformat(_r["ts"]).astimezone(_sgt).replace(tzinfo=None)
                 _hist_rows.append((_local_ts, float(_r["score"])))
         except Exception:
             continue
