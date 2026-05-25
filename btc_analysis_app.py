@@ -5988,10 +5988,10 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# Signal breakdown inside expander — 2 rows, 6 then 5
-with st.expander("📊 72h Bias — Signal Breakdown (11 signals)", expanded=False):
+# Signal breakdown inside expander — 2 rows of 6 (dynamic)
+with st.expander(f"📊 72h Bias — Signal Breakdown ({len(_b12_sigs)} signals)", expanded=False):
     _sig_items = list(_b12_sigs.items())
-    # Row 1: first 6 signals (Polymarket + 5 others)
+    # Row 1: first 6 signals
     _row1_cols = st.columns(6)
     for _ci, (_sn, (_sv, _se)) in enumerate(_sig_items[:6]):
         _wt      = _b12_wts[_sn]
@@ -6007,9 +6007,10 @@ with st.expander("📊 72h Bias — Signal Breakdown (11 signals)", expanded=Fal
   <div style="font-size:9px; color:#8b949e; margin-top:5px; line-height:1.3;">{_se}</div>
 </div>
 """, unsafe_allow_html=True)
-    # Row 2: remaining 5 signals
-    _row2_cols = st.columns(5)
-    for _ci, (_sn, (_sv, _se)) in enumerate(_sig_items[6:]):
+    # Row 2: remaining signals (up to 6)
+    _row2_items = _sig_items[6:]
+    _row2_cols = st.columns(len(_row2_items))
+    for _ci, (_sn, (_sv, _se)) in enumerate(_row2_items):
         _wt      = _b12_wts[_sn]
         _contrib = _sv * _wt * 100
         _pcol    = "#3fb950" if _sv > 0.05 else ("#f85149" if _sv < -0.05 else "#8b949e")
