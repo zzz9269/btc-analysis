@@ -5765,7 +5765,7 @@ with st.sidebar:
     _refresh_count = st_autorefresh(interval=5 * 60 * 1000, key="autorefresh_main")
     if _refresh_count > 0:
         st.cache_data.clear()
-    _last_refreshed = _dt.now().strftime("%H:%M:%S")
+    _last_refreshed = _dt.now(_tz.utc).strftime("%H:%M:%S UTC")
     st.caption(f"Auto-refreshes every 5 min · Liquidity every 2 min")
     st.caption(f"🕐 Last refreshed: {_last_refreshed}")
     st.divider()
