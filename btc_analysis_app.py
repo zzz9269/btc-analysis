@@ -3111,9 +3111,11 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
         _daily_dir = 0
     _COHERENCE_DAMP = 0.50   # liq signals dampened to 50% when opposing daily trend
 
-    # 11 signals total; weights sum to 1.00.
-    # Polymarket thesis score (0.20) is the primary external sentiment anchor.
-    # All prior weights scaled ×0.80 to accommodate it while keeping sum = 1.00.
+    # 12 signals total; weights sum to 1.00.
+    # Polymarket thesis score is the primary external sentiment anchor.
+    # OBV added (4%) — accumulation/distribution is highly predictive of 72h direction.
+    # OB Depth reduced 4%→2% (redundant with cascade/hunt-zone at higher fidelity).
+    # Candlestick reduced 3%→1% (1h patterns too noisy for 72h forecast).
     WEIGHTS = {
         # Sentiment / Prediction Markets  22% — slow-moving, anchors the bias
         "Polymarket Sentiment": 0.22,
@@ -3123,16 +3125,18 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
         "RSI Level":            0.12,
         "MACD Momentum":        0.08,
         "Stochastic Zone":      0.04,
-        # Liquidity / Hunt Zones          10% — real-time, down from 22%
+        # Liquidity / Hunt Zones          10% — real-time
         "Hunt Zone Pull":       0.10,
-        # Liquidation / Cascade Data       8% — real-time, down from 17%
+        # Liquidation / Cascade Data       8% — real-time
         "Cascade Direction":    0.08,
-        # Order Book / CVD                 8%
-        "Order Book Depth":     0.04,
+        # Volume / Accumulation            4% — OBV trend (new)
+        "OBV Trend":            0.04,
+        # Order Book / CVD                 6% (OB depth reduced, momentum kept)
+        "Order Book Depth":     0.02,
         "Short Momentum":       0.04,
-        # Candle / Divergence              4%
+        # Candle / Divergence              3%
         "RSI Divergence":       0.03,
-        "Candlestick":          0.03,
+        "Candlestick":          0.01,
     }
     _SMOOTH_N = 5   # rolling window for noisy liq signals (≈10 min at 2-min refresh)
 
@@ -3268,7 +3272,13 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
         rsi    = float(rsi_s.dropna().iloc[-1])
         rsi_5  = float(rsi_s.dropna().iloc[-5]) if len(rsi_s.dropna()) >= 5 else rsi
         rising = rsi > rsi_5
-        slope_bonus = +0.15 if (rising and rsi < 50) else (-0.15 if (not rising and rsi > 50) else 0.0)
+        # Slope bonus applies in all zones — momentum direction matters regardless of level.
+        # Rising RSI = building momentum (bullish), falling RSI = fading (bearish).
+        # Bonus is larger when moving away from extremes (most predictive for 72h).
+        if rising:
+            slope_bonus = +0.20 if rsi < 40 else +0.10   # stronger signal recovering from oversold
+        else:
+            slope_bonus = -0.20 if rsi > 60 else -0.10   # stronger signal fading from overbought
         if   rsi < 20: base =  1.00
         elif rsi < 30: base =  0.75
         elif rsi < 40: base =  0.40
@@ -3407,6 +3417,24 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
         raw, note = 0.0, "Pattern N/A"
     signals["Candlestick"] = (raw, note)
     weighted_sum += raw * WEIGHTS["Candlestick"]
+
+    # ── 12. OBV Trend — on daily candles ──────────────────────────
+    # Strong accumulation (OBV rising while price flat/down) = smart money buying.
+    # Strong distribution (OBV falling while price flat/up) = smart money selling.
+    # Uses daily df for a stable multi-day view rather than noisy 1h OBV.
+    try:
+        _obv_trend = calculate_obv_trend(df)
+        if   _obv_trend == "strong_accumulation":  raw, note = +1.0, "OBV: strong accumulation (smart money buying into weakness)"
+        elif _obv_trend == "accumulation":          raw, note = +0.6, "OBV: accumulation (OBV rising with price)"
+        elif _obv_trend == "mild_accumulation":     raw, note = +0.3, "OBV: mild accumulation"
+        elif _obv_trend == "strong_distribution":   raw, note = -1.0, "OBV: strong distribution (smart money selling into strength)"
+        elif _obv_trend == "distribution":          raw, note = -0.6, "OBV: distribution (OBV falling with price)"
+        elif _obv_trend == "mild_distribution":     raw, note = -0.3, "OBV: mild distribution"
+        else:                                       raw, note =  0.0, "OBV: neutral — no clear accumulation or distribution"
+    except Exception:
+        raw, note = 0.0, "OBV N/A"
+    signals["OBV Trend"] = (raw, note)
+    weighted_sum += raw * WEIGHTS["OBV Trend"]
 
     # ── Final score — EMA-smoothed to suppress refresh-to-refresh noise ──────
     # α=0.30 → half-life ~2 refreshes (~4 min at 2-min cadence).
