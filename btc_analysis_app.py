@@ -2806,7 +2806,7 @@ def _narrative(liq, a):
     if ratio > 1.4:
         imb_txt = f"{ratio:.1f}x more bids than asks — order book is bid-heavy"
     elif ratio < 0.7:
-        imb_txt = f"{1/ratio:.1f}x more asks than bids — order book is ask-heavy"
+        imb_txt = f"{(1/ratio if ratio > 0 else float('inf')):.1f}x more asks than bids — order book is ask-heavy"
     else:
         imb_txt = f"balanced ({ratio:.1f}x bid/ask)"
     L.append("ORDER BOOK WALLS  (large resting limit orders — not liquidations)")
@@ -5817,9 +5817,7 @@ with st.spinner("Loading…"):
     try:
         a = run_analysis("BTC-USD")
     except Exception as e:
-        import traceback
         st.error(f"Analysis failed: {e}")
-        st.code(traceback.format_exc())
         st.stop()
 
 if not a:
