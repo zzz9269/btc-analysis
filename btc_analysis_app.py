@@ -6472,8 +6472,7 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
         _sa.text(1.002, -25, "−25",  transform=_sa.get_yaxis_transform(), fontsize=6, color="#f85149", va="center")
         _sa.text(1.002, -40, "−40",  transform=_sa.get_yaxis_transform(), fontsize=6, color="#f85149", va="center")
 
-        _pad = max(20, abs(max(_hist_scores, key=abs)) * 0.3)
-        _sa.set_ylim(max(-100, min(_hist_scores) - _pad), min(100, max(_hist_scores) + _pad))
+        _sa.set_ylim(-75, 75)
         _sa.set_ylabel("Bias Score", color="#8b949e", fontsize=7)
         _sa.tick_params(colors="#8b949e", labelsize=7)
         for _sp in _sa.spines.values(): _sp.set_edgecolor("#30363d")
