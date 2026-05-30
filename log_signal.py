@@ -150,27 +150,25 @@ print(f"  price=${price:,.2f}  score={score:+.1f}  label={label}  direction={dir
 
 
 # ─────────────────────────────────────────────────────────────────
-# 2. Log this tick if |score| >= 25 (matches app behavior)
+# 2. Log every tick (matches the local app — chart needs continuity;
+#    calibration buckets filter to |score|>=25 themselves).
 # ─────────────────────────────────────────────────────────────────
-if abs(score) >= 25:
-    row = {
-        "ts":          datetime.now(timezone.utc).isoformat(),
-        "score":       round(score, 1),
-        "label":       label,
-        "direction":   direction,
-        "entry_price": round(price, 2),
-        "exit_price":  None,
-        "pct_move":    None,
-        "correct":     None,
-    }
-    inserted = _supa("POST", f"/{TABLE}", body=row)
-    if inserted:
-        print(f"  ✓ logged signal id={inserted[0].get('id') if isinstance(inserted, list) else '?'}")
-    else:
-        print("  ✗ Supabase insert failed (see error above)")
-        sys.exit(4)
+row = {
+    "ts":          datetime.now(timezone.utc).isoformat(),
+    "score":       round(score, 1),
+    "label":       label,
+    "direction":   direction,
+    "entry_price": round(price, 2),
+    "exit_price":  None,
+    "pct_move":    None,
+    "correct":     None,
+}
+inserted = _supa("POST", f"/{TABLE}", body=row)
+if inserted:
+    print(f"  ✓ logged signal id={inserted[0].get('id') if isinstance(inserted, list) else '?'}")
 else:
-    print(f"  |score|={abs(score):.1f} < 25 — not logging (HOLD)")
+    print("  ✗ Supabase insert failed (see error above)")
+    sys.exit(4)
 
 
 # ─────────────────────────────────────────────────────────────────

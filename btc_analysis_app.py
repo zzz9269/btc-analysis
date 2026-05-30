@@ -174,86 +174,108 @@ def _supa_fetch_signals() -> "list | None":
 
 def _resolve_signal_outcomes(current_price: float) -> list:
     """Return all signal rows with outcomes filled where age ≥ _OUTCOME_HOURS.
-    Prefers Supabase as source of truth (the GitHub Actions cron keeps it
-    populated 24/7). Falls back to local CSV when Supabase is unreachable."""
+    Merges the local CSV (historical, written when this PC ran the app) with
+    Supabase (server-side, written by the GitHub Actions cron). Supabase wins
+    on duplicate timestamps because it's authoritative for resolved outcomes."""
 
-    # ── Path 1: Supabase (server-side, always up to date) ────────────────
-    if _supa_available():
-        rows = _supa_fetch_signals()
-        if rows is not None:
-            # Resolve any unresolved rows older than the outcome window
-            now = _dt.now(_tz.utc)
-            for row in rows:
-                if row.get("correct") or not row.get("entry_price"):
-                    continue
-                try:
-                    age = (now - _dt.fromisoformat(row["ts"])).total_seconds() / 3600
-                    if age < _OUTCOME_HOURS:
-                        continue
-                    ep  = float(row["entry_price"])
-                    pct = (current_price - ep) / ep * 100
-                    d   = row["direction"]
-                    _dir_right = (d == "LONG" and pct > 0) or (d == "SHORT" and pct < 0)
-                    correct = (
-                        "2"   if _dir_right and abs(pct) >= 3.0
-                        else "1"   if _dir_right
-                        else "N/A" if d == "HOLD"
-                        else "0"
-                    )
-                    # Patch on Supabase (idempotent — uses ts as filter)
-                    _supa_request(
-                        "PATCH",
-                        f"/rest/v1/signal_log?ts=eq.{urllib.parse.quote(row['ts'])}",
-                        body={
-                            "exit_price": round(current_price, 2),
-                            "pct_move":   round(pct, 2),
-                            "correct":    correct,
-                        },
-                    )
-                    # Reflect locally so the UI sees the update this render
-                    row["exit_price"] = str(round(current_price, 2))
-                    row["pct_move"]   = f"{pct:+.2f}"
-                    row["correct"]    = correct
-                except Exception:
-                    pass
-            return rows
-
-    # ── Path 2: Local CSV (offline / Supabase down) ──────────────────────
-    if not _SIGNAL_LOG.exists():
-        return []
     now = _dt.now(_tz.utc)
-    rows, changed = [], False
-    try:
-        with open(_SIGNAL_LOG, newline="") as f:
-            for row in _csv.DictReader(f):
-                if not row.get("correct") and row.get("entry_price"):
-                    try:
-                        age = (now - _dt.fromisoformat(row["ts"])).total_seconds() / 3600
-                        if age >= _OUTCOME_HOURS:
-                            ep  = float(row["entry_price"])
-                            pct = (current_price - ep) / ep * 100
-                            d   = row["direction"]
-                            row["exit_price"] = str(round(current_price, 2))
-                            row["pct_move"]   = f"{pct:+.2f}"
-                            _dir_right = (d == "LONG" and pct > 0) or (d == "SHORT" and pct < 0)
-                            row["correct"] = (
-                                "2"   if _dir_right and abs(pct) >= 3.0
-                                else "1"   if _dir_right
-                                else "N/A" if d == "HOLD"
-                                else "0"
-                            )
-                            changed = True
-                    except Exception:
-                        pass
-                rows.append(row)
-        if changed:
+
+    # ── Load Supabase rows (may be empty list if cron hasn't logged yet) ─
+    supa_rows = _supa_fetch_signals() if _supa_available() else None
+    supa_rows = supa_rows or []
+    supa_ts   = {r.get("ts") for r in supa_rows if r.get("ts")}
+
+    # ── Load local CSV rows (skipping any ts already present in Supabase) ─
+    csv_rows = []
+    if _SIGNAL_LOG.exists():
+        try:
+            with open(_SIGNAL_LOG, newline="") as f:
+                for row in _csv.DictReader(f):
+                    if row.get("ts") and row["ts"] not in supa_ts:
+                        csv_rows.append(row)
+        except Exception:
+            pass
+
+    # ── Resolve outcomes on CSV rows (in-memory + write back if changed) ─
+    csv_changed = False
+    for row in csv_rows:
+        if row.get("correct") or not row.get("entry_price"):
+            continue
+        try:
+            age = (now - _dt.fromisoformat(row["ts"])).total_seconds() / 3600
+            if age < _OUTCOME_HOURS:
+                continue
+            ep  = float(row["entry_price"])
+            pct = (current_price - ep) / ep * 100
+            d   = row["direction"]
+            _dir_right = (d == "LONG" and pct > 0) or (d == "SHORT" and pct < 0)
+            row["exit_price"] = str(round(current_price, 2))
+            row["pct_move"]   = f"{pct:+.2f}"
+            row["correct"] = (
+                "2"   if _dir_right and abs(pct) >= 3.0
+                else "1"   if _dir_right
+                else "N/A" if d == "HOLD"
+                else "0"
+            )
+            csv_changed = True
+        except Exception:
+            pass
+    if csv_changed:
+        try:
+            # Re-read full CSV (including rows we skipped above) and write back
+            all_rows = []
+            with open(_SIGNAL_LOG, newline="") as f:
+                for r in _csv.DictReader(f):
+                    all_rows.append(r)
+            # Overlay our resolved updates
+            by_ts = {r["ts"]: r for r in csv_rows}
+            for i, r in enumerate(all_rows):
+                if r.get("ts") in by_ts:
+                    all_rows[i] = by_ts[r["ts"]]
             with open(_SIGNAL_LOG, "w", newline="") as f:
                 w = _csv.DictWriter(f, fieldnames=_LOG_FIELDS)
                 w.writeheader()
-                w.writerows(rows)
-    except Exception:
-        pass
-    return rows
+                w.writerows(all_rows)
+        except Exception:
+            pass
+
+    # ── Resolve outcomes on Supabase rows (PATCH back to remote) ─────────
+    for row in supa_rows:
+        if row.get("correct") or not row.get("entry_price"):
+            continue
+        try:
+            age = (now - _dt.fromisoformat(row["ts"])).total_seconds() / 3600
+            if age < _OUTCOME_HOURS:
+                continue
+            ep  = float(row["entry_price"])
+            pct = (current_price - ep) / ep * 100
+            d   = row["direction"]
+            _dir_right = (d == "LONG" and pct > 0) or (d == "SHORT" and pct < 0)
+            correct = (
+                "2"   if _dir_right and abs(pct) >= 3.0
+                else "1"   if _dir_right
+                else "N/A" if d == "HOLD"
+                else "0"
+            )
+            _supa_request(
+                "PATCH",
+                f"/rest/v1/signal_log?ts=eq.{urllib.parse.quote(row['ts'])}",
+                body={
+                    "exit_price": round(current_price, 2),
+                    "pct_move":   round(pct, 2),
+                    "correct":    correct,
+                },
+            )
+            row["exit_price"] = str(round(current_price, 2))
+            row["pct_move"]   = f"{pct:+.2f}"
+            row["correct"]    = correct
+        except Exception:
+            pass
+
+    # ── Merge + sort by ts ascending ─────────────────────────────────────
+    merged = csv_rows + supa_rows
+    merged.sort(key=lambda r: r.get("ts") or "")
+    return merged
 
 
 def _accuracy_stats(rows: list) -> dict:
@@ -4058,13 +4080,13 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
     # Normalize: std=0 → conviction=1.0, std=0.7 (max for ±1 distribution) → conviction≈0
     _conviction = round(max(0.0, 1.0 - _sig_std / 0.70), 2)
 
-    # ── Final score — EMA-smoothed (α=0.65) to suppress refresh-to-refresh noise ──
+    # ── Final score — raw, clipped to [-100, +100]. Smoothing happens once
+    # at the gauge layer (α=0.50) so behavior is consistent across local app
+    # and headless cron (where st.session_state is stubbed). Previously this
+    # block applied a second α=0.65 EMA that compounded with the gauge EMA
+    # locally but was a no-op in cron, contaminating logged data.
     _raw_score = max(-100.0, min(100.0, weighted_sum * 100))
-    _EMA_KEY   = "_bias_score_ema"
-    _prev      = st.session_state.get(_EMA_KEY, _raw_score)
-    _smoothed  = 0.65 * _raw_score + 0.35 * _prev
-    st.session_state[_EMA_KEY] = _smoothed
-    score = round(_smoothed, 1)
+    score = round(_raw_score, 1)
 
     if   score >=  70: label, color = "STRONG BULL", "#3fb950"
     elif score >=  40: label, color = "BULL BIAS",   "#58a6ff"
@@ -8086,7 +8108,9 @@ _sig_rows = _resolve_signal_outcomes(price)
 _now_ts   = _dt.now(_tz.utc).timestamp()
 _last_log = st.session_state.get("_last_log_ts", 0)
 if _now_ts - _last_log >= _LOG_INTERVAL:
-    _log_bias_signal(_b12_score, _b12_label, price)
+    # Log the raw (unsmoothed) score + label so values match what the
+    # headless cron writes — calibration must be environment-independent.
+    _log_bias_signal(_b12_score_raw, bias_72h.get("label", _b12_label), price)
     st.session_state["_last_log_ts"] = _now_ts
 
 # Signal stability — consecutive same-direction refreshes
