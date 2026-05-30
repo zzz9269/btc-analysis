@@ -3,7 +3,7 @@ BTC Analysis — Streamlit App
 Converted from btc_analysis.ipynb
 """
 
-import warnings, os, csv as _csv, urllib.request, urllib.parse, json as _json
+import warnings, os, csv as _csv, urllib.request, urllib.parse, json as _json, io as _io
 from pathlib import Path as _Path
 from datetime import datetime as _dt, timezone as _tz
 import numpy as np
@@ -107,61 +107,121 @@ def _supa_request(method: str, path: str, body=None) -> "dict | list | None":
 # ════════════════════════════════════════════════════════════════
 
 def _log_bias_signal(score: float, label: str, price: float) -> None:
-    if abs(score) < 10:
-        return   # skip only pure noise near zero
+    """Append one row to the signal log. Prefers Supabase when configured;
+    always also writes the local CSV as an offline backup."""
     direction = "LONG" if score >= 25 else ("SHORT" if score <= -25 else "HOLD")
-    row = {"ts": _dt.now(_tz.utc).isoformat(), "score": round(score, 1),
-           "label": label, "direction": direction,
-           "entry_price": round(price, 2), "exit_price": "", "pct_move": "", "correct": ""}
+    ts = _dt.now(_tz.utc).isoformat()
+
+    # ── Supabase (server-side, runs even when this PC is off via cron) ────
     if _supa_available():
-        _supa_request("POST", "/rest/v1/signal_log", row)
-    else:
-        write_hdr = not _SIGNAL_LOG.exists()
         try:
-            with open(_SIGNAL_LOG, "a", newline="") as f:
-                w = _csv.writer(f)
-                if write_hdr:
-                    w.writerow(_LOG_FIELDS)
-                w.writerow([row["ts"], row["score"], row["label"], row["direction"],
-                            row["entry_price"], "", "", ""])
+            _supa_request("POST", "/rest/v1/signal_log", body={
+                "ts":          ts,
+                "score":       round(score, 1),
+                "label":       label,
+                "direction":   direction,
+                "entry_price": round(price, 2),
+                "exit_price":  None,
+                "pct_move":    None,
+                "correct":     None,
+            })
         except Exception:
             pass
 
+    # ── Local CSV backup (so the app still works without internet) ────────
+    write_hdr = not _SIGNAL_LOG.exists()
+    try:
+        with open(_SIGNAL_LOG, "a", newline="") as f:
+            w = _csv.writer(f)
+            if write_hdr:
+                w.writerow(_LOG_FIELDS)
+            w.writerow([ts, round(score, 1), label, direction,
+                        round(price, 2), "", "", ""])
+    except Exception:
+        pass
+
+
+def _supa_fetch_signals() -> "list | None":
+    """Fetch all signal_log rows from Supabase, normalised to the CSV
+    row format the rest of the app expects. Returns None on failure."""
+    if not _supa_available():
+        return None
+    try:
+        # Pull up to 10k rows ordered by ts ascending — plenty for live history.
+        raw = _supa_request(
+            "GET",
+            "/rest/v1/signal_log?select=ts,score,label,direction,entry_price,"
+            "exit_price,pct_move,correct&order=ts.asc&limit=10000",
+        )
+        if not isinstance(raw, list):
+            return None
+        rows = []
+        for r in raw:
+            rows.append({
+                "ts":          r.get("ts") or "",
+                "score":       "" if r.get("score") is None       else str(r["score"]),
+                "label":       r.get("label") or "",
+                "direction":   r.get("direction") or "",
+                "entry_price": "" if r.get("entry_price") is None else str(r["entry_price"]),
+                "exit_price":  "" if r.get("exit_price")  is None else str(r["exit_price"]),
+                "pct_move":    "" if r.get("pct_move")    is None else str(r["pct_move"]),
+                "correct":     "" if r.get("correct")     is None else str(r["correct"]),
+            })
+        return rows
+    except Exception:
+        return None
+
 
 def _resolve_signal_outcomes(current_price: float) -> list:
-    """Fill outcomes for signals that are ≥ _OUTCOME_HOURS old. Returns all rows."""
-    now = _dt.now(_tz.utc)
+    """Return all signal rows with outcomes filled where age ≥ _OUTCOME_HOURS.
+    Prefers Supabase as source of truth (the GitHub Actions cron keeps it
+    populated 24/7). Falls back to local CSV when Supabase is unreachable."""
 
+    # ── Path 1: Supabase (server-side, always up to date) ────────────────
     if _supa_available():
-        rows = _supa_request("GET", "/rest/v1/signal_log?order=ts.asc") or []
-        changed = False
-        for row in rows:
-            if row.get("correct") or not row.get("entry_price"):
-                continue
-            try:
-                age = (now - _dt.fromisoformat(row["ts"])).total_seconds() / 3600
-                if age >= _OUTCOME_HOURS:
+        rows = _supa_fetch_signals()
+        if rows is not None:
+            # Resolve any unresolved rows older than the outcome window
+            now = _dt.now(_tz.utc)
+            for row in rows:
+                if row.get("correct") or not row.get("entry_price"):
+                    continue
+                try:
+                    age = (now - _dt.fromisoformat(row["ts"])).total_seconds() / 3600
+                    if age < _OUTCOME_HOURS:
+                        continue
                     ep  = float(row["entry_price"])
                     pct = (current_price - ep) / ep * 100
                     d   = row["direction"]
-                    correct = ("1" if (d == "LONG" and pct > 0) or (d == "SHORT" and pct < 0)
-                               else "N/A" if d == "HOLD" else "0")
-                    _supa_request("PATCH",
+                    _dir_right = (d == "LONG" and pct > 0) or (d == "SHORT" and pct < 0)
+                    correct = (
+                        "2"   if _dir_right and abs(pct) >= 3.0
+                        else "1"   if _dir_right
+                        else "N/A" if d == "HOLD"
+                        else "0"
+                    )
+                    # Patch on Supabase (idempotent — uses ts as filter)
+                    _supa_request(
+                        "PATCH",
                         f"/rest/v1/signal_log?ts=eq.{urllib.parse.quote(row['ts'])}",
-                        {"exit_price": round(current_price, 2),
-                         "pct_move":   f"{pct:+.2f}",
-                         "correct":    correct})
+                        body={
+                            "exit_price": round(current_price, 2),
+                            "pct_move":   round(pct, 2),
+                            "correct":    correct,
+                        },
+                    )
+                    # Reflect locally so the UI sees the update this render
                     row["exit_price"] = str(round(current_price, 2))
                     row["pct_move"]   = f"{pct:+.2f}"
                     row["correct"]    = correct
-                    changed = True
-            except Exception:
-                pass
-        return rows
+                except Exception:
+                    pass
+            return rows
 
-    # ── CSV fallback (local) ──────────────────────────────────────
+    # ── Path 2: Local CSV (offline / Supabase down) ──────────────────────
     if not _SIGNAL_LOG.exists():
         return []
+    now = _dt.now(_tz.utc)
     rows, changed = [], False
     try:
         with open(_SIGNAL_LOG, newline="") as f:
@@ -175,9 +235,10 @@ def _resolve_signal_outcomes(current_price: float) -> list:
                             d   = row["direction"]
                             row["exit_price"] = str(round(current_price, 2))
                             row["pct_move"]   = f"{pct:+.2f}"
-                            row["correct"]    = (
-                                "1"   if (d == "LONG"  and pct > 0) or
-                                         (d == "SHORT" and pct < 0)
+                            _dir_right = (d == "LONG" and pct > 0) or (d == "SHORT" and pct < 0)
+                            row["correct"] = (
+                                "2"   if _dir_right and abs(pct) >= 3.0
+                                else "1"   if _dir_right
                                 else "N/A" if d == "HOLD"
                                 else "0"
                             )
@@ -188,7 +249,8 @@ def _resolve_signal_outcomes(current_price: float) -> list:
         if changed:
             with open(_SIGNAL_LOG, "w", newline="") as f:
                 w = _csv.DictWriter(f, fieldnames=_LOG_FIELDS)
-                w.writeheader(); w.writerows(rows)
+                w.writeheader()
+                w.writerows(rows)
     except Exception:
         pass
     return rows
@@ -208,12 +270,12 @@ def _accuracy_stats(rows: list) -> dict:
     for label, lo, hi in buckets:
         vals, moves = [], []
         for r in rows:
-            if r.get("correct") not in ("0", "1"):
+            if r.get("correct") not in ("0", "1", "2"):
                 continue
             try:
                 s = float(r["score"])
                 if lo <= s <= hi:
-                    vals.append(int(r["correct"]))
+                    vals.append(1 if r["correct"] in ("1", "2") else 0)
                     if r.get("pct_move"):
                         moves.append(float(r["pct_move"]))
             except Exception:
@@ -337,7 +399,7 @@ def _backtest_tech_signals(days: int = 55) -> dict:
 
         stats   = _accuracy_stats(rows)
         total   = len(rows)
-        overall = round(sum(1 for r in rows if r["correct"] == "1") / total * 100, 1) if total else None
+        overall = round(sum(1 for r in rows if r["correct"] in ("1", "2")) / total * 100, 1) if total else None
         return {"stats": stats, "total": total, "overall_acc": overall,
                 "bars": len(df), "days": days, "rows": rows}
     except Exception:
@@ -350,6 +412,13 @@ def _backtest_tech_signals(days: int = 55) -> dict:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_ohlc(ticker: str, days: int = LOOKBACK_DAYS) -> pd.DataFrame:
+    # Prefer Binance daily klines for BTC — single source of truth across the app.
+    # Last candle is the live current-day candle (Close = live spot price).
+    if "BTC" in ticker.upper():
+        _bn = _fetch_binance_klines("1d", min(days, 1000))
+        if _bn is not None and len(_bn) >= MIN_DAYS:
+            return _bn
+    # yfinance fallback (and primary path for non-BTC tickers)
     for method in ["history", "download"]:
         try:
             if method == "history":
@@ -749,83 +818,94 @@ def _call_polymarket_ai(market_strings: list, api_key: str) -> "dict | None":
         return None
 
 
-_CLAUDE_SYSTEM_PROMPT = """You are an expert Bitcoin trading analyst embedded in a real-time BTC dashboard. Synthesise every signal into one clear, actionable verdict. Be direct. No hedging words (could, potentially, may, it's possible).
+_CLAUDE_SYSTEM_PROMPT = """You are an expert Bitcoin trading analyst embedded in a real-time BTC dashboard. Synthesise every signal into one clear, actionable verdict. Be direct. No hedging words.
 
-## SIGNAL HIERARCHY (by weight — respect this order when signals conflict)
+## ENGINE ARCHITECTURE
+Two parallel engines: **72h bias** (24–72h horizon, score ±100, 16 signals) and **24h bias** (intraday, score ±100, 13 signals). Both use ADX-based regime switching (TREND / RANGE / TRANSITION) which dynamically shifts signal weights. The actual current weights (post-regime, post-decay) are shown next to each signal in the data — trust those numbers, not generic priors.
 
-**Tier 1 — Primary anchors (22% each):**
-- Polymarket Sentiment: real-money prediction-market crowd thesis, confidence-adjusted. Highest-quality external signal because capital is at risk.
-- EMA Structure: EMA20 vs EMA50 on 1h candles. Cross or slope = medium-term trend. Most stable signal.
+## 72h SIGNAL HIERARCHY (BASE weights — TREND/RANGE shift them, then horizon-decay applies)
 
-**Tier 2 — Momentum (12% / 8% / 8%):**
-- RSI Level (12%): 1h RSI with slope bonus. <30 bullish, >70 bearish.
-- MACD Momentum (8%): 1h histogram. Accelerating = full ±1.0; decelerating = ±0.4; stalling = ±0.2.
-- Cascade Direction (8%): long-liq fuel / short-liq fuel ratio. <0.7 = more short fuel above → price hunts UP. >1.4 = more long fuel below → hunts DOWN. Dampened 50% when opposing 6-day daily trend. A low ratio with large ASK walls means massive short exposure that will eventually be squeezed — bullish on a 72h horizon even if price is stalling now.
+**Tier 1 — Structural anchors:**
+- Polymarket Sentiment (16%, raised in RANGE): real-money crowd thesis, horizon-weighted toward 24–72h questions; same-day questions discounted to 0.2×. High-agreement (>85%) markets get a tanh steepening boost. Highest-quality external signal.
+- EMA Structure (20% BASE → 28% TREND → 10% RANGE): 4h EMA20/50 cross + slope. 4h preferred over 1h.
+- OI Funding (13%): combined funding rate (centered at 0.01%) + 24h OI delta. Crowded longs = bearish; rising OI on price up = conviction.
+- 4h RSI (13% BASE → 6% TREND → 18% RANGE): RSI(14) on 4h with **trend-conditional center**: 44 in downtrend (EMA20<EMA50), 56 in uptrend, 50 neutral. RSI=37 in a downtrend is NOT oversold — it's normal.
 
-**Tier 3 — Liquidity structure (10% / 4%):**
-- Hunt Zone Pull (10%): net directional pull from liquidity clusters within 7% of price. ASK-side dominance = upside pull (short squeeze target); BID-side = downside pull. Uses notional/dist²×chain_mult, dampened by wall resistance layering. Dampened 50% when opposing daily trend. NOTE: this is order-book clustering, not prediction-market capital.
-- Order Book Depth (4%): smoothed bid/ask depth ratio. >2x bid-heavy = bullish; <0.5x = ask-heavy bearish.
+**Tier 2 — Reversal & structure:**
+- RSI Divergence (8%, boosted to 13% in RANGE): 4h preferred. Binary ±1.0 — high alpha when present.
+- Price Structure (5–7%): 4h trap/sweep detection. Bull/bear traps, failed breakouts.
+- CVD Trend (6%, boosted to 8% in TREND): 24h cumulative volume delta. Bull/bear divergence boosted +0.3.
 
-**Tier 4 — Secondary context (4% / 4% / 3% / 3%):**
-- Short Momentum (4%): 24h price return.
-- Stochastic Zone (4%): <20 oversold bullish, >80 overbought bearish.
-- RSI Divergence (3%): bull/bear divergence on 1h. Rare but high-quality — weight it above its 3% mechanical share when present.
-- Candlestick (3%): pattern recognition last 3 candles.
+**Tier 3 — Liquidation cluster signals (forward-looking + reactive pair):**
+- Hunt Zone Pull (4–5%): **liquidation clusters within 7%** acting as price magnets (NOT order book walls). side=ASK → short-liq cluster above (squeeze magnet pulling up); side=BID → long-liq cluster below (flush magnet pulling down). Swept zones discounted 65%.
+- Swept Reversal (3–5%, strongest in RANGE): **reactive twin** to Hunt Zone Pull — fires when last 3×4h candles wicked into a cluster ≥$1M then closed back through it (bear when ASK swept-and-rejected; bull when BID swept-and-rejected). High alpha at range edges.
+- Cascade Direction (3–5%): liq fuel ratio (long-liq vs short-liq notional). Dampened 50% when opposing 6-day trend.
 
-**Score thresholds:** ≥70 STRONG BULL · 40–69 BULL · 15–39 MILD BULL · ±14 NEUTRAL · -15–-39 MILD BEAR · -40–-69 BEAR · ≤-70 STRONG BEAR. Only call an actionable trade when |score| ≥ 40.
+**Tier 4 — Divergence & microstructure (minimal weight):**
+- MACD Divergence (2–4%): 4h preferred.
+- Order Book Depth (1–3%), RSI Level (1–2%), MACD Momentum (1–2%), Short Momentum (1%), Stochastic Zone (~1% floor).
 
-## INTRADAY SIGNALS (entry timing only, not directional weight)
-- EMA8/21 cross on 15m: short-term momentum, use for entry timing.
-- VWAP: above = institutions net bought today (bullish intraday); below = net sold.
-- POC: price above POC = buyers control value area; below = sellers.
-- ATR: volatility proxy — size stops accordingly.
+## 24h ENGINE (13 signals, separate weight table)
+- Liq Imbalance (14–16%): forced trades over last 4h — strongest unique 24h signal.
+- CVD (13–14%): 6h volume delta, volume-normalized.
+- Momentum (11–14%): blend of 1h + 4h returns.
+- Funding (9–11%): same neutral as 72h (0.01% center).
+- Fast MACD (7–12%): 6/13/4 params.
+- EMA Align (4–10%, boosted in TREND): 1h/15m EMA cross.
+- RSI(7) (4–12%, boosted in RANGE), Stochastic (2–9%, boosted in RANGE), Candle Pos (6–7%), Order Book (4–6%).
+- **Nearby Liq Magnet (3–6%, strongest in RANGE)**: NEW — projected liquidation clusters within ±2.5% pulling price intraday. Same cluster data as 72h Hunt Zone Pull but tighter window and no daily-coherence damping. Strongest signal at range edges.
+- Polymarket (3%): uses `signal_24h` — same-day questions boosted 1.5×, far markets discounted to 0.15×.
+- Fear & Greed (1–4%, extremes only, <20 or >80).
 
-## CYCLE PHASE
-Scored -24 to +24 across accumulation/markup/distribution/markdown. Positive = accumulation or markup (buy or hold). Negative = distribution or markdown (reduce or short). State where we are in the cycle and what it means for position sizing: cycle extremes override short-term noise.
+## LIQUIDATION DATA SOURCE QUALITY
+Liquidity maps drive Hunt Zone Pull, Swept Reversal, Cascade Direction, and Nearby Liq Magnet. Source is reported as `liq_map_source`:
+- **coinglass**: paid API, highest quality (if available).
+- **hyblock**: free fallback, good coverage.
+- **binance_synthetic**: built locally from Binance OI history + taker ratio + leverage tier fan-out (3x/5x/10x/25x/50x/100x with empirical weights 0.10/0.18/0.30/0.24/0.12/0.06), 7-day half-life decay. Reasonable proxy but coarser — discount liq-cluster signals by ~20% confidence.
+- **orderbook_proxy**: last-resort fallback using book walls as a stand-in. Liq-cluster signals are weak in this mode; lean on technicals + Polymarket.
 
 ## CONFLICT RULES
-1. Polymarket + EMA agree → highest conviction tier. Both are slow, capital-anchored signals.
-2. Cascade low ratio + large ASK walls → read as bullish on 72h horizon (short squeeze fuel), not bearish resistance.
-3. Daily trend vs 72h bias divergence → favour 72h bias for the trade but note the headwind.
-4. RSI divergence present → weight it above its mechanical 3% in your narrative.
-5. Fear & Greed → contextual filter only. Extreme readings strengthen contrarian reads.
-6. Cycle phase at extreme (>+16 or <-16) → it overrides mild 72h signals. Don't call a long into late distribution.
+1. **Polymarket + EMA agree** → highest conviction. Both capital-anchored.
+2. **4h RSI bullish + EMA bearish** → counter-trend signal. The center fix already discounts this; don't double-count.
+3. **72h and 24h disagree** → 72h owns the direction, 24h owns the timing.
+4. **Hunt Zone Pull + Swept Reversal disagree** → Swept Reversal wins (reactive beats projection). Pull says "magnet exists"; Swept says "magnet rejected price".
+5. **Hunt Zone Pull + Swept Reversal agree on bear (ASK above, then ASK rejection)** → high-quality fade short setup.
+6. **Nearby Liq Magnet + Liq Imbalance agree** → intraday squeeze imminent in the indicated direction.
+7. **CVD divergence + price extreme** → high-quality reversal flag.
+8. **Daily trend vs 72h bias divergence** → favour 72h bias for the trade but note the headwind.
+9. **Cycle phase extreme (>+16 or <-16)** → overrides mild 72h signals.
 
-## POLYMARKET EXPIRY RULE
-Before using any Polymarket market, check its expiry against the current date in the data.
-- Market expires within 24h → **discard it entirely** from the thesis. Flag it: "(expired — excluded)". Do not let it drive the verdict.
-- Market expires within 72h → use it but label it "(expiring soon — lower weight)".
-- Market expires >72h → full weight.
-A market settling today has zero forward-looking value for a 72H trade.
+## POLYMARKET HORIZON
+The engine already routes questions: same-day → 24h signal (1.5× boost), 24–168h → 72h signal (1.5× boost in 24–72h sweet spot). You don't need to re-filter by expiry. But still call out questions expiring in <12h as low forward-value when summarizing.
 
-## OVERSOLD/OVERBOUGHT CONFLICT RULE
-If RSI < 32 or Stochastic < 22, a SHORT trade setup carries elevated reversal risk — state the exact bounce level where the short becomes invalid. If RSI > 68 or Stochastic > 78, a LONG trade setup carries the same risk.
+## OVERSOLD/OVERBOUGHT
+If RSI < 32 or Stoch < 22 → SHORT carries reversal risk; name invalidation level. If RSI > 68 or Stoch > 78 → LONG carries same risk.
 
-## POSITION SIZING BY VERDICT
-- STRONG BUY / STRONG SELL: 100% of normal risk allocation
-- BUY / SELL: 75%
-- LEAN BUY / LEAN SELL: 40%
-- NEUTRAL: 0% — no trade
+## SCORE THRESHOLDS
+≥70 STRONG · 40–69 BULL/BEAR · 15–39 MILD · ±14 NEUTRAL. Actionable trade only at |score| ≥ 40.
 
-## OUTPUT FORMAT — use EXACTLY this structure, no extra sections:
+## POSITION SIZING
+STRONG: 100% · BUY/SELL: 75% · LEAN: 40% · NEUTRAL: 0%. Reduce one tier if `liq_map_source` = orderbook_proxy AND liq-cluster signals are dominant drivers.
 
-**VERDICT: [STRONG BUY / BUY / LEAN BUY / NEUTRAL / LEAN SELL / SELL / STRONG SELL]** · Confidence: [LOW / MEDIUM / HIGH] · Size: [X% of normal risk]
-[One sentence: the single clearest reason for the verdict right now.]
+## OUTPUT FORMAT — EXACTLY this structure:
 
-**Cycle position:** [Phase name, score, one sentence on what it means for sizing — does it confirm or cap the verdict?]
+**VERDICT: [STRONG BUY / BUY / LEAN BUY / NEUTRAL / LEAN SELL / SELL / STRONG SELL]** · Confidence: [LOW / MEDIUM / HIGH] · Size: [X%]
+[One sentence: the single clearest reason for the verdict.]
 
-**72H case:** [2 sentences max. Lead with the 2 highest-weight valid signals (name + value). One intraday signal for entry timing. Flag any Polymarket markets that are expired/expiring.]
+**72h read:** [2 sentences. Lead with 2 highest-weight signals (name + value + weight%). Note the regime.]
 
-**Far-term (3–10 days):** [2 sentences max. Daily trend score, 7d/30d momentum, 52-week range, Polymarket weekly markets (with expiry context), dominance trend.]
+**24h read:** [1–2 sentences. Lead with the dominant 24h signal. Does it confirm or contradict the 72h direction?]
 
-**Key signal conflict or alignment:** [One sentence. Name the two signals that most pull in opposite directions — or confirm alignment and state that conviction is elevated.]
+**Cycle / far-term:** [1–2 sentences on cycle phase, dominance, momentum.]
 
-**Trade setup:** [Format strictly: "Direction · entry trigger (price + 1h close condition) · stop (invalidation price) · target · R:R ratio · structural reason." Calculate R:R explicitly. If R:R < 1.5 on a LEAN verdict, say so and either adjust the target or flag the trade as marginal. If score < ±40: state the exact condition (price level + signal change) that makes the score cross ±40 and the trade valid. If RSI/Stoch is in danger zone for the direction, name the confirmation needed.]
+**Key conflict or alignment:** [One sentence. Name the two signals most opposed — or confirm conviction.]
 
-**Confidence rules:**
-- HIGH: Tier 1 signals agree + cascade aligns + no major counter-signal + no expiry distortion
-- MEDIUM: 1 Tier 1 signal clear + momentum supporting, or strong signal offset by meaningful counter
-- LOW: Tier 1 signals split, expired Polymarket driving thesis, or dominant signal contradicts daily trend
+**Trade setup:** "Direction · entry (price + 1h close trigger) · stop (invalidation) · target · R:R · structural reason." Calculate R:R explicitly. If |score| < 40, state the exact level/signal change that would validate the trade.
+
+**Confidence:**
+- HIGH: Tier 1 signals agree + 24h confirms + no major counter-signal
+- MEDIUM: 1 Tier 1 signal clear with momentum support, or strong signal offset by meaningful counter
+- LOW: Tier 1 split, 24h contradicts 72h, or dominant signal opposes daily trend
 
 Under 300 words total."""
 
@@ -851,12 +931,20 @@ def _call_claude_interpretation(
     cycle_score: int = 0,
     adx_val: float = float("nan"),
     signal_weights: "dict | None" = None,
+    # 24h engine
+    bias_24h_score: float = 0.0,
+    bias_24h_label: str = "N/A",
+    bias_24h_regime: str = "N/A",
+    bias_24h_signals: "dict | None" = None,
+    bias_24h_weights: "dict | None" = None,
     # 15-min chart signals
     ema_cross_15m: str = "N/A",
     vwap_bias_15m: str = "N/A",
     poc_vs_price_15m: str = "N/A",
     atr_15m: str = "N/A",
     atr_pct_15m: str = "N/A",
+    # Liquidation map source quality
+    liq_map_source: str = "N/A",
 ) -> str:
     """Call Claude with full system prompt to interpret all dashboard signals."""
     weights = signal_weights or {}
@@ -869,6 +957,18 @@ def _call_claude_interpretation(
                 raw_v, note_v = val[0], val[1]
                 w_pct = f"{weights.get(name, 0)*100:.0f}%" if name in weights else ""
                 signal_lines.append(f"  • [{w_pct} weight] {name} ({raw_v:+.2f}): {note_v}")
+
+    # 24h engine signal lines
+    sig24_lines = []
+    if isinstance(bias_24h_signals, dict):
+        w24 = bias_24h_weights or {}
+        for name, val in bias_24h_signals.items():
+            try:
+                v = float(val)
+                w_pct = f"{w24.get(name, 0)*100:.0f}%" if name in w24 else ""
+                sig24_lines.append(f"  • [{w_pct} weight] {name}: {v:+.2f}")
+            except Exception:
+                pass
 
     pm_lines = []
     for m in (pm_markets or [])[:12]:
@@ -897,6 +997,10 @@ Cycle Phase: {cycle_phase} ({cycle_score:+d}/24)  (positive = accumulation/bull;
 Signal breakdown (weight → influence on composite score):
 {chr(10).join(signal_lines) or "  (no signal data)"}
 
+=== 24h DIRECTIONAL BIAS: {bias_24h_score:+.0f}/100 ({bias_24h_label}) · regime: {bias_24h_regime} ===
+Intraday engine — separate from 72h. Use to confirm/contradict 72h direction and set entry timing.
+{chr(10).join(sig24_lines) or "  (no signal data)"}
+
 === POLYMARKET CROWD THESIS: {pm_thesis:+.2f}/10 ({pm_label}) ===
 Real money at risk — treat as highest-conviction external signal.
 Markets expiring ≤72h are most relevant to the 72h bias; weekly/range markets inform the far-term.
@@ -911,7 +1015,13 @@ Price vs VWAP: {vwap_bias_15m}
 POC vs Price: {poc_vs_price_15m}
 ATR (volatility): {atr_15m} = {atr_pct_15m}% of price
 
-Now give your two-horizon analysis covering the 72H OUTLOOK (24–72h) and FAR-TERM (3–10 days) using ALL signals above."""
+=== LIQUIDATION MAP SOURCE: {liq_map_source} ===
+Drives Hunt Zone Pull, Swept Reversal, Cascade Direction (72h) and Nearby Liq Magnet (24h).
+Quality ladder: coinglass > hyblock > binance_synthetic > orderbook_proxy.
+If source is binance_synthetic, treat liq-cluster signals with ~80% confidence.
+If source is orderbook_proxy, treat liq-cluster signals as noise and lean on technicals + Polymarket.
+
+Now give your analysis using the OUTPUT FORMAT in the system prompt: 72h read, 24h read, cycle/far-term, conflict/alignment, trade setup."""
 
     payload = _json.dumps({
         "model":      "claude-sonnet-4-6",
@@ -1246,14 +1356,16 @@ def fetch_polymarket_btc_sentiment(current_price: float) -> dict:
             score, summary, buckets = _score_range_market(outcomes, probs, cur_price)
             if score is None:
                 return None
-            if hours_left is not None and hours_left <= 48:
-                w, rat = 4, "Today/tomorrow price range — hard directional stake"
+            if hours_left is not None and hours_left <= 72:
+                w, rat = 5, "Resolves within 72h — direct bias window"
             elif hours_left is not None and hours_left <= 168:
-                w, rat = 4, "This week's price range — hard directional stake"
-            elif hours_left is not None and hours_left <= 744:
-                w, rat = 2, "Monthly price range — less relevant to 72h thesis"
+                w, rat = 3, "This week's price range — partially relevant to 72h bias"
+            elif hours_left is not None and hours_left <= 720:
+                w, rat = 1, "Monthly price range — marginal relevance to 72h"
+            elif hours_left is not None and hours_left > 720:
+                return None  # exclude markets resolving >30 days out
             else:
-                w, rat = 1, "Long-term price range"
+                w, rat = 1, "Price range — unknown horizon"
             return {
                 "category": "PRICE_RANGE", "weight": w,
                 "individual_score": score, "market_data": summary,
@@ -1915,20 +2027,50 @@ def fetch_polymarket_btc_sentiment(current_price: float) -> dict:
             )
             return result
 
-        total_weight = sum(m["weight"] for m in scored_markets)
-        weighted_sum = sum(m["individual_score"] * m["weight"] for m in scored_markets)
-        thesis_score = max(-10.0, min(10.0, weighted_sum / total_weight))
-        signal       = thesis_score / 10.0
+        # ── Horizon-split aggregation ──────────────────────────────────────────
+        # Same question list, two different horizon multipliers so each engine
+        # gets a signal calibrated to its window:
+        #
+        # 72h engine: wants markets resolving in 24–168h (tomorrow / this week).
+        #             Same-day markets (≤24h) resolve before the window matters → discounted.
+        # 24h engine: wants markets resolving today (≤24h). Longer-dated markets
+        #             are forward of the window → discounted.
 
-        n          = len(scored_markets)
-        agreeing   = sum(1 for m in scored_markets if (m["individual_score"] >= 0) == (thesis_score >= 0))
-        weighted_agreement = sum(
-            m["weight"]
-            for m in scored_markets
-            if (m["individual_score"] >= 0) == (thesis_score >= 0)
-        )
-        
-        confidence = weighted_agreement / total_weight
+        def _horizon_mul(hl, window):
+            """Return weight multiplier for a market given hours_left and target window."""
+            if hl is None:
+                return 0.5
+            if window == 24:
+                if hl <= 24:   return 1.5   # primary window
+                if hl <= 48:   return 0.6
+                return 0.15                  # too far out for 24h
+            else:  # 72h
+                if hl <= 24:   return 0.2   # resolves before half the window
+                if hl <= 72:   return 1.5   # sweet spot
+                if hl <= 168:  return 1.0   # still relevant
+                return 0.2                   # too far out for 72h
+
+        def _aggregate(markets, window):
+            ws = sum(m["weight"] * _horizon_mul(m.get("hours_left"), window) for m in markets)
+            if ws == 0:
+                return 0.0, 0.0, 0
+            wsum = sum(m["individual_score"] * m["weight"] * _horizon_mul(m.get("hours_left"), window)
+                       for m in markets)
+            ts   = max(-10.0, min(10.0, wsum / ws))
+            wagreeing = sum(
+                m["weight"] * _horizon_mul(m.get("hours_left"), window)
+                for m in markets
+                if (m["individual_score"] >= 0) == (ts >= 0)
+            )
+            return ts, wagreeing / ws, len(markets)
+
+        thesis_score,  confidence,  n = _aggregate(scored_markets, 72)
+        thesis_score24, conf24,    _  = _aggregate(scored_markets, 24)
+        signal    = thesis_score   / 10.0
+        signal_24 = thesis_score24 / 10.0
+
+        total_weight = sum(m["weight"] for m in scored_markets)
+        weighted_agreement = confidence * total_weight  # approximate for legacy compat
 
         scored_markets.sort(key=lambda x: abs(x["weighted_score"]), reverse=True)
 
@@ -1942,12 +2084,13 @@ def fetch_polymarket_btc_sentiment(current_price: float) -> dict:
 
         result.update({
             "signal":       round(signal, 3),
+            "signal_24h":   round(signal_24, 3),
             "confidence":   round(confidence, 2),
             "markets_used": n,
             "markets":      scored_markets,
             "thesis_score": round(thesis_score, 2),
             "thesis_label": thesis_label,
-            "detail":       (f"24h Thesis: {thesis_label} ({thesis_score:+.2f}/10) "
+            "detail":       (f"72h Thesis: {thesis_label} ({thesis_score:+.2f}/10) "
                              f"| {n} mkts, {confidence:.0%} agree"),
         })
 
@@ -2113,6 +2256,138 @@ def calculate_obv_trend(df: pd.DataFrame, period: int = 20) -> str:
         return "neutral"
     except Exception:
         return "neutral"
+
+
+def detect_price_traps(ohlcv: pd.DataFrame, lookback: int = 20) -> tuple:
+    """
+    Detect bull/bear traps and liquidity sweep candles from OHLCV price action.
+
+    Bull trap  — price breaks above rolling high, closes back below → bearish (longs trapped)
+    Bear trap  — price breaks below rolling low, closes back above  → bullish (shorts trapped)
+    Sweep up   — long lower wick + close near high (pin bar)         → bullish rejection of low
+    Sweep down — long upper wick + close near low  (shooting star)   → bearish rejection of high
+    Failed break — price tags a level multiple times without closing through → exhaustion
+
+    Returns (category, score, note) where score ∈ [−1, +1].
+    """
+    try:
+        if ohlcv is None or len(ohlcv) < lookback + 4:
+            return "none", 0.0, "Insufficient data for trap detection"
+
+        # Reference window excludes the last 3 bars (those are the "test" bars)
+        ref   = ohlcv.iloc[-(lookback + 3):-3]
+        last3 = ohlcv.iloc[-3:]
+        curr  = ohlcv.iloc[-1]
+
+        ref_high = float(ref["High"].max())
+        ref_low  = float(ref["Low"].min())
+
+        c_high  = float(curr["High"])
+        c_low   = float(curr["Low"])
+        c_close = float(curr["Close"])
+        c_open  = float(curr["Open"])
+        c_range = c_high - c_low
+        c_body  = abs(c_close - c_open)
+
+        # ── 1. Bull Trap: any of last 3 bars pierced ref_high but current close < ref_high
+        pierce_high = max((float(r["High"]) for _, r in last3.iterrows()), default=0)
+        if pierce_high > ref_high and c_close < ref_high:
+            pierce_pct  = (pierce_high - ref_high) / ref_high * 100
+            pullback_pct = (ref_high - c_close) / ref_high * 100
+            # Stronger trap if the pierce was small (real fakeout) and pull-back is sharp
+            strength = float(np.tanh((pierce_pct + pullback_pct * 1.5) / 1.5))
+            strength = max(0.25, min(1.0, strength))
+            return ("bull_trap", -strength,
+                    f"Bull trap: broke ${ref_high:,.0f} (+{pierce_pct:.2f}%), closed back below "
+                    f"(trapped longs, -{pullback_pct:.2f}%)")
+
+        # ── 2. Bear Trap: any of last 3 bars pierced ref_low but current close > ref_low
+        pierce_low = min((float(r["Low"]) for _, r in last3.iterrows()), default=float("inf"))
+        if pierce_low < ref_low and c_close > ref_low:
+            pierce_pct   = (ref_low - pierce_low) / ref_low * 100
+            recovery_pct = (c_close - ref_low) / ref_low * 100
+            strength = float(np.tanh((pierce_pct + recovery_pct * 1.5) / 1.5))
+            strength = max(0.25, min(1.0, strength))
+            return ("bear_trap", +strength,
+                    f"Bear trap: swept ${ref_low:,.0f} (-{pierce_pct:.2f}%), recovered above "
+                    f"(trapped shorts, +{recovery_pct:.2f}%)")
+
+        # ── 3. Sweep candle on current bar (pin bars / shooting stars)
+        if c_range > 0:
+            upper_wick = c_high - max(c_close, c_open)
+            lower_wick = min(c_close, c_open) - c_low
+            body_ratio = c_body / c_range   # near 0 = doji/pin, near 1 = marubozu
+
+            # Bearish sweep: large upper wick, close in lower half
+            if (upper_wick > 0.55 * c_range and lower_wick < 0.20 * c_range
+                    and c_close < (c_high + c_low) / 2):
+                wick_pct = upper_wick / c_close * 100
+                score = -float(np.tanh(wick_pct / 0.8))
+                score = max(-0.85, score)
+                return ("sweep_down", score,
+                        f"Bearish sweep candle — upper wick {wick_pct:.2f}% of price "
+                        f"(rejection at high, body ratio {body_ratio:.2f})")
+
+            # Bullish sweep: large lower wick, close in upper half
+            if (lower_wick > 0.55 * c_range and upper_wick < 0.20 * c_range
+                    and c_close > (c_high + c_low) / 2):
+                wick_pct = lower_wick / c_close * 100
+                score = +float(np.tanh(wick_pct / 0.8))
+                score = min(+0.85, score)
+                return ("sweep_up", score,
+                        f"Bullish sweep candle — lower wick {wick_pct:.2f}% of price "
+                        f"(rejection at low, body ratio {body_ratio:.2f})")
+
+        # ── 4. Failed breakout test (multiple tags without close-through)
+        # Price has tagged ref_high 2+ times in last 3 bars without closing above → exhaustion
+        tags_high = sum(1 for _, r in last3.iterrows() if float(r["High"]) >= ref_high * 0.998)
+        tags_low  = sum(1 for _, r in last3.iterrows() if float(r["Low"])  <= ref_low  * 1.002)
+        if tags_high >= 2 and c_close < ref_high * 0.998:
+            return ("failed_breakout", -0.40,
+                    f"Failed breakout — {tags_high}x tag of ${ref_high:,.0f} resistance, no close-through (bearish exhaustion)")
+        if tags_low >= 2 and c_close > ref_low * 1.002:
+            return ("failed_breakdown", +0.40,
+                    f"Failed breakdown — {tags_low}x tag of ${ref_low:,.0f} support, no close-through (bullish absorption)")
+
+        return "none", 0.0, "No trap or sweep pattern detected"
+
+    except Exception:
+        return "none", 0.0, "Trap detection N/A"
+
+
+def calculate_cvd(df: pd.DataFrame, lookback: int = 24) -> tuple:
+    """
+    Approximate Cumulative Volume Delta from OHLCV.
+    Buy pressure per bar = volume * (close - low) / (high - low).
+    Returns (category_str, raw_score) where score is in [-1, +1].
+    """
+    try:
+        if df is None or len(df) < lookback + 5:
+            return "neutral", 0.0
+        d   = df.iloc[-(lookback + 5):].copy()
+        hl  = (d["High"] - d["Low"]).replace(0, float("nan"))
+        buy_vol  = d["Volume"] * (d["Close"] - d["Low"]) / hl
+        sell_vol = d["Volume"] * (d["High"] - d["Close"]) / hl
+        delta    = (buy_vol - sell_vol).fillna(0)
+        cvd      = delta.cumsum()
+        cvd_now  = float(cvd.iloc[-1])
+        cvd_prev = float(cvd.iloc[-lookback])
+        price_now  = float(d["Close"].iloc[-1])
+        price_prev = float(d["Close"].iloc[-lookback])
+        price_up   = price_now > price_prev
+        cvd_up     = cvd_now  > cvd_prev
+        # Normalised slope: how much CVD moved relative to average bar volume
+        avg_vol    = float(d["Volume"].mean()) * lookback + 1e-8
+        cvd_slope  = (cvd_now - cvd_prev) / avg_vol   # positive = net buying
+        raw = float(np.tanh(cvd_slope * 2.5))          # scale so ±1 ≈ strong imbalance
+        if   cvd_up and not price_up: category = "bull_divergence"
+        elif not cvd_up and price_up: category = "bear_divergence"
+        elif cvd_up and price_up:     category = "accumulation"
+        elif not cvd_up and not price_up: category = "distribution"
+        else:                         category = "neutral"
+        return category, raw
+    except Exception:
+        return "neutral", 0.0
 
 
 def rsi_trajectory(rsi_series: pd.Series, lookback: int = 10) -> str:
@@ -2504,8 +2779,23 @@ def _fetch_depth(cprice=None):
     _raw = {}
     with ThreadPoolExecutor(max_workers=4) as _ex:
         _futs = {_ex.submit(_get_raw, url): name for name, url in _urls.items()}
-        for _f in as_completed(_futs, timeout=12):
-            _raw[_futs[_f]] = _f.result()
+        try:
+            for _f in as_completed(_futs, timeout=12):
+                try:
+                    _raw[_futs[_f]] = _f.result()
+                except Exception:
+                    _raw[_futs[_f]] = None   # individual exchange error — skip it
+        except TimeoutError:
+            # One or more exchanges didn't respond in time — use whatever finished.
+            # Cancel any still-pending futures so the executor can shut down promptly.
+            for _f in _futs:
+                if not _f.done():
+                    _f.cancel()
+                else:
+                    try:
+                        _raw.setdefault(_futs[_f], _f.result(timeout=0))
+                    except Exception:
+                        _raw.setdefault(_futs[_f], None)
 
     # ── Parse and normalise each source to [(price_str, qty_str), ...] ───────
     bids: list = []
@@ -3081,63 +3371,189 @@ def predict_direction(df: pd.DataFrame, liq: dict) -> dict:
 
 def compute_72h_bias(df: pd.DataFrame, liq: dict,
                      short_df: "pd.DataFrame | None" = None,
-                     poly: "dict | None" = None) -> dict:
+                     poly: "dict | None" = None,
+                     oi_data: "dict | None" = None,
+                     df_4h: "pd.DataFrame | None" = None) -> dict:
     """
     Weighted 72-hour directional bias score from −100 (strong bear) to +100 (strong bull).
-    Liquidity signals (cascade, hunt zones, depth ratio) are smoothed via session-state
-    rolling averages.  Technical indicators (RSI/MACD/Stoch/momentum) use 1h candles
-    over the last 72h for a stable medium-term view.  Polymarket crowd sentiment
-    (thesis-weighted) is the primary external input at 0.22 weight.
-    Each signal returns a raw float in [−1, +1]; multiplied by its weight then summed × 100.
+
+    Timeframe architecture:
+      - df_4h  (4h candles, 30d) → EMA structure, 4h RSI, RSI divergence  [primary 72h anchor]
+      - short_df (1h candles, 72h) → MACD, Stoch, CVD, momentum            [medium refinement]
+      - df     (daily candles)     → regime detection (ADX), daily coherence [slow anchor]
+      - liq    (real-time)         → cascade, hunt zones, OB depth           [short-term, decay-weighted]
+
+    Microstructure signals (OB, cascade, hunt zones) receive horizon-decay multipliers
+    because they have effective horizons of hours–1 day, not 72h.
     """
     signals      = {}
     weighted_sum = 0.0
-    # Use 1h candles (72h window) for tech signals — stable medium-term view
-    _ti = short_df if (short_df is not None and len(short_df) >= 20) else df
+    # Timeframe layers
+    _ti   = short_df if (short_df is not None and len(short_df) >= 20) else df   # 1h candles
+    _tf4h = df_4h    if (df_4h   is not None and len(df_4h)   >= 20) else None   # 4h candles
     closes       = _ti["Close"].tolist()
     price        = closes[-1]
     analysis     = (liq or {}).get("liq_analysis", {})
 
     # ── Daily trend direction for coherence filtering ──────────────────────────
-    # Cascade and hunt-zone signals are order-book *snapshots* — in a bull market
-    # there's almost always more long-liq fuel below, so cascade reads DOWN even
-    # when price is trending up.  When a liq signal contradicts the daily trend
-    # we dampen it: it may be flagging a stop-hunt detour, not a 72h reversal.
     try:
         _d_cls   = df["Close"].tolist()
         _d6ret   = (_d_cls[-1] - _d_cls[-6]) / _d_cls[-6] if len(_d_cls) >= 6 else 0.0
-        _daily_dir = +1 if _d6ret > 0.015 else (-1 if _d6ret < -0.015 else 0)
+        _daily_dir = +1 if _d6ret > 0.025 else (-1 if _d6ret < -0.025 else 0)
     except Exception:
         _daily_dir = 0
-    _COHERENCE_DAMP = 0.50   # liq signals dampened to 50% when opposing daily trend
+    _COHERENCE_DAMP = 0.50
 
-    # 12 signals total; weights sum to 1.00.
-    # Polymarket thesis score is the primary external sentiment anchor.
-    # OBV added (4%) — accumulation/distribution is highly predictive of 72h direction.
-    # OB Depth reduced 4%→2% (redundant with cascade/hunt-zone at higher fidelity).
-    # Candlestick reduced 3%→1% (1h patterns too noisy for 72h forecast).
-    WEIGHTS = {
-        # Sentiment / Prediction Markets  22% — slow-moving, anchors the bias
-        "Polymarket Sentiment": 0.22,
-        # Market Structure / EMA          22% — days-level, very stable
-        "EMA Structure":        0.22,
-        # Momentum (RSI/MACD/Stoch)       24% — hours-level, moderate pace
-        "RSI Level":            0.12,
-        "MACD Momentum":        0.08,
-        "Stochastic Zone":      0.04,
-        # Liquidity / Hunt Zones          10% — real-time
-        "Hunt Zone Pull":       0.10,
-        # Liquidation / Cascade Data       8% — real-time
-        "Cascade Direction":    0.08,
-        # Volume / Accumulation            4% — OBV trend (new)
-        "OBV Trend":            0.04,
-        # Order Book / CVD                 6% (OB depth reduced, momentum kept)
-        "Order Book Depth":     0.02,
-        "Short Momentum":       0.04,
-        # Candle / Divergence              3%
-        "RSI Divergence":       0.03,
-        "Candlestick":          0.01,
+    # ── Regime detection via ADX on 1h candles ────────────────────────────────
+    # ADX > 28 → trend regime (EMAs + momentum reliable; mean-reversion weak)
+    # ADX < 18 → range regime (RSI/Stoch/divergence reliable; EMAs lag)
+    # 18–28    → transition (use base weights)
+    try:
+        _adx_1h = calculate_adx(_ti, period=14)
+    except Exception:
+        _adx_1h = float("nan")
+    _adx_ok = not np.isnan(_adx_1h)
+    if _adx_ok and _adx_1h > 28:
+        regime = "trend"
+    elif _adx_ok and _adx_1h < 18:
+        regime = "range"
+    else:
+        regime = "transition"
+
+    # ── Volatility conditioning via ATR percentile on daily candles ───────────
+    # ATR percentile > 70 → high vol → dampen mean-reversion signals
+    # ATR percentile < 30 → low vol / squeeze → dampen breakout signals
+    try:
+        _atr_series = calculate_atr(df)
+        _atr_pctile = float(_atr_series.rank(pct=True).iloc[-1]) if len(_atr_series) >= 20 else 0.5
+    except Exception:
+        _atr_pctile = 0.5
+    _vol_high  = _atr_pctile > 0.70   # high vol → mean-reversion less reliable
+    _vol_low   = _atr_pctile < 0.30   # low vol / squeeze → momentum less reliable
+
+    # ── Regime-switched weights (13 signals, sum to 1.00) ─────────────────────
+    # BASE (transition / no clear regime):
+    # Weights redesigned for genuine 72h horizon:
+    # Structural/daily signals (Polymarket, EMA, 4h RSI, OI, RSI Div) dominate.
+    # Fast 1h oscillators (Stoch, Short Momentum) drastically reduced — they
+    # describe hours, not days, and cause score churn without predictive value.
+    _W_BASE = {
+        "Polymarket Sentiment": 0.16,  # forward-looking but slow on BTC — moves rarely
+        "EMA Structure":        0.20,  # primary directional anchor — tracks the trend
+        "OI Funding":           0.13,  # positioning trap detector; structural
+        "4h RSI":               0.13,  # structural momentum; raised to compensate for PM cut
+        "RSI Divergence":       0.08,  # reliable reversal signal on 4h
+        "Price Structure":      0.05,  # trap/sweep detection (overlaps Swept Reversal)
+        "CVD Trend":            0.06,  # buy/sell pressure over 24h
+        "Hunt Zone Pull":       0.04,  # liquidity magnet (forward-looking)
+        "Swept Reversal":       0.04,  # confirmed hunt completion (reactive)
+        "Cascade Direction":    0.03,  # real-time liq fuel ratio
+        "MACD Divergence":      0.03,  # structural divergence on 4h
+        "Order Book Depth":     0.02,  # very fast-decaying; reduced
+        "RSI Level":            0.01,  # 1h signal; noisy for 72h horizon
+        "MACD Momentum":        0.01,  # 1h MACD histogram; noisy
+        "Short Momentum":       0.01,  # 24h price change; partially redundant with 4h RSI
+        "Stochastic Zone":      0.00,  # 1h oscillator; too short for 72h
     }
+    # TREND: EMA dominant; mean-reversion signals suppressed; volume/momentum confirm
+    _W_TREND = {
+        "Polymarket Sentiment": 0.16,
+        "EMA Structure":        0.28,  # primary trend anchor
+        "OI Funding":           0.13,  # trend-confirming positioning
+        "4h RSI":               0.06,  # CUT — mean-reversion fights trend in this regime
+        "RSI Divergence":       0.04,
+        "Price Structure":      0.05,  # trimmed — overlaps Swept Reversal
+        "CVD Trend":            0.08,  # boosted — volume confirms trend
+        "Hunt Zone Pull":       0.05,
+        "Swept Reversal":       0.03,  # confirmed hunt completion — small in trend (counter-trend bias)
+        "Cascade Direction":    0.05,
+        "MACD Divergence":      0.02,
+        "Order Book Depth":     0.01,
+        "RSI Level":            0.01,
+        "MACD Momentum":        0.02,  # boosted — momentum confirms trend
+        "Short Momentum":       0.01,
+        "Stochastic Zone":      0.00,
+    }
+    # RANGE: 4h RSI + RSI Div lead; EMA suppressed; CVD and traps confirm reversal zones
+    _W_RANGE = {
+        "Polymarket Sentiment": 0.13,
+        "EMA Structure":        0.10,  # lags in ranging market but small bump from PM cut
+        "OI Funding":           0.10,
+        "4h RSI":               0.18,  # mean-reversion king in range
+        "RSI Divergence":       0.13,  # highly reliable in range
+        "Price Structure":      0.07,  # trimmed — overlaps Swept Reversal
+        "CVD Trend":            0.05,
+        "Hunt Zone Pull":       0.05,
+        "Swept Reversal":       0.05,  # ranges live & die at hunt zones — strongest here
+        "Cascade Direction":    0.03,
+        "MACD Divergence":      0.04,
+        "Order Book Depth":     0.03,
+        "RSI Level":            0.02,
+        "MACD Momentum":        0.01,
+        "Short Momentum":       0.01,
+        "Stochastic Zone":      0.00,
+    }
+    WEIGHTS = {"trend": _W_TREND, "range": _W_RANGE, "transition": _W_BASE}[regime]
+
+    # ── Horizon-decay: microstructure signals decay fast vs 72h target ────────
+    # Order book, cascade, and hunt zones have effective horizons of hours–1 day.
+    # We down-weight them relative to their face weight to prevent short-term state
+    # from dominating what is claimed to be a 72h forecast.
+    # Decay factor = fraction of 72h budget the signal is genuinely predictive over.
+    _HORIZON_DECAY = {
+        "Order Book Depth":     0.25,  # minutes → almost no 72h predictive value
+        "Stochastic Zone":      0.30,  # hours → negligible weight
+        "Swept Reversal":       0.40,  # 4–12h reversal confirmation; fades fast
+        "Short Momentum":       0.45,  # 24h return; half-life well under 72h
+        "Cascade Direction":    0.50,  # hours–1 day
+        "Hunt Zone Pull":       0.55,  # positional but reshapes within a day
+        "CVD Trend":            0.65,  # 1–2 days
+        "RSI Level":            0.65,  # 1h RSI; directional only 12–24h
+        "MACD Momentum":        0.75,  # 1–3 days; trend-confirming but lags
+        "Price Structure":      0.85,  # 4h traps last 1–3 days
+        "RSI Divergence":       0.95,  # 4h divergences persist days
+        "MACD Divergence":      0.95,  # 4h divergences persist multiple days
+        "OI Funding":           0.95,  # funding cycles are 8h–days level
+        "4h RSI":               1.00,  # structural — directly 72h-relevant
+        "EMA Structure":        1.00,  # daily — no decay
+        "Polymarket Sentiment": 1.00,  # 24h+ crowd consensus — no decay
+    }
+    _decay_total_before = sum(WEIGHTS.values())
+    for _dk, _dd in _HORIZON_DECAY.items():
+        if _dk in WEIGHTS:
+            WEIGHTS[_dk] *= _dd
+    # Renormalise so weights still sum to 1.0 after decay
+    _decay_total_after = sum(WEIGHTS.values())
+    if _decay_total_after > 0:
+        WEIGHTS = {k: v / _decay_total_after for k, v in WEIGHTS.items()}
+
+    # ── Dynamic EMA weight: scale by ADX trend strength ───────────────────────
+    # EMA is lagging and unreliable in ranging/compressing markets.
+    # trend_strength = 0 when ADX ≤ 18 (fully ranging), 1.0 when ADX ≥ 30 (strong trend).
+    # Freed weight is redistributed proportionally to the liquidity+sentiment signals.
+    _trend_strength = float(np.clip((_adx_1h - 18) / 12, 0.0, 1.0)) if _adx_ok else 0.6
+    if _trend_strength < 0.99:
+        _ema_raw = WEIGHTS["EMA Structure"]
+        WEIGHTS["EMA Structure"] = _ema_raw * _trend_strength
+        _freed = _ema_raw - WEIGHTS["EMA Structure"]
+        # Redistribute freed weight to liquidity signals (they don't lag like EMA)
+        _redist_keys = ["Hunt Zone Pull", "Cascade Direction", "Order Book Depth",
+                        "Polymarket Sentiment", "OI Funding"]
+        _redist_total = sum(WEIGHTS[k] for k in _redist_keys)
+        if _redist_total > 0:
+            for _rk in _redist_keys:
+                WEIGHTS[_rk] += _freed * (WEIGHTS[_rk] / _redist_total)
+        # Ensure sum == 1.0 (floating point safety)
+        _wsum = sum(WEIGHTS.values())
+        WEIGHTS = {k: v / _wsum for k, v in WEIGHTS.items()}
+
+    # Weight floor: no signal fully silenced — ADX/regime may zero signals
+    # which lets 2-3 hot signals dominate uncontested. Floor at 1% per signal.
+    _W_FLOOR = 0.01
+    WEIGHTS = {k: max(v, _W_FLOOR) for k, v in WEIGHTS.items()}
+    _wsum = sum(WEIGHTS.values())
+    WEIGHTS = {k: v / _wsum for k, v in WEIGHTS.items()}
+
     _SMOOTH_N = 5   # rolling window for noisy liq signals (≈10 min at 2-min refresh)
 
     # ── Session-state rolling buffers for volatile order-book signals ──────────
@@ -3162,8 +3578,13 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
         if n_mkts == 0:
             raw, note = 0.0, "Polymarket: no qualifying markets (neutral)"
         else:
-            conf_factor = 0.5 + 0.5 * conf              # [0.5, 1.0] — never zero
-            raw         = max(-1.0, min(1.0, pm_sig * conf_factor))
+            conf_factor = 0.3 + 0.7 * conf              # [0.3, 1.0] — low-confidence markets barely count
+            if conf > 0.85:
+                # Near-unanimous agreement: steepen the curve so consensus hits harder
+                _boost = 1.0 + (conf - 0.85) * 4.0     # 1.0→1.6x as conf goes 85%→100%
+                raw = float(np.clip(np.tanh(pm_sig * conf_factor * _boost), -1.0, 1.0))
+            else:
+                raw = float(np.clip(pm_sig * conf_factor, -1.0, 1.0))
             label       = p.get("thesis_label", "BULL" if raw > 0.05 else ("BEAR" if raw < -0.05 else "NEUTRAL"))
             note        = f"Polymarket {label} ({pm_thesis:+.2f}/10, {n_mkts} mkts, {conf:.0%} agree)"
     except Exception:
@@ -3196,14 +3617,15 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
     signals["Cascade Direction"] = (raw, note)
     weighted_sum += raw * WEIGHTS["Cascade Direction"]
 
-    # ── 3. Hunt Zone Pull (10%) ────────────────────────────────────
-    # ASK-wall zones pull price UP (short squeeze when swept).
-    # BID-wall zones pull price DOWN (long liquidation when swept).
-    # For a 72H horizon, even walls 0.1% away are legitimate sweep targets —
-    # price will test them within hours. The "active resistance" interpretation
-    # is intraday-only; over 72H, concentrated ASK notional = short exposure
-    # that will be squeezed. wall_res dampens zones that have another wall
-    # between them and current price, correctly penalising layered resistance.
+    # ── 3. Hunt Zone Pull ──────────────────────────────────────────
+    # Hunt zones are LIQUIDATION CLUSTERS (not order-book walls):
+    #   side="ASK" → short-liq cluster ABOVE price → magnet pulling UP
+    #                (price hunts up to trigger forced buys → squeeze)
+    #   side="BID" → long-liq cluster BELOW price  → magnet pulling DOWN
+    #                (price hunts down to trigger forced sells → flush)
+    # Order-book walls only enter via `wall_res`: a real resting wall sitting
+    # between price and the cluster dampens the magnet pull (layered resistance).
+    # For a 72H horizon, clusters even 0.1% away are legitimate sweep targets.
     try:
         hz            = analysis.get("hunt_zones", [])
         ask_pull      = 0.0
@@ -3218,6 +3640,17 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
         for zone in active_zones:
             # hunt_score = (notional/1e6) / dist² × cascade_chain_mult — no squaring
             score     = zone.get("hunt_score", 0.0)
+            # ⑩ Post-sweep discount: a zone already swept has far less magnet pull.
+            # Check if price passed through the zone level in the last 4 candles.
+            try:
+                _zp      = float(zone["price"])
+                _rh4     = _ti["High"].dropna().iloc[-4:]
+                _rl4     = _ti["Low"].dropna().iloc[-4:]
+                _swept   = any(lo <= _zp <= hi for hi, lo in zip(_rh4, _rl4))
+                if _swept:
+                    score *= 0.35  # recently swept → 65% pull reduction
+            except Exception:
+                pass
             # Dampen by any order-book wall sitting between price and the zone.
             # A $20M wall in the path → 50% reduction; $100M → 83% reduction.
             wall_res  = zone.get("wall_res", 0.0)
@@ -3234,7 +3667,7 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
             bid_pct  = 100 - ask_pct
             dominant = "Upside" if ask_pull >= bid_pull else "Downside"
             note     = (f"{dominant} hunt pull within 7% "
-                        f"({ask_pct:.0f}% ask vs {bid_pct:.0f}% bid, "
+                        f"({ask_pct:.0f}% short-liq vs {bid_pct:.0f}% long-liq, "
                         f"{len(active_zones)}/{len(hz)} zones ≥$1M)")
         elif hz:
             raw, note = 0.0, "Hunt zones too far or too small for 72h horizon"
@@ -3249,46 +3682,93 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
     signals["Hunt Zone Pull"] = (raw, note)
     weighted_sum += raw * WEIGHTS["Hunt Zone Pull"]
 
-    # ── 4. Order Book Depth Ratio (4%) ────────────────────────────
-    # This is the most volatile signal — smoothed heavily and given minimal weight.
+    # ── 3b. Swept Reversal ─────────────────────────────────────────
+    # Confirms hunt completion. When price wicks through a known hunt zone
+    # AND closes back on the originating side within the last 1–3 × 4h bars,
+    # the liquidations actually triggered and got rejected — the strongest
+    # short-term reversal tell. Complements Hunt Zone Pull, which is
+    # forward-looking (where price MIGHT go); this is reactive (where it
+    # just went and reversed).
+    #   +1 → long-liq cluster swept & rejected (longs flushed, bounce → bullish)
+    #   -1 → short-liq cluster swept & rejected (shorts squeezed, fade → bearish)
+    try:
+        hz_all   = analysis.get("hunt_zones", [])
+        bull_acc = 0.0
+        bear_acc = 0.0
+        swept_n  = 0
+        if hz_all and _tf4h is not None and len(_tf4h) >= 3:
+            _last3   = _tf4h.iloc[-3:]
+            _recency = [0.3, 0.6, 1.0]   # oldest → newest
+            _cands   = [z for z in hz_all
+                        if abs(z["price"] - price) / price <= 0.05
+                        and z.get("notional", z.get("wall", 0)) >= 1_000_000]
+            for r_idx, (_, row) in enumerate(_last3.iterrows()):
+                hi, lo, cl = float(row["High"]), float(row["Low"]), float(row["Close"])
+                for z in _cands:
+                    zp = float(z["price"])
+                    # cap per-zone weight so a single huge cluster can't dominate
+                    w  = min(z.get("hunt_score", 0.0), 50_000.0) * _recency[r_idx]
+                    if z["side"] == "ASK":
+                        # short-liq cluster above: swept-then-rejected = bearish
+                        if hi >= zp and cl < zp:
+                            bear_acc += w
+                            swept_n  += 1
+                    else:
+                        # long-liq cluster below: swept-then-rejected = bullish
+                        if lo <= zp and cl > zp:
+                            bull_acc += w
+                            swept_n  += 1
+        total = bull_acc + bear_acc
+        if total > 0:
+            direction = (bull_acc - bear_acc) / total
+            magnitude = float(np.tanh(total / 30_000.0))
+            raw       = direction * magnitude
+            tag       = ("Long-flush rejected (bull)" if bull_acc > bear_acc
+                         else "Short-squeeze rejected (bear)")
+            note      = f"{tag} — {swept_n} sweep(s) in last 12h, mag {magnitude:.2f}"
+        else:
+            raw, note = 0.0, "No hunt-zone sweeps in last 12h"
+    except Exception:
+        raw, note = 0.0, "Swept Reversal N/A"
+    # No daily-trend coherence damping: counter-trend reversal signals are
+    # exactly when this signal is most valuable.
+    signals["Swept Reversal"] = (raw, note)
+    weighted_sum += raw * WEIGHTS.get("Swept Reversal", 0.0)
+
+    # ── 4. Order Book Depth Ratio ─────────────────────────────────
+    # tanh((ratio-1)/0.6) → smooth +1 when bid-heavy, -1 when ask-heavy.
     try:
         ratio_raw = float((liq or {}).get("liq_depth_ratio", 1.0))
         ratio     = _smooth_push("_b12_ob_ratio", ratio_raw)
-        if   ratio >= 2.5: raw, note = +1.0, f"Strongly bid-heavy (smoothed {ratio:.2f}x)"
-        elif ratio >= 2.0: raw, note = +0.7, f"Bid-heavy (smoothed {ratio:.2f}x)"
-        elif ratio >= 1.4: raw, note = +0.4, f"Mild bid bias (smoothed {ratio:.2f}x)"
-        elif ratio >= 0.8: raw, note =  0.0, f"Balanced (smoothed {ratio:.2f}x)"
-        elif ratio >= 0.5: raw, note = -0.4, f"Mild ask bias (smoothed {ratio:.2f}x)"
-        elif ratio >= 0.3: raw, note = -0.7, f"Ask-heavy (smoothed {ratio:.2f}x)"
-        else:              raw, note = -1.0, f"Strongly ask-heavy (smoothed {ratio:.2f}x)"
+        raw       = float(np.tanh((ratio - 1.0) / 0.6))
+        note      = f"OB ratio {ratio:.2f}x — {'bid' if ratio > 1 else 'ask'}-heavy (tanh {raw:+.2f})"
     except Exception:
         raw, note = 0.0, "OB depth N/A"
     signals["Order Book Depth"] = (raw, note)
     weighted_sum += raw * WEIGHTS["Order Book Depth"]
 
-    # ── 5. RSI Level (12%) — uses 1h candles ──────────────────────
+    # ── 5. RSI Level — uses 1h candles ────────────────────────────
+    # Probabilistic tanh scoring: smooth, no cliff-edges at integer thresholds.
+    # ⑨ Trend-conditional center: shift neutral from 50 toward 55 in uptrend, 45 in
+    # downtrend. RSI=75 is continuation in a bull market, not overbought.
     try:
         rsi_s  = calculate_rsi(_ti["Close"])
         rsi    = float(rsi_s.dropna().iloc[-1])
         rsi_5  = float(rsi_s.dropna().iloc[-5]) if len(rsi_s.dropna()) >= 5 else rsi
         rising = rsi > rsi_5
-        # Slope bonus applies in all zones — momentum direction matters regardless of level.
-        # Rising RSI = building momentum (bullish), falling RSI = fading (bearish).
-        # Bonus is larger when moving away from extremes (most predictive for 72h).
-        if rising:
-            slope_bonus = +0.20 if rsi < 40 else +0.10   # stronger signal recovering from oversold
-        else:
-            slope_bonus = -0.20 if rsi > 60 else -0.10   # stronger signal fading from overbought
-        if   rsi < 20: base =  1.00
-        elif rsi < 30: base =  0.75
-        elif rsi < 40: base =  0.40
-        elif rsi < 50: base =  0.15
-        elif rsi < 60: base = -0.15
-        elif rsi < 70: base = -0.40
-        elif rsi < 80: base = -0.75
-        else:          base = -1.00
+        slope_bonus = (+0.15 if (rising and rsi < 45) else
+                       -0.15 if (not rising and rsi > 55) else
+                       +0.08 if rising else -0.08)
+        # ⑨ Shift neutral center based on EMA20/EMA50 trend direction
+        _rsi_ema_src = _tf4h if _tf4h is not None else _ti
+        _r_e20 = float(_rsi_ema_src["Close"].ewm(span=20, adjust=False).mean().iloc[-1])
+        _r_e50 = float(_rsi_ema_src["Close"].ewm(span=50, adjust=False).mean().iloc[-1])
+        _rsi_center = 56.0 if _r_e20 > _r_e50 else (44.0 if _r_e20 < _r_e50 else 50.0)
+        base = float(np.tanh((_rsi_center - rsi) / 18.0))
         raw  = max(-1.0, min(1.0, base + slope_bonus))
-        note = f"RSI {rsi:.0f} {'↑ recovering' if rising else '↓ fading'}"
+        if _vol_high and regime == "trend":
+            raw *= 0.65   # dampen mean-reversion read during high-vol trending
+        note = f"RSI {rsi:.0f} {'↑' if rising else '↓'} (center {_rsi_center:.0f}, tanh {raw:+.2f})"
     except Exception:
         raw, note = 0.0, "RSI N/A"
     signals["RSI Level"] = (raw, note)
@@ -3311,7 +3791,9 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
     signals["MACD Momentum"] = (raw, note)
     weighted_sum += raw * WEIGHTS["MACD Momentum"]
 
-    # ── 7. Stochastic Zone (4%) — uses 1h candles ─────────────────
+    # ── 7. Stochastic Zone — uses 1h candles ──────────────────────
+    # Probabilistic tanh: smooth gradient from oversold to overbought.
+    # Cross bonus preserved — %K/%D crossover adds directional conviction.
     try:
         st_d   = calculate_stochastic(_ti)
         k      = float(st_d["k"].dropna().iloc[-1])
@@ -3320,130 +3802,267 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
         d_prev = float(st_d["d"].dropna().iloc[-2]) if len(st_d["d"].dropna()) >= 2 else d
         bull_x = k > d and k_prev <= d_prev
         bear_x = k < d and k_prev >= d_prev
-        if   k < 15 and bull_x: raw, note = +1.0, f"Stoch bull cross deep oversold (%K {k:.0f})"
-        elif k < 20:             raw, note = +0.7, f"Stoch deeply oversold (%K {k:.0f})"
-        elif k < 30:             raw, note = +0.4, f"Stoch oversold (%K {k:.0f})"
-        elif k > 85 and bear_x:  raw, note = -1.0, f"Stoch bear cross deep overbought (%K {k:.0f})"
-        elif k > 80:             raw, note = -0.7, f"Stoch deeply overbought (%K {k:.0f})"
-        elif k > 70:             raw, note = -0.4, f"Stoch overbought (%K {k:.0f})"
-        elif bull_x:             raw, note = +0.3, f"Stoch bull cross (%K {k:.0f})"
-        elif bear_x:             raw, note = -0.3, f"Stoch bear cross (%K {k:.0f})"
-        else:                    raw, note =  0.0, f"Stoch neutral (%K {k:.0f} / %D {d:.0f})"
+        base   = float(np.tanh((50.0 - k) / 20.0))
+        cross_bonus = (+0.25 if bull_x and k < 40 else
+                       -0.25 if bear_x and k > 60 else
+                       +0.12 if bull_x else
+                       -0.12 if bear_x else 0.0)
+        raw    = max(-1.0, min(1.0, base + cross_bonus))
+        if _vol_high and regime == "trend":
+            raw *= 0.65
+        note   = f"Stoch %K {k:.0f}/%D {d:.0f} {'↗ bull cross' if bull_x else '↘ bear cross' if bear_x else ''} (tanh {raw:+.2f})"
     except Exception:
         raw, note = 0.0, "Stoch N/A"
     signals["Stochastic Zone"] = (raw, note)
     weighted_sum += raw * WEIGHTS["Stochastic Zone"]
 
-    # ── 8. 24h Momentum (4%) ──────────────────────────────────────
+    # ── 8. 24h Momentum ───────────────────────────────────────────
+    # tanh((ret24)/4) → ±1 at ±8% move; smooth gradient through neutral.
+    # Damped in low-vol squeeze (momentum less reliable pre-expansion).
     try:
         p24   = closes[-24] if len(closes) >= 24 else closes[0]
         ret24 = (price - p24) / p24 * 100
-        if   ret24 >  5: raw, note = +1.0, f"Strong rally last 24h (+{ret24:.1f}%)"
-        elif ret24 >  2: raw, note = +0.5, f"Mild upside last 24h (+{ret24:.1f}%)"
-        elif ret24 < -5: raw, note = -1.0, f"Strong selloff last 24h ({ret24:.1f}%)"
-        elif ret24 < -2: raw, note = -0.5, f"Mild downside last 24h ({ret24:.1f}%)"
-        else:            raw, note =  0.0, f"Flat last 24h ({ret24:.1f}%)"
+        raw   = float(np.tanh(ret24 / 4.0))
+        if _vol_low:
+            raw *= 0.60   # squeeze → momentum signal unreliable
+        note  = f"24h momentum {ret24:+.1f}% (tanh {raw:+.2f})"
     except Exception:
         raw, note = 0.0, "Momentum N/A"
     signals["Short Momentum"] = (raw, note)
     weighted_sum += raw * WEIGHTS["Short Momentum"]
 
-    # ── 9. EMA Structure — EMA20/50 on 1h candles ─────────────────
-    # Medium-term EMA cross + slope captures 72h trend direction.
+    # ── 9. EMA Structure — 4h candles preferred, 1h fallback ────────
+    # 4h EMA20 spans ~80h, EMA50 spans ~200h — genuinely predictive for 72h.
+    # 1h EMA20 only spans ~20h; too reactive to be a 72h structural anchor.
     try:
-        ema20   = _ti["Close"].ewm(span=20, adjust=False).mean()
-        ema50   = _ti["Close"].ewm(span=50, adjust=False).mean()
+        _ema_src = _tf4h if _tf4h is not None else _ti
+        _tf_label = "4h" if _tf4h is not None else "1h"
+        ema20   = _ema_src["Close"].ewm(span=20, adjust=False).mean()
+        ema50   = _ema_src["Close"].ewm(span=50, adjust=False).mean()
         e20_now  = float(ema20.iloc[-1]); e20_prev  = float(ema20.iloc[-2]) if len(ema20) >= 2 else e20_now
         e50_now  = float(ema50.iloc[-1]); e50_prev  = float(ema50.iloc[-2]) if len(ema50) >= 2 else e50_now
         bull_x   = e20_now > e50_now and e20_prev <= e50_prev
         bear_x   = e20_now < e50_now and e20_prev >= e50_prev
-        e20_slope = (e20_now - float(ema20.iloc[-5])) / e20_now * 100 if len(ema20) >= 5 else 0
-        if   bull_x:            raw, note = +1.0, f"EMA20 crossed above EMA50 ({e20_now:,.0f} vs {e50_now:,.0f})"
-        elif bear_x:            raw, note = -1.0, f"EMA20 crossed below EMA50 ({e20_now:,.0f} vs {e50_now:,.0f})"
+        e20_slope = (e20_now - float(ema20.iloc[-3])) / e20_now * 100 if len(ema20) >= 3 else 0
+        if   bull_x:            raw, note = +1.0, f"EMA20/50 bull cross [{_tf_label}] ({e20_now:,.0f} vs {e50_now:,.0f})"
+        elif bear_x:            raw, note = -1.0, f"EMA20/50 bear cross [{_tf_label}] ({e20_now:,.0f} vs {e50_now:,.0f})"
         elif e20_now > e50_now:
-            bonus = min(0.4, abs(e20_slope) * 15)
+            bonus = min(0.4, abs(e20_slope) * 20)
             raw   = min(1.0, 0.5 + bonus)
-            note  = f"EMA20 above EMA50, slope {e20_slope:+.3f}%/bar"
+            note  = f"EMA20 above EMA50 [{_tf_label}], slope {e20_slope:+.3f}%/bar"
         else:
-            bonus = min(0.4, abs(e20_slope) * 15)
+            bonus = min(0.4, abs(e20_slope) * 20)
             raw   = max(-1.0, -0.5 - bonus)
-            note  = f"EMA20 below EMA50, slope {e20_slope:+.3f}%/bar"
+            note  = f"EMA20 below EMA50 [{_tf_label}], slope {e20_slope:+.3f}%/bar"
     except Exception:
         raw, note = 0.0, "EMA N/A"
     signals["EMA Structure"] = (raw, note)
     weighted_sum += raw * WEIGHTS["EMA Structure"]
 
-    # ── 10. RSI Divergence — on 1h candles ────────────────────────
-    # Bullish divergence (price lower low, RSI higher low) is a reliable
-    # reversal signal; bearish divergence is the inverse.
+    # ── 10. RSI Divergence — 4h preferred, 1h fallback ───────────
+    # 4h divergences span multi-day swing structure — far more reliable for 72h.
+    # 1h divergences are often noise in a strong trend.
     try:
-        _rsi_intra = calculate_rsi(_ti["Close"])
-        _div       = detect_rsi_divergence(_ti["Close"].tolist(), _rsi_intra, order=5)
-        if   _div == "bull": raw, note = +1.0, "Bullish RSI divergence on 1h (price ↓ low, RSI ↑ low)"
-        elif _div == "bear": raw, note = -1.0, "Bearish RSI divergence on 1h (price ↑ high, RSI ↓ high)"
-        else:                raw, note =  0.0, "No RSI divergence"
+        _div_src   = _tf4h if _tf4h is not None else _ti
+        _div_label = "4h" if _tf4h is not None else "1h"
+        _rsi_div_s = calculate_rsi(_div_src["Close"])
+        _div       = detect_rsi_divergence(_div_src["Close"].tolist(), _rsi_div_s, order=3)
+        if   _div == "bull": raw, note = +1.0, f"Bullish RSI divergence [{_div_label}] (price ↓ low, RSI ↑ low)"
+        elif _div == "bear": raw, note = -1.0, f"Bearish RSI divergence [{_div_label}] (price ↑ high, RSI ↓ high)"
+        else:                raw, note =  0.0, f"No RSI divergence [{_div_label}]"
     except Exception:
         raw, note = 0.0, "RSI div N/A"
     signals["RSI Divergence"] = (raw, note)
     weighted_sum += raw * WEIGHTS["RSI Divergence"]
 
-    # ── 11. Candlestick Pattern — on 1h candles ───────────────────
-    # Counts confirmed bull/bear patterns in the last 3 candles.
-    # Only scored when TA-Lib is available.
+    # ── 10c. MACD Divergence — 4h preferred, 1h fallback (structural reversal) ──
     try:
+        _mdiv_src   = _tf4h if _tf4h is not None else _ti
+        _mdiv_label = "4h" if _tf4h is not None else "1h"
+        _, _, _mhist = calculate_macd(_mdiv_src["Close"])
+        _mdiv = detect_macd_divergence(_mdiv_src["Close"].tolist(), _mhist, order=3)
+        if   _mdiv == "bull": raw, note = +1.0, f"Bullish MACD divergence [{_mdiv_label}] (price ↓ low, MACD hist ↑ low)"
+        elif _mdiv == "bear": raw, note = -1.0, f"Bearish MACD divergence [{_mdiv_label}] (price ↑ high, MACD hist ↓ high)"
+        else:                 raw, note =  0.0, f"No MACD divergence [{_mdiv_label}]"
+    except Exception:
+        raw, note = 0.0, "MACD div N/A"
+    signals["MACD Divergence"] = (raw, note)
+    weighted_sum += raw * WEIGHTS.get("MACD Divergence", 0.0)
+
+    # ── 10b. 4h RSI — structural momentum anchor ──────────────────
+    # RSI on 4h measures exhaustion over ~3-day windows — directly relevant to 72h.
+    # This is separate from the 1h RSI (signal 5) which reads short-term momentum.
+    # Only computed when 4h data is available; otherwise signal is muted.
+    if _tf4h is not None:
+        try:
+            _rsi4h_s = calculate_rsi(_tf4h["Close"])
+            _rsi4h   = float(_rsi4h_s.dropna().iloc[-1])
+            _rsi4h_p = float(_rsi4h_s.dropna().iloc[-3]) if len(_rsi4h_s.dropna()) >= 3 else _rsi4h
+            _rising4h = _rsi4h > _rsi4h_p
+            _slope_b4h = (+0.12 if (_rising4h and _rsi4h < 50) else
+                          -0.12 if (not _rising4h and _rsi4h > 50) else
+                          +0.06 if _rising4h else -0.06)
+            # Trend-conditional center: mirrors 1h RSI logic. In downtrend (EMA20 < EMA50),
+            # RSI=37 is not truly oversold — shift neutral zone from 50 → 44.
+            _4h_bull = e20_now > e50_now
+            _4h_bear = e20_now < e50_now
+            _4h_rsi_center = 56.0 if _4h_bull else (44.0 if _4h_bear else 50.0)
+            raw  = max(-1.0, min(1.0, float(np.tanh((_4h_rsi_center - _rsi4h) / 18.0)) + _slope_b4h))
+            note = f"4h RSI {_rsi4h:.0f} {'↑' if _rising4h else '↓'} (center {_4h_rsi_center:.0f}, tanh {raw:+.2f}) — structural"
+        except Exception:
+            raw, note = 0.0, "4h RSI N/A"
+    else:
+        raw, note = 0.0, "4h RSI: data unavailable"
+    signals["4h RSI"] = (raw, note)
+    weighted_sum += raw * WEIGHTS.get("4h RSI", 0.0)
+
+    # ── 11. Price Structure — traps, sweeps, failed breaks ────────
+    # Primary: trap/sweep detection on 4h candles (multi-day structure).
+    # Secondary: same on 1h (intraday confirmation).
+    # Bonus: TA-Lib named patterns if available (tiebreaker only).
+    # Bull trap / bear trap / sweep candles are the highest-alpha output here.
+    try:
+        _ps_scores = []
+        _ps_notes  = []
+
+        # 4h trap detection (primary — structural, 72h-relevant)
+        if _tf4h is not None and len(_tf4h) >= 24:
+            _cat4h, _sc4h, _nt4h = detect_price_traps(_tf4h, lookback=20)
+            if _cat4h != "none":
+                _ps_scores.append(_sc4h * 1.0)   # full weight for 4h signal
+                _ps_notes.append(f"[4h] {_nt4h}")
+
+        # 1h trap/sweep detection (secondary — confirms or contradicts 4h)
+        if len(_ti) >= 24:
+            _cat1h, _sc1h, _nt1h = detect_price_traps(_ti, lookback=24)
+            if _cat1h != "none":
+                _ps_scores.append(_sc1h * 0.6)   # 60% weight for 1h signal
+                _ps_notes.append(f"[1h] {_nt1h}")
+
+        # TA-Lib named patterns (bonus — low weight, complements trap signal)
+        _talib_bonus = 0.0
         if TALIB_AVAILABLE and len(_ti) >= 10:
-            _o = _ti["Open"].values.astype(float)
-            _h = _ti["High"].values.astype(float)
-            _l = _ti["Low"].values.astype(float)
-            _c = _ti["Close"].values.astype(float)
-            bull_hits = bear_hits = 0.0
-            for fn in PATTERNS_BULLISH.values():
-                res = getattr(talib, fn)(_o, _h, _l, _c)
-                if res[-1] > 0:   bull_hits += 1.0
-                elif res[-2] > 0: bull_hits += 0.5   # one candle ago
-            for fn in PATTERNS_BEARISH.values():
-                res = getattr(talib, fn)(_o, _h, _l, _c)
-                if res[-1] < 0:   bear_hits += 1.0
-                elif res[-2] < 0: bear_hits += 0.5
-            total = bull_hits + bear_hits
-            if total > 0:
-                raw  = (bull_hits - bear_hits) / total
-                note = f"{bull_hits:.1f} bull / {bear_hits:.1f} bear pattern hits (1h)"
-            else:
-                raw, note = 0.0, "No candlestick patterns detected"
+            try:
+                _o = _ti["Open"].values.astype(float)
+                _h = _ti["High"].values.astype(float)
+                _l = _ti["Low"].values.astype(float)
+                _c = _ti["Close"].values.astype(float)
+                _bull_hits = _bear_hits = 0.0
+                for fn in PATTERNS_BULLISH.values():
+                    res = getattr(talib, fn)(_o, _h, _l, _c)
+                    if res[-1] > 0:   _bull_hits += 1.0
+                    elif res[-2] > 0: _bull_hits += 0.5
+                for fn in PATTERNS_BEARISH.values():
+                    res = getattr(talib, fn)(_o, _h, _l, _c)
+                    if res[-1] < 0:   _bear_hits += 1.0
+                    elif res[-2] < 0: _bear_hits += 0.5
+                _total_hits = _bull_hits + _bear_hits
+                if _total_hits > 0:
+                    _talib_bonus = (_bull_hits - _bear_hits) / _total_hits * 0.3
+                    _ps_notes.append(f"Patterns: {_bull_hits:.0f}B/{_bear_hits:.0f}bear")
+            except Exception:
+                pass
+
+        if _ps_scores:
+            # Blend: traps dominate, TA-Lib is a nudge
+            raw = max(-1.0, min(1.0, float(np.mean(_ps_scores)) + _talib_bonus))
+        elif _talib_bonus != 0.0:
+            raw = max(-1.0, min(1.0, _talib_bonus))
         else:
-            raw, note = 0.0, "TA-Lib unavailable — pattern scan skipped"
-    except Exception:
-        raw, note = 0.0, "Pattern N/A"
-    signals["Candlestick"] = (raw, note)
-    weighted_sum += raw * WEIGHTS["Candlestick"]
+            raw = 0.0
 
-    # ── 12. OBV Trend — on daily candles ──────────────────────────
-    # Strong accumulation (OBV rising while price flat/down) = smart money buying.
-    # Strong distribution (OBV falling while price flat/up) = smart money selling.
-    # Uses daily df for a stable multi-day view rather than noisy 1h OBV.
+        note = " · ".join(_ps_notes) if _ps_notes else "No traps, sweeps, or patterns detected"
+
+    except Exception:
+        raw, note = 0.0, "Price structure N/A"
+    signals["Price Structure"] = (raw, note)
+    weighted_sum += raw * WEIGHTS.get("Price Structure", WEIGHTS.get("Candlestick", 0.0))
+
+    # ── 12. CVD (Cumulative Volume Delta) — on 1h candles ────────────
+    # CVD = net buyer/seller pressure estimated from OHLCV bar positions.
+    # More reliable than OBV on BTC: OBV is fragmented across venues + noisy.
+    # Divergences (CVD rising while price falls, or vice versa) are strongest signal.
     try:
-        _obv_trend = calculate_obv_trend(df)
-        if   _obv_trend == "strong_accumulation":  raw, note = +1.0, "OBV: strong accumulation (smart money buying into weakness)"
-        elif _obv_trend == "accumulation":          raw, note = +0.6, "OBV: accumulation (OBV rising with price)"
-        elif _obv_trend == "mild_accumulation":     raw, note = +0.3, "OBV: mild accumulation"
-        elif _obv_trend == "strong_distribution":   raw, note = -1.0, "OBV: strong distribution (smart money selling into strength)"
-        elif _obv_trend == "distribution":          raw, note = -0.6, "OBV: distribution (OBV falling with price)"
-        elif _obv_trend == "mild_distribution":     raw, note = -0.3, "OBV: mild distribution"
-        else:                                       raw, note =  0.0, "OBV: neutral — no clear accumulation or distribution"
+        _cvd_cat, raw = calculate_cvd(_ti, lookback=24)
+        if   _cvd_cat == "bull_divergence":  raw = min(+1.0, abs(raw) + 0.3); note = f"CVD: hidden buying — buyers active vs falling price (strong bull div, {raw:+.2f})"
+        elif _cvd_cat == "bear_divergence":  raw = max(-1.0, -abs(raw) - 0.3); note = f"CVD: hidden selling — sellers active into rally (strong bear div, {raw:+.2f})"
+        elif _cvd_cat == "accumulation":     note = f"CVD: net buy pressure (CVD↑ with price↑, {raw:+.2f})"
+        elif _cvd_cat == "distribution":     note = f"CVD: net sell pressure (CVD↓ with price↓, {raw:+.2f})"
+        else:                                raw = 0.0; note = "CVD: neutral — balanced buy/sell pressure"
     except Exception:
-        raw, note = 0.0, "OBV N/A"
-    signals["OBV Trend"] = (raw, note)
-    weighted_sum += raw * WEIGHTS["OBV Trend"]
+        raw, note = 0.0, "CVD N/A"
+    signals["CVD Trend"] = (raw, note)
+    weighted_sum += raw * WEIGHTS["CVD Trend"]
 
-    # ── Final score — EMA-smoothed to suppress refresh-to-refresh noise ──────
-    # α=0.30 → half-life ~2 refreshes (~4 min at 2-min cadence).
-    # Prior 0.12 was too slow: score lagged 20+ points behind actual signals
-    # when conditions shifted, giving stale readings for 15+ minutes.
+    # ── 13. OI / Funding Regime ────────────────────────────────────
+    # price↑ + OI↑ = trend continuation (bull); price↑ + OI↓ = short covering (weaker)
+    # flat price + rising OI = squeeze brewing; high positive funding = overleveraged longs
+    # Funding tanh: +0.01% rate (neutral) → 0; +0.05% (crowded longs) → -0.8 (bearish)
+    try:
+        _oi = oi_data or {}
+        _fr  = _oi.get("funding_rate", None)
+        _oi24 = _oi.get("oi_24h_delta_pct", None)
+        if _fr is None and _oi24 is None:
+            raw, note = 0.0, "OI/Funding: N/A"
+        else:
+            # Funding component: crowded longs (high +funding) = bearish signal
+            # tanh centered at 0.01% (typical neutral) with scale 0.025%
+            _fr_val  = _fr if _fr is not None else 0.0
+            _fr_comp = float(-np.tanh((_fr_val - 0.0001) / 0.00025))
+            # OI delta component: rising OI = conviction, falling = fading
+            _oi_comp = float(np.tanh(_oi24 / 5.0)) if _oi24 is not None else 0.0
+            # Price-OI divergence: if OI falling while price rising → weaker bull
+            _p1h  = closes[-1]
+            _pm1h = closes[-2] if len(closes) >= 2 else _p1h
+            _price_rising = _p1h > _pm1h
+            if _oi24 is not None and _price_rising and _oi24 < -2:
+                _oi_comp *= 0.5   # short-covering rally, not conviction
+            raw  = max(-1.0, min(1.0, 0.5 * _fr_comp + 0.5 * _oi_comp))
+            _fr_pct = _fr_val * 100 if _fr is not None else None
+            note = (f"Funding {_fr_pct:+.4f}%/8h" if _fr_pct is not None else "Funding N/A") + \
+                   (f", OI 24h {_oi24:+.1f}%" if _oi24 is not None else ", OI N/A") + \
+                   f" (raw {raw:+.2f})"
+    except Exception:
+        raw, note = 0.0, "OI/Funding N/A"
+    signals["OI Funding"] = (raw, note)
+    weighted_sum += raw * WEIGHTS["OI Funding"]
+
+    # ── Signal family normalization — cap each family before summing ──────────
+    # Prevents correlated signals from compounding false confidence.
+    # Each family is capped at ±1 effective unit; the individual weights still apply.
+    def _family_cap(keys: list, cap: float = 1.0) -> None:
+        total = sum(signals[k][0] * WEIGHTS[k] for k in keys if k in signals)
+        max_possible = sum(WEIGHTS[k] for k in keys if k in signals)
+        if max_possible == 0:
+            return
+        utilization = total / max_possible  # how much of max the family is using
+        if abs(utilization) > cap:
+            scale = cap / abs(utilization)
+            for k in keys:
+                if k in signals:
+                    signals[k] = (signals[k][0] * scale, signals[k][1])
+
+    _family_cap(["EMA Structure", "MACD Momentum"],                           cap=0.95)
+    _family_cap(["RSI Level", "Stochastic Zone", "RSI Divergence", "4h RSI", "MACD Divergence"],  cap=0.95)
+    _family_cap(["Hunt Zone Pull", "Swept Reversal", "Cascade Direction", "Order Book Depth"],  cap=0.95)
+    _family_cap(["CVD Trend", "OI Funding"],                                  cap=0.95)
+
+    # Recompute weighted_sum after family normalization
+    weighted_sum = sum(sig * WEIGHTS.get(name, 0) for name, (sig, _) in signals.items())
+
+    # ⑫ Signal dispersion — std of raw signal values measures genuine consensus.
+    # Low std = all signals agree → real conviction.
+    # High std = half at +1, half at -1 → misleading average → flag as weak.
+    _sig_vals   = [v[0] for v in signals.values()]
+    _sig_std    = float(np.std(_sig_vals)) if _sig_vals else 0.5
+    # Normalize: std=0 → conviction=1.0, std=0.7 (max for ±1 distribution) → conviction≈0
+    _conviction = round(max(0.0, 1.0 - _sig_std / 0.70), 2)
+
+    # ── Final score — EMA-smoothed (α=0.65) to suppress refresh-to-refresh noise ──
     _raw_score = max(-100.0, min(100.0, weighted_sum * 100))
     _EMA_KEY   = "_bias_score_ema"
     _prev      = st.session_state.get(_EMA_KEY, _raw_score)
-    _smoothed  = 0.30 * _raw_score + 0.70 * _prev
+    _smoothed  = 0.65 * _raw_score + 0.35 * _prev
     st.session_state[_EMA_KEY] = _smoothed
     score = round(_smoothed, 1)
 
@@ -3455,8 +4074,324 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
     elif score >  -70: label, color = "BEAR BIAS",   "#f0883e"
     else:              label, color = "STRONG BEAR",  "#f85149"
 
+    # ── Probabilistic outputs ─────────────────────────────────────────────────
+    # bull_prob: logistic transform of score, calibrated so score=0 → 50%, ±60 → ~80/20%
+    bull_prob     = round(100 / (1 + np.exp(-score / 30)), 1)
+    # expected_move: ATR-based 72h range estimate, direction-weighted by score
+    try:
+        # Realized 72h volatility: std of all 3-day rolling returns in the lookback window.
+        # More accurate than ATR×3 because BTC vol clusters — ATR×3 overestimates in calm periods.
+        _cls_daily  = df["Close"].dropna()
+        _ret_72h    = _cls_daily.pct_change(3).dropna() * 100   # 3-day % returns
+        _vol_72h    = float(_ret_72h.std()) if len(_ret_72h) >= 10 else 3.0
+        _price_now  = float(_cls_daily.iloc[-1])
+        expected_range = round(_price_now * _vol_72h / 100, 0)
+        expected_move  = round(expected_range * (score / 100) * 0.7, 0)
+    except Exception:
+        expected_move  = None
+        expected_range = None
+
     return {"score": score, "label": label, "color": color,
-            "signals": signals, "weights": WEIGHTS}
+            "signals": signals, "weights": WEIGHTS,
+            "regime": regime, "adx_1h": round(_adx_1h, 1) if _adx_ok else None,
+            "atr_percentile": round(_atr_pctile * 100, 0),
+            "bull_prob": bull_prob,
+            "expected_move": expected_move,
+            "expected_range": expected_range,
+            "conviction": _conviction,   # ⑫ 0=split signals, 1=full consensus
+            "signal_std": round(_sig_std, 3)}
+
+
+def compute_24h_bias(df: pd.DataFrame, btc_liq: dict = None,
+                     short_df: pd.DataFrame = None,
+                     oi_data: dict = None,
+                     crypto_sig: dict = None,
+                     poly: dict = None) -> dict:
+    """
+    24-hour directional bias with full ADX regime switching (④).
+    Distinct from 72h engine:
+      - RSI(7) vs RSI(14), Fast MACD (6,13,4) vs standard (12,26,9)
+      - Liquidation imbalance and candle close position are unique to this engine
+      - CVD uses 6h window with rolling-std normalization (⑬)
+      - Microstructure signals (OB, CVD, liq) carry more weight (⑭)
+      - Polymarket daily thesis re-added at light weight (⑥)
+    """
+    tf = short_df if (short_df is not None and not short_df.empty) else df
+
+    # ④ Full ADX regime detection — same pattern as 72h engine
+    try:
+        _adx24 = calculate_adx(tf, period=14)
+        _adx24_ok = not np.isnan(_adx24)
+    except Exception:
+        _adx24 = float("nan"); _adx24_ok = False
+    if _adx24_ok and _adx24 > 25:
+        _regime24 = "trend"
+    elif _adx24_ok and _adx24 < 15:
+        _regime24 = "range"
+    else:
+        _regime24 = "transition"
+    _mr = 0.45 if _regime24 == "trend" else (1.10 if _regime24 == "range" else 1.0)
+
+    # ⑭ Weight tables: microstructure signals get boosted vs structural ones.
+    # OB depth, CVD, liq imbalance, and momentum matter most over 24h.
+    # RSI/Stoch get less weight than in 72h since mean-reversion over 24h is noisy.
+    _W24_BASE = {
+        "RSI7":              0.07,
+        "Stochastic":        0.04,
+        "Fast MACD":         0.10,
+        "Momentum":          0.11,
+        "Candle Pos":        0.07,
+        "Order Book":        0.06,   # trimmed for Nearby Liq Magnet
+        "Funding":           0.11,
+        "CVD":               0.14,
+        "Liq Imbalance":     0.14,   # trimmed for Nearby Liq Magnet
+        "Nearby Liq Magnet": 0.04,   # NEW — projected liq clusters within ±2.5%
+        "EMA Align":         0.08,
+        "Polymarket":        0.03,
+        "Fear Greed":        0.01,
+    }
+    _W24_TREND = {
+        "RSI7":              0.04, "Stochastic":        0.02, "Fast MACD":     0.12,
+        "Momentum":          0.14, "Candle Pos":        0.06, "Order Book":    0.04,
+        "Funding":           0.09, "CVD":               0.13, "Liq Imbalance": 0.16,
+        "Nearby Liq Magnet": 0.03, "EMA Align":         0.10, "Polymarket":    0.03,
+        "Fear Greed":        0.04,
+    }
+    _W24_RANGE = {
+        "RSI7":              0.12, "Stochastic":        0.09, "Fast MACD":     0.07,
+        "Momentum":          0.08, "Candle Pos":        0.07, "Order Book":    0.05,
+        "Funding":           0.10, "CVD":               0.13, "Liq Imbalance": 0.13,
+        "Nearby Liq Magnet": 0.06, "EMA Align":         0.04, "Polymarket":    0.03,
+        "Fear Greed":        0.03,
+    }
+    _W24 = {"trend": _W24_TREND, "range": _W24_RANGE, "transition": _W24_BASE}[_regime24]
+    # Normalise weights to sum to 1.0
+    _w24_sum = sum(_W24.values())
+    _W24 = {k: v / _w24_sum for k, v in _W24.items()}
+    # Weight floor: no signal silenced below 1%
+    _W24 = {k: max(v, 0.01) for k, v in _W24.items()}
+    _w24_sum = sum(_W24.values())
+    _W24 = {k: v / _w24_sum for k, v in _W24.items()}
+
+    _sigs24 = {}
+
+    # 1. RSI(7) — faster than 72h engine's RSI(14)
+    try:
+        _delta = tf["Close"].diff()
+        _gain  = _delta.clip(lower=0).ewm(com=6, adjust=False).mean()
+        _loss  = (-_delta).clip(lower=0).ewm(com=6, adjust=False).mean()
+        _rsi7  = float((100 - 100 / (1 + _gain / (_loss + 1e-9))).dropna().iloc[-1])
+        _sigs24["RSI7"] = float(np.tanh((50.0 - _rsi7) / 10.0)) * _mr
+    except Exception:
+        _sigs24["RSI7"] = 0.0
+
+    # 2. Stochastic %K/%D with cross bonus
+    try:
+        _st = calculate_stochastic(tf)
+        k = float(_st["k"].dropna().iloc[-1])
+        d = float(_st["d"].dropna().iloc[-1])
+        s = float(np.tanh((50.0 - k) / 12.0))
+        cross = 0.40 if (k > d and k < 35) else (-0.40 if (k < d and k > 65) else 0.0)
+        _sigs24["Stochastic"] = (s + cross * (1.0 - abs(s))) * _mr
+    except Exception:
+        _sigs24["Stochastic"] = 0.0
+
+    # 3. Fast MACD (6,13,4) — intraday momentum vs 72h's standard (12,26,9)
+    try:
+        _ema6  = tf["Close"].ewm(span=6,  adjust=False).mean()
+        _ema13 = tf["Close"].ewm(span=13, adjust=False).mean()
+        _fmacd = _ema6 - _ema13
+        _fsig  = _fmacd.ewm(span=4, adjust=False).mean()
+        _fhist = (_fmacd - _fsig).dropna()
+        h_now  = float(_fhist.iloc[-1])
+        h_prev = float(_fhist.iloc[-2]) if len(_fhist) >= 2 else h_now
+        h_mean = float(_fhist.abs().mean()) or 1.0
+        s = float(np.tanh(h_now / h_mean))
+        accel = (0.30 if (h_now > h_prev > 0 or h_now > 0 > h_prev) else
+                -0.30 if (h_now < h_prev < 0 or h_now < 0 < h_prev) else 0.0)
+        _sigs24["Fast MACD"] = s * 0.70 + accel * 0.30
+    except Exception:
+        _sigs24["Fast MACD"] = 0.0
+
+    # 4. Short-horizon momentum: 1h/4h only (24h momentum belongs to 72h engine)
+    try:
+        _cl = tf["Close"].dropna()
+        c0  = float(_cl.iloc[-1])
+        c1  = float(_cl.iloc[-2]) if len(_cl) >= 2 else c0
+        c4  = float(_cl.iloc[-5]) if len(_cl) >= 5 else c0
+        mom = np.tanh((c0 - c1) / c1 * 100 / 0.5) * 0.60 + np.tanh((c0 - c4) / c4 * 100 / 1.2) * 0.40
+        _sigs24["Momentum"] = float(mom)
+    except Exception:
+        _sigs24["Momentum"] = 0.0
+
+    # 5. EMA Align — structural trend anchor on 1h candles (EMA8 vs EMA21)
+    # ±0.5% spread → ±1.0 signal. Bullish when EMA8 > EMA21, bearish when below.
+    try:
+        _ema8_24  = tf["Close"].ewm(span=8,  adjust=False).mean()
+        _ema21_24 = tf["Close"].ewm(span=21, adjust=False).mean()
+        _e8  = float(_ema8_24.iloc[-1])
+        _e21 = float(_ema21_24.iloc[-1])
+        _sigs24["EMA Align"] = float(np.tanh((_e8 - _e21) / _e21 * 100 / 0.5))
+    except Exception:
+        _sigs24["EMA Align"] = 0.0
+
+    # 6. Candle close position — where last 3 bars closed within their H/L range
+    try:
+        _hi  = tf["High"].dropna().iloc[-3:]
+        _lo  = tf["Low"].dropna().iloc[-3:]
+        _cl3 = tf["Close"].dropna().iloc[-3:]
+        _rng = (_hi - _lo).replace(0, np.nan)
+        _pos = ((_cl3 - _lo) / _rng - 0.5) * 2
+        _wts = np.array([0.20, 0.30, 0.50])[:len(_pos)]; _wts /= _wts.sum()
+        _sigs24["Candle Pos"] = float(np.dot(_pos.fillna(0).values, _wts))
+    except Exception:
+        _sigs24["Candle Pos"] = 0.0
+
+    # 6. Order book depth ratio — smoothed over last 5 readings to cut noise
+    try:
+        bid = btc_liq.get("total_bid_depth", 0) if btc_liq else 0
+        ask = btc_liq.get("total_ask_depth", 0) if btc_liq else 0
+        _raw_ob24 = float(np.tanh((bid / (ask + 1e-9) - 1.0) / 0.35)) if bid + ask > 0 else 0.0
+        _ob24_buf = st.session_state.setdefault("_ob24_buf", [])
+        _ob24_buf.append(_raw_ob24)
+        if len(_ob24_buf) > 5:
+            _ob24_buf.pop(0)
+        _sigs24["Order Book"] = float(np.mean(_ob24_buf))
+    except Exception:
+        _sigs24["Order Book"] = 0.0
+
+    # 7. Funding rate — center at 0.01% (same neutral as 72h engine)
+    try:
+        fr = oi_data.get("funding_rate") if oi_data else None
+        _sigs24["Funding"] = float(-np.tanh((fr - 0.0001) / 0.00025)) if fr is not None else 0.0
+    except Exception:
+        _sigs24["Funding"] = 0.0
+
+    # 8. ⑬ CVD with rolling-std normalization (not arbitrary fixed divisor)
+    try:
+        _tf6h = tf.iloc[-7:] if len(tf) >= 7 else tf   # ~6h of 1h candles
+        _, _cvd_raw = calculate_cvd(_tf6h)
+        # Rolling 20-period std for calibration — adapts to current volume conditions
+        _cvd_series = []
+        for _i in range(max(1, len(tf) - 19), len(tf) + 1):
+            try:
+                _, _c = calculate_cvd(tf.iloc[max(0, _i - 7): _i])
+                _cvd_series.append(_c)
+            except Exception:
+                pass
+        _cvd_std = float(np.std(_cvd_series)) if len(_cvd_series) >= 3 else 30.0
+        _sigs24["CVD"] = float(np.tanh(_cvd_raw / (_cvd_std + 1e-9)))
+    except Exception:
+        _sigs24["CVD"] = 0.0
+
+    # 9. Liquidation imbalance — UNIQUE to 24h engine
+    try:
+        import time as _time
+        _liq_ev = st.session_state.get(_LIQ_EVENTS_KEY, {})
+        _sigs24["Liq Imbalance"] = 0.0
+        if _liq_ev:
+            _cutoff = (_time.time() - 4 * 3600) * 1000
+            _ll = _sl = 0.0
+            for _ts_ms, _ev_list in _liq_ev.items():
+                if float(_ts_ms) < _cutoff:
+                    continue
+                for _ev in (_ev_list if isinstance(_ev_list, list) else [_ev_list]):
+                    _side = str(_ev.get("side", "")).upper()
+                    _notl = float(_ev.get("notional", 0))
+                    if _side in ("SELL", "SHORT"):
+                        _ll += _notl
+                    elif _side in ("BUY", "LONG"):
+                        _sl += _notl
+            _tl = _ll + _sl
+            if _tl > 0:
+                _sigs24["Liq Imbalance"] = float(np.tanh((_sl - _ll) / _tl / 0.4))
+    except Exception:
+        _sigs24["Liq Imbalance"] = 0.0
+
+    # 9b. Nearby Liq Magnet — projected liquidation clusters within ±2.5%
+    # Forward-looking complement to Liq Imbalance (which is reactive — measures
+    # liquidations that ALREADY fired). This signal reads the same synthetic /
+    # Coinglass map that feeds the 72h Hunt Zone Pull, but with an intraday
+    # window and tighter notional floor.
+    #   +1 → short-liq cluster above pulls UP (squeeze magnet)
+    #   -1 → long-liq cluster below pulls DOWN (flush magnet)
+    try:
+        _hz24       = (btc_liq or {}).get("liq_analysis", {}).get("hunt_zones", [])
+        _ask_pull24 = 0.0
+        _bid_pull24 = 0.0
+        _px24       = float((btc_liq or {}).get("liq_current_price")
+                            or tf["Close"].iloc[-1])
+        for _z in _hz24:
+            _zp   = float(_z.get("price", 0))
+            if _zp <= 0:
+                continue
+            _dist = abs(_zp - _px24) / _px24
+            if _dist > 0.025 or _dist < 1e-4:
+                continue
+            _ntl = float(_z.get("notional", _z.get("wall", 0)))
+            if _ntl < 500_000:
+                continue
+            # Linear 1/dist weighting — intraday distance matters but doesn't
+            # dominate as steeply as the 72h's 1/dist² treatment.
+            _strength = (_ntl / 1e6) / _dist
+            if _z.get("side") == "ASK":
+                _ask_pull24 += _strength
+            else:
+                _bid_pull24 += _strength
+        _tot24 = _ask_pull24 + _bid_pull24
+        if _tot24 > 0:
+            _dir24 = (_ask_pull24 - _bid_pull24) / _tot24
+            _mag24 = float(np.tanh(_tot24 / 200.0))
+            _sigs24["Nearby Liq Magnet"] = _dir24 * _mag24
+        else:
+            _sigs24["Nearby Liq Magnet"] = 0.0
+    except Exception:
+        _sigs24["Nearby Liq Magnet"] = 0.0
+
+    # 10. ⑥ Polymarket daily thesis — light weight, avoids heavy correlation with 72h
+    # Uses thesis_score (range -10..+10) normalised to -1..+1. Only applies when
+    # ≥1 qualifying market found and confidence > 20% (thin markets excluded).
+    try:
+        _pm = poly or {}
+        # 24h engine uses signal_24h — horizon-weighted toward same-day questions
+        _pm_sig  = float(_pm.get("signal_24h", _pm.get("signal", 0.0)))
+        _pm_conf = float(_pm.get("confidence", 0.0))
+        _pm_n    = int(_pm.get("markets_used", 0))
+        if _pm_n >= 1 and _pm_conf > 0.20:
+            _cf24 = 0.2 + 0.8 * _pm_conf
+            if _pm_conf > 0.85:
+                _boost24 = 1.0 + (_pm_conf - 0.85) * 4.0
+                _sigs24["Polymarket"] = float(np.clip(np.tanh(_pm_sig * _cf24 * _boost24), -1.0, 1.0))
+            else:
+                _sigs24["Polymarket"] = float(np.clip(_pm_sig * _cf24, -1.0, 1.0))
+        else:
+            _sigs24["Polymarket"] = 0.0
+    except Exception:
+        _sigs24["Polymarket"] = 0.0
+
+    # 11. Fear & Greed — only at panic (<20) or euphoria (>80) extremes ⑤
+    try:
+        fg = crypto_sig.get("fear_greed_value") if crypto_sig else None
+        if isinstance(fg, (int, float)) and (fg < 20 or fg > 80):
+            _sigs24["Fear Greed"] = float(np.tanh((50.0 - fg) / 15.0))
+        else:
+            _sigs24["Fear Greed"] = 0.0
+    except Exception:
+        _sigs24["Fear Greed"] = 0.0
+
+    # Weighted sum
+    _ws24 = sum(_sigs24.get(k, 0.0) * w for k, w in _W24.items())
+    score_100 = float(np.clip(_ws24 * 100, -100, 100))
+
+    if   score_100 >= 40: lab, col = "BULLISH",   "#3fb950"
+    elif score_100 >= 20: lab, col = "MILD BULL", "#58a6ff"
+    elif score_100 > -20: lab, col = "NEUTRAL",   "#8b949e"
+    elif score_100 > -40: lab, col = "MILD BEAR", "#f0883e"
+    else:                 lab, col = "BEARISH",   "#f85149"
+
+    return {"score": score_100, "label": lab, "color": col,
+            "regime": _regime24, "adx": round(_adx24, 1) if _adx24_ok else None,
+            "signals": _sigs24, "weights": _W24}
 
 
 def _fetch_btc_liquidity(current_price=None):
@@ -3472,6 +4407,35 @@ def _fetch_btc_liquidity(current_price=None):
     sadj = (+1 if bias == "BID" and stren in ("strong", "moderate") else
             -1 if bias == "ASK" and stren in ("strong", "moderate") else 0)
 
+    # ── Liquidation map for hunt-zone / cascade engines ──────────────────────
+    # Priority: Coinglass (paid) → Hyblock (paid) → Binance synthetic (free)
+    # When any is available we feed REAL liquidation levels into _analyze_liq
+    # instead of using order-book bid_c/ask_c as a proxy.
+    _liq_map     = None
+    _liq_map_src = "orderbook_proxy"
+    if d["price"] > 0:
+        _liq_map = _fetch_coinglass_liq_map()
+        if _liq_map:
+            _liq_map_src = "coinglass"
+        else:
+            _liq_map = _fetch_hyblock_liq_map()
+            if _liq_map:
+                _liq_map_src = "hyblock"
+            else:
+                _liq_map = _fetch_binance_synthetic_liqmap(d["price"])
+                if _liq_map:
+                    _liq_map_src = _liq_map.get("source", "binance_synthetic")
+
+    # If we have a real liq map, build {price: usd} dicts that _analyze_liq's
+    # cascade/hunt-zone engines can consume in place of order-book clusters.
+    # long-liq levels (below price) → bid_c slot; short-liq (above) → ask_c slot.
+    if _liq_map:
+        _bidc_for_engine = {float(p): float(u) for p, u in _liq_map.get("long",  [])}
+        _askc_for_engine = {float(p): float(u) for p, u in _liq_map.get("short", [])}
+    else:
+        _bidc_for_engine = d.get("bid_c", {})
+        _askc_for_engine = d.get("ask_c", {})
+
     analysis = {}
     if d["bid_walls"] or d["ask_walls"] or d["raw_bids"] or d["raw_asks"]:
         lo   = d["price"] * (1 - WALL_RANGE_PCT / 100)
@@ -3485,7 +4449,8 @@ def _fetch_btc_liquidity(current_price=None):
         except Exception:
             la = sa = None
         analysis = _analyze_liq(la, sa, grid, d["price"], d["bid_walls"], d["ask_walls"],
-                                bid_c=d.get("bid_c", {}), ask_c=d.get("ask_c", {}))
+                                bid_c=_bidc_for_engine, ask_c=_askc_for_engine)
+        analysis["liq_map_source"] = _liq_map_src
 
     result = {
         "liq_bid_walls": d["bid_walls"], "liq_ask_walls": d["ask_walls"],
@@ -3497,7 +4462,9 @@ def _fetch_btc_liquidity(current_price=None):
         "liq_spread_bps": d["spread"],
         "liq_bias": bias, "liq_bias_strength": stren,
         "liq_source": d["source"], "liq_score_adj": sadj,
-        "liq_cg_available": False, "liq_analysis": analysis,
+        "liq_cg_available": _liq_map_src != "orderbook_proxy",
+        "liq_map_source":   _liq_map_src,
+        "liq_analysis": analysis,
     }
     result["liq_narrative"] = _narrative(result, analysis)
     parts = []
@@ -3535,8 +4502,37 @@ def _cmap_asks():
     return LinearSegmentedColormap.from_list("asks", ["#220000", "#880011", "#cc2200", "#ff4400", "#ff9944"], N=256)
 
 
+def _fetch_binance_klines(interval: str, limit: int, symbol: str = "BTCUSDT"):
+    """Single source of truth for BTC OHLCV — Binance spot klines.
+    Returns DataFrame with UTC DatetimeIndex and Open/High/Low/Close/Volume columns,
+    or None on failure. The most recent row is the currently-forming candle (live)."""
+    try:
+        import datetime as _dt
+        url  = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+        data = _get_raw(url)
+        if not data:
+            return None
+        timestamps, rows = [], []
+        for k in data:
+            timestamps.append(_dt.datetime.fromtimestamp(k[0] / 1000, tz=_dt.timezone.utc))
+            rows.append({
+                "Open":   float(k[1]),
+                "High":   float(k[2]),
+                "Low":    float(k[3]),
+                "Close":  float(k[4]),
+                "Volume": float(k[5]),
+            })
+        return pd.DataFrame(rows, index=pd.DatetimeIndex(timestamps))
+    except Exception:
+        return None
+
+
 def _fetch_short_term_ohlcv():
     """1h BTC candles for last 72 hours (used for 72h bias computation)."""
+    df = _fetch_binance_klines("1h", 72)
+    if df is not None and len(df) >= 10:
+        return df
+    # yfinance fallback if Binance unreachable
     try:
         import datetime as _dt
         end   = _dt.datetime.now(_dt.timezone.utc)
@@ -3551,30 +4547,74 @@ def _fetch_short_term_ohlcv():
 
 
 @st.cache_data(ttl=900, show_spinner=False)
+def _fetch_4h_ohlcv():
+    """4h BTC candles for last 30 days — primary timeframe for 72h structural signals.
+    4h EMA20/50 span ~80h/200h, which is far more appropriate for a 72h forecast
+    than 1h equivalents that only span ~20h/50h."""
+    df = _fetch_binance_klines("4h", 180)
+    if df is not None and len(df) >= 20:
+        return df
+    # yfinance fallback
+    try:
+        import datetime as _dt
+        end   = _dt.datetime.now(_dt.timezone.utc)
+        start = end - _dt.timedelta(days=30)
+        df    = yf.Ticker("BTC-USD").history(start=start, end=end, interval="4h")
+        if df is not None and len(df) >= 20:
+            df.index = pd.to_datetime(df.index)
+            return df[["Open", "High", "Low", "Close", "Volume"]]
+    except Exception:
+        pass
+    return None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_oi_funding() -> dict:
+    """Fetch Binance futures open interest + funding rate. Returns dict or empty dict on failure."""
+    result = {}
+    try:
+        oi_data = _get_raw("https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT")
+        if isinstance(oi_data, dict) and "openInterest" in oi_data:
+            result["open_interest"] = float(oi_data["openInterest"])
+            result["open_interest_usd"] = float(oi_data.get("openInterestValue", 0))
+    except Exception:
+        pass
+    try:
+        # Historical OI (last 30 periods, 1h) for delta
+        hist = _get_raw(
+            "https://fapi.binance.com/futures/data/openInterestHist"
+            "?symbol=BTCUSDT&period=1h&limit=30"
+        )
+        if isinstance(hist, list) and len(hist) >= 2:
+            oi_vals = [float(r["sumOpenInterestValue"]) for r in hist if "sumOpenInterestValue" in r]
+            if len(oi_vals) >= 2:
+                result["oi_hist"] = oi_vals
+                result["oi_1h_delta_pct"] = (oi_vals[-1] - oi_vals[-2]) / oi_vals[-2] * 100
+                result["oi_24h_delta_pct"] = (oi_vals[-1] - oi_vals[0])  / oi_vals[0]  * 100
+    except Exception:
+        pass
+    try:
+        # Last 8 funding rates
+        fr_data = _get_raw(
+            "https://fapi.binance.com/fapi/v1/fundingRate"
+            "?symbol=BTCUSDT&limit=8"
+        )
+        if isinstance(fr_data, list) and fr_data:
+            rates = [float(r["fundingRate"]) for r in fr_data if "fundingRate" in r]
+            if rates:
+                result["funding_rate"]       = rates[-1]
+                result["funding_rate_avg8h"] = float(np.mean(rates))
+    except Exception:
+        pass
+    return result
+
+
+@st.cache_data(ttl=900, show_spinner=False)
 def _fetch_15min_ohlcv():
     """~5 days of 15-min BTC/USDT candles from Binance (free, no API key).
     We fetch 500 candles (~5 days) so the heat matrix captures positions opened
     well above/below current price; only the last 24h (96 candles) is displayed."""
-    try:
-        import datetime as _dt
-        url  = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=500"
-        data = _get_raw(url)
-        if not data:
-            return None
-        timestamps, rows = [], []
-        for k in data:
-            timestamps.append(_dt.datetime.fromtimestamp(k[0] / 1000, tz=_dt.timezone.utc))
-            rows.append({
-                "Open":   float(k[1]),
-                "High":   float(k[2]),
-                "Low":    float(k[3]),
-                "Close":  float(k[4]),
-                "Volume": float(k[5]),
-            })
-        df = pd.DataFrame(rows, index=pd.DatetimeIndex(timestamps))
-        return df
-    except Exception:
-        return None
+    return _fetch_binance_klines("15m", 500)
 
 
 def _build_liq_heat_2d(plot_df, grid, bsz, tiers=None):
@@ -3776,6 +4816,261 @@ def _fetch_hyblock_liq_map():
 
     except Exception as e:
         st.session_state["_hyblock_err"] = str(e)
+        return None
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  BINANCE SYNTHETIC LIQUIDATION MAP — free, no API key
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Reconstructs a Coinglass-style long/short liquidation heatmap from public
+# Binance futures-data endpoints. Methodology:
+#
+#   1. Walk 1h bars over the last ~20 days.
+#   2. For each bar, OI delta = OI[t] - OI[t-1] (USD notional change).
+#   3. When OI rises → new positions opened at this bar's midprice.
+#      Split between longs/shorts using the taker-buy ratio (closest live
+#      proxy for new directional flow).
+#   4. When OI falls → close oldest tranches first (FIFO) until the drop
+#      is absorbed. Survivors = the position book that's still open.
+#   5. For each surviving tranche, fan its notional across realistic
+#      Binance leverage tiers (3x/5x/10x/25x/50x/100x with empirical
+#      retail+pro distribution) and compute the liquidation price for
+#      each tier using Binance's ~0.4% maintenance margin floor.
+#   6. Apply soft time decay (7-day half-life) — positions still open
+#      after weeks are typically reduced or hedged.
+#   7. Bin all (liq_price, weighted_notional) pairs into the same grid
+#      Coinglass returns.
+#
+# Limits we're honest about: Binance only (~40-50% of BTC perp OI), no
+# margin/spot leverage. Leverage tier weights are empirically calibrated to
+# match observed Coinglass cluster shapes but cannot replicate exact strikes.
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_binance_oi_hist(period: str = "1h", limit: int = 480):
+    """Open interest history. Returns list of (ts_ms, oi_btc, oi_usd) or None.
+    Free, no auth. Binance returns max ~500 entries; 480 × 1h ≈ 20 days."""
+    url = ("https://fapi.binance.com/futures/data/openInterestHist"
+           f"?symbol=BTCUSDT&period={period}&limit={limit}")
+    data = _get_raw(url, timeout=10)
+    if not isinstance(data, list) or not data:
+        return None
+    out = []
+    for row in data:
+        try:
+            ts  = int(row["timestamp"])
+            btc = float(row["sumOpenInterest"])
+            usd = float(row["sumOpenInterestValue"])
+            if btc > 0 and usd > 0:
+                out.append((ts, btc, usd))
+        except (KeyError, ValueError, TypeError):
+            continue
+    return out or None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_binance_taker_ls(period: str = "1h", limit: int = 480):
+    """Taker buy/sell ratio. Returns {ts_ms: buy_ratio_0_1}.
+    buy_ratio = buyVol / (buyVol + sellVol). Best live proxy for the
+    directional flow that drove each bar's OI delta."""
+    url = ("https://fapi.binance.com/futures/data/takerlongshortRatio"
+           f"?symbol=BTCUSDT&period={period}&limit={limit}")
+    data = _get_raw(url, timeout=10)
+    if not isinstance(data, list) or not data:
+        return None
+    out = {}
+    for row in data:
+        try:
+            ts = int(row["timestamp"])
+            bv = float(row["buyVol"])
+            sv = float(row["sellVol"])
+            tot = bv + sv
+            if tot > 0:
+                out[ts] = bv / tot
+        except (KeyError, ValueError, TypeError):
+            continue
+    return out or None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_binance_ls_ratio(period: str = "1h", limit: int = 480):
+    """Global account long/short ratio. Fallback when taker ratio is sparse."""
+    url = ("https://fapi.binance.com/futures/data/globalLongShortAccountRatio"
+           f"?symbol=BTCUSDT&period={period}&limit={limit}")
+    data = _get_raw(url, timeout=10)
+    if not isinstance(data, list) or not data:
+        return None
+    out = {}
+    for row in data:
+        try:
+            ts = int(row["timestamp"])
+            la = float(row["longAccount"])
+            # longAccount is fraction in [0,1] — directly usable
+            if 0 < la < 1:
+                out[ts] = la
+        except (KeyError, ValueError, TypeError):
+            continue
+    return out or None
+
+
+# Empirical Binance BTC perp leverage distribution. Tier weights calibrated
+# against observed Coinglass cluster intensity ratios across multiple
+# regime snapshots (bull, range, post-flush). Sum to 1.00.
+_LEV_TIERS = [
+    (3,   0.10),   # conservative whales, hedgers
+    (5,   0.18),   # mid-leverage
+    (10,  0.30),   # most common retail
+    (25,  0.24),   # aggressive retail
+    (50,  0.12),   # gambler tier
+    (100, 0.06),   # YOLO / liquidation farming bait
+]
+# Binance BTCUSDT perp maintenance margin floor (effective fraction)
+_MAINT_MARGIN = 0.004
+
+
+def _liq_price_long(entry: float, lev: int) -> float:
+    """Long liquidation: entry × (1 − 1/lev + maint_margin × something).
+    Simplified Binance formula: liq ≈ entry × (1 − 1/lev × (1 − maint))."""
+    return entry * (1.0 - (1.0 - _MAINT_MARGIN) / lev)
+
+
+def _liq_price_short(entry: float, lev: int) -> float:
+    """Short liquidation: mirror of long."""
+    return entry * (1.0 + (1.0 - _MAINT_MARGIN) / lev)
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def _fetch_binance_synthetic_liqmap(current_price: float):
+    """
+    Build a Coinglass-style liquidation heatmap from free Binance data.
+    Returns dict matching the _fetch_coinglass_liq_map shape:
+        {"long":  [(price, usd), ...],
+         "short": [(price, usd), ...],
+         "max_usd": float,
+         "source": "binance_synthetic"}
+    or None if data is unavailable.
+    """
+    try:
+        oi_hist = _fetch_binance_oi_hist("1h", 480)
+        if not oi_hist or len(oi_hist) < 24:
+            return None
+        taker = _fetch_binance_taker_ls("1h", 480) or {}
+        lsr   = _fetch_binance_ls_ratio("1h", 480) or {}
+
+        # We also need a per-bar entry price. The OI hist row gives
+        # sumOpenInterestValue (USD) and sumOpenInterest (BTC); their ratio
+        # is the average mark price during that bar — exactly what we want
+        # for "where positions were opened".
+        # tranches: list of {"entry": price, "long_usd": x, "short_usd": x, "ts": ms}
+        tranches: list = []
+        prev_usd = None
+
+        for ts, oi_btc, oi_usd in oi_hist:
+            mid_price = oi_usd / oi_btc if oi_btc > 0 else current_price
+            if prev_usd is None:
+                prev_usd = oi_usd
+                continue
+            delta_usd = oi_usd - prev_usd
+
+            if delta_usd > 0:
+                # New positions opened. Allocate by taker buy ratio.
+                # If taker data missing, fall back to longAccount fraction.
+                if ts in taker:
+                    long_frac = taker[ts]
+                elif ts in lsr:
+                    long_frac = lsr[ts]
+                else:
+                    long_frac = 0.5
+                # Clip to [0.2, 0.8] — extreme ratios are noisy and would
+                # produce single-sided liq maps that don't match reality.
+                long_frac = max(0.2, min(0.8, long_frac))
+                tranches.append({
+                    "entry":     mid_price,
+                    "long_usd":  delta_usd * long_frac,
+                    "short_usd": delta_usd * (1.0 - long_frac),
+                    "ts":        ts,
+                })
+            elif delta_usd < 0:
+                # Positions closed. Bleed FIFO from oldest tranches first.
+                close_usd = -delta_usd
+                # Each tranche has long + short components; close them
+                # proportionally (we don't know which side actually closed,
+                # so prorate by tranche composition).
+                i = 0
+                while close_usd > 0 and i < len(tranches):
+                    tr = tranches[i]
+                    tr_total = tr["long_usd"] + tr["short_usd"]
+                    if tr_total <= 0:
+                        i += 1
+                        continue
+                    take = min(close_usd, tr_total)
+                    ratio = take / tr_total
+                    tr["long_usd"]  -= tr["long_usd"]  * ratio
+                    tr["short_usd"] -= tr["short_usd"] * ratio
+                    close_usd       -= take
+                    if tr["long_usd"] + tr["short_usd"] < 1.0:
+                        i += 1     # tranche exhausted
+                    else:
+                        break
+                # Drop fully-exhausted tranches
+                tranches = [t for t in tranches if (t["long_usd"] + t["short_usd"]) >= 1.0]
+
+            prev_usd = oi_usd
+
+        if not tranches:
+            return None
+
+        # Apply 7-day half-life time decay
+        now_ms       = oi_hist[-1][0]
+        HALF_LIFE_MS = 7 * 24 * 3600 * 1000
+
+        # Bin to $50 grid (same as order-book heatmap)
+        BIN  = 50.0
+        long_map: dict  = {}
+        short_map: dict = {}
+
+        for tr in tranches:
+            age_ms = max(0, now_ms - tr["ts"])
+            decay  = 0.5 ** (age_ms / HALF_LIFE_MS)
+            entry  = tr["entry"]
+            for lev, w in _LEV_TIERS:
+                # Long liq price + weighted notional
+                if tr["long_usd"] > 0:
+                    lp = _liq_price_long(entry, lev)
+                    if lp > 0:
+                        b = round(lp / BIN) * BIN
+                        long_map[b] = long_map.get(b, 0.0) + tr["long_usd"] * w * decay
+                # Short liq price
+                if tr["short_usd"] > 0:
+                    sp = _liq_price_short(entry, lev)
+                    if sp > 0:
+                        b = round(sp / BIN) * BIN
+                        short_map[b] = short_map.get(b, 0.0) + tr["short_usd"] * w * decay
+
+        # Filter: longs by definition liquidate BELOW current price, shorts ABOVE.
+        # Liq prices that ended up on the wrong side of current price are
+        # tranches that are already underwater / already liquidated — drop them.
+        longs  = [(p, u) for p, u in long_map.items()  if p < current_price * 0.999]
+        shorts = [(p, u) for p, u in short_map.items() if p > current_price * 1.001]
+
+        if not longs and not shorts:
+            return None
+
+        # Sort by intensity desc for top-cluster display
+        longs.sort(key=lambda x: x[1], reverse=True)
+        shorts.sort(key=lambda x: x[1], reverse=True)
+
+        all_usd = [u for _, u in longs + shorts]
+        max_usd = max(all_usd) if all_usd else 1.0
+
+        return {
+            "long":    longs,
+            "short":   shorts,
+            "max_usd": max_usd,
+            "source":  "binance_synthetic",
+        }
+    except Exception as e:
+        st.session_state["_bn_synth_err"] = str(e)
         return None
 
 
@@ -4104,13 +5399,15 @@ def plot_liquidity_depth(ax, liq, short_df=None):
 
     # ── Layer 1: liquidation heatmap ────────────────────────────────────────
     # Priority order:
-    #   A) Coinglass API       — real open-interest liquidation map (best, paid)
-    #   B) Hyblock Capital     — real liquidation levels (free tier available)
-    #   C) Screenshot extract  — Claude vision reads an uploaded heatmap image
-    #   D) Order-book projection + real liq events overlay (always-free fallback)
+    #   A) Coinglass API           — real OI liquidation map (best, paid)
+    #   B) Hyblock Capital         — real liquidation levels (free tier, needs auth)
+    #   C) Binance synthetic       — reconstructed from public OI+taker+L/S (FREE, NEW)
+    #   D) Order-book projection   — last-resort proxy
     cg_data         = _fetch_coinglass_liq_map()
     hb_data         = _fetch_hyblock_liq_map() if not cg_data else None
-    oi_data         = cg_data or hb_data
+    bn_synth        = (_fetch_binance_synthetic_liqmap(cprice)
+                       if not (cg_data or hb_data) else None)
+    oi_data         = cg_data or hb_data or bn_synth
     using_coinglass = oi_data is not None
 
     if using_coinglass:
@@ -4670,6 +5967,7 @@ def _ax_style(ax):
 #  DATA LAYER — single fetch, all charts share this
 # ════════════════════════════════════════════════════════════════
 
+@st.cache_data(ttl=300, show_spinner=False)
 def run_analysis(ticker: str = "BTC-USD") -> dict:
     """Fetch + compute everything. Returns a plain dict — no figures."""
     df = fetch_ohlc(ticker)
@@ -4678,6 +5976,17 @@ def run_analysis(ticker: str = "BTC-USD") -> dict:
 
     closes = df["Close"].tolist()
     price  = closes[-1]
+    # Override with live Binance spot price — yfinance daily lags by 5-30 min via cache+latency.
+    # Only applies for BTC; other tickers keep yfinance value.
+    if "BTC" in ticker.upper():
+        try:
+            _live = _get_raw("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT")
+            if isinstance(_live, dict) and "price" in _live:
+                _p = float(_live["price"])
+                if _p > 0:
+                    price = _p
+        except Exception:
+            pass
     df["MA50"]  = df["Close"].rolling(50).mean()
     df["MA200"] = df["Close"].rolling(200).mean()
     rsi_series  = calculate_rsi(df["Close"])
@@ -4727,9 +6036,22 @@ def run_analysis(ticker: str = "BTC-USD") -> dict:
     )
 
     short_df      = _fetch_short_term_ohlcv()
+    df_4h         = _fetch_4h_ohlcv()
+    # ⑯ Track 4h fetch freshness: compare session-state timestamp to now.
+    # If score refreshes faster than the 15-min cache, EMA Structure may be stale.
+    _4h_prev_len = st.session_state.get("_4h_cached_len", -1)
+    _4h_cur_len  = len(df_4h) if df_4h is not None else 0
+    if _4h_cur_len != _4h_prev_len:
+        st.session_state["_4h_fetch_ts"]   = _dt.now(_tz.utc).timestamp()
+        st.session_state["_4h_cached_len"] = _4h_cur_len
     poly_sentiment = fetch_polymarket_btc_sentiment(price)
+    oi_funding    = fetch_oi_funding()
     prediction    = predict_direction(df, btc_liq)
-    bias_72h      = compute_72h_bias(df, btc_liq, short_df=short_df, poly=poly_sentiment)
+    bias_72h      = compute_72h_bias(df, btc_liq, short_df=short_df, poly=poly_sentiment,
+                                     oi_data=oi_funding, df_4h=df_4h)
+    bias_24h      = compute_24h_bias(df, btc_liq, short_df=short_df,
+                                     oi_data=oi_funding, crypto_sig=crypto_sig,
+                                     poly=poly_sentiment)
 
     # 24h price change from last two rows
     prev_close = closes[-2] if len(closes) >= 2 else price
@@ -4743,7 +6065,7 @@ def run_analysis(ticker: str = "BTC-USD") -> dict:
         adx_val=adx_val, imm_sup=imm_sup, imm_res=imm_res, w52=w52,
         fib=fib, bb=bb,
         crypto_sig=crypto_sig, btc_liq=btc_liq, has_liq=has_liq,
-        cycle=cycle, prediction=prediction, bias_72h=bias_72h,
+        cycle=cycle, prediction=prediction, bias_72h=bias_72h, bias_24h=bias_24h,
         poly_sentiment=poly_sentiment,
         chg_24h=chg_24h, ticker=ticker,
     )
@@ -4866,9 +6188,8 @@ def fig_price_chart(a: dict) -> plt.Figure:
 
 
 def fig_intraday_15m(a: dict) -> "plt.Figure | None":
-    """24h 15-min candle chart with EMA8/21, VWAP, volume profile, ATR, and liq heatmap."""
-    # Prefer real 15-min Binance data (same source as the Liquidity tab).
-    # Fall back to short_df (1h) if the fetch fails.
+    """24h 15-min chart: EMA ribbon, session shading, market structure labels,
+    relative-volume z-score, ATR regime percentile, HVN/LVN profile, liq walls."""
     _raw15 = _fetch_15min_ohlcv()
     if _raw15 is not None and len(_raw15) >= 10:
         df15 = _raw15.iloc[-96:].copy()
@@ -4887,17 +6208,22 @@ def fig_intraday_15m(a: dict) -> "plt.Figure | None":
     vols   = df15["Volume"].values
     n      = len(df15)
     xs     = np.arange(n)
-    cur    = closes[-1]
+    # Use the live Binance ticker price (a["price"]) instead of the last 15m kline
+    # close — kline cache can lag the ticker by 5–15s, causing the right-side price
+    # tag to disagree with the header BTC Price. Fall back to closes[-1] if missing.
+    _live_price = float(a.get("price") or closes[-1])
+    cur    = _live_price
     p_lo   = lows.min();  p_hi = highs.max()
-    _pad   = (p_hi - p_lo) * 0.05
+    _pad   = (p_hi - p_lo) * 0.06
     colors = np.where(closes >= opens, "#3fb950", "#f85149")
 
+    # EMAs
     ema8  = df15["Close"].ewm(span=8,  adjust=False).mean().values
     ema21 = df15["Close"].ewm(span=21, adjust=False).mean().values
 
     # VWAP — reset each UTC session
     vwap = None
-    vwap_sessions = []  # list of (xs_segment, vwap_segment) per day
+    vwap_sessions = []
     try:
         _idx   = df15.index
         _dates = (_idx.normalize() if (hasattr(_idx, "tz") and _idx.tz is not None)
@@ -4921,8 +6247,28 @@ def fig_intraday_15m(a: dict) -> "plt.Figure | None":
               np.maximum(np.abs(highs - prev_c), np.abs(lows - prev_c)))
     atr     = pd.Series(tr).ewm(span=14, adjust=False).mean().values
     atr_now = atr[-1]
+    atr_pct = float(pd.Series(atr).rank(pct=True).iloc[-1]) * 100   # rolling percentile
+    atr_rolling_pct = pd.Series(atr).rank(pct=True).values * 100
+    atr_mean20  = float(np.mean(atr[-20:])) if len(atr) >= 20 else float(np.mean(atr))
+    atr_chg_pct = (atr_now - atr_mean20) / atr_mean20 * 100
+    if atr_pct < 30:
+        atr_state, atr_sc = "LOW VOL", "#58a6ff"
+    elif atr_pct > 70:
+        atr_state, atr_sc = "HIGH VOL", "#f85149"
+    else:
+        atr_state, atr_sc = "NORMAL",   "#e3b341"
+    # Compression zones: ATR below 30th pctile for ≥2 consecutive bars → blue shading
+    _atr_30 = np.percentile(atr, 30)
+    _compress = atr < _atr_30
 
-    # Volume profile
+    # Relative volume z-score
+    vol_mean = float(np.mean(vols))
+    vol_std  = float(np.std(vols)) if np.std(vols) > 0 else 1.0
+    vol_z    = (vols - vol_mean) / vol_std
+    _bull_mask   = closes >= opens
+    _bright_mask = vol_z >= 1.5   # highlight spikes ≥1.5σ
+
+    # Volume profile (40 bins)
     N_BINS    = 40
     bin_edges = np.linspace(p_lo, p_hi, N_BINS + 1)
     bin_sz    = bin_edges[1] - bin_edges[0]
@@ -4936,13 +6282,39 @@ def fig_intraday_15m(a: dict) -> "plt.Figure | None":
     poc_idx   = int(np.argmax(vol_prof))
     poc_price = (bin_edges[poc_idx] + bin_edges[poc_idx + 1]) / 2
     vp_max    = vol_prof.max() or 1
+    vp_hvn    = np.percentile(vol_prof, 72)   # HVN threshold
+    vp_lvn    = np.percentile(vol_prof, 28)   # LVN threshold
 
+    # Market structure: local swing highs/lows (order=3 bars)
+    _ord = 3
+    swing_highs, swing_lows = [], []
+    for i in range(_ord, n - _ord):
+        if all(highs[i] >= highs[i-j] for j in range(1, _ord+1)) and \
+           all(highs[i] >= highs[i+j] for j in range(1, _ord+1)):
+            swing_highs.append((i, highs[i]))
+        if all(lows[i]  <= lows[i-j]  for j in range(1, _ord+1)) and \
+           all(lows[i]  <= lows[i+j]  for j in range(1, _ord+1)):
+            swing_lows.append((i, lows[i]))
+    struct_labels = []   # (x, y, label, color, "high"|"low")
+    for k in range(1, len(swing_highs)):
+        xi, hi = swing_highs[k]; _, hi_p = swing_highs[k-1]
+        lbl = "HH" if hi > hi_p else "LH"
+        struct_labels.append((xi, hi, lbl, "#3fb950" if lbl == "HH" else "#f85149", "high"))
+    for k in range(1, len(swing_lows)):
+        xi, lo = swing_lows[k]; _, lo_p = swing_lows[k-1]
+        lbl = "HL" if lo > lo_p else "LL"
+        struct_labels.append((xi, lo, lbl, "#3fb950" if lbl == "HL" else "#f85149", "low"))
 
+    # Liquidity walls from btc_liq
+    _liq      = a.get("btc_liq") or {}
+    _liq_anal = _liq.get("liq_analysis", {})
+    _bid_walls = _liq_anal.get("bid_walls", []) or []
+    _ask_walls = _liq_anal.get("ask_walls", []) or []
 
-    # ── Layout ───────────────────────────────────────────────────────
-    fig = plt.figure(figsize=(14, 6), dpi=130)
+    # ── Layout ─────────────────────────────────────────────────────────
+    fig = plt.figure(figsize=(14, 6.5), dpi=130)
     fig.patch.set_facecolor("#0d1117")
-    gs = fig.add_gridspec(3, 2, height_ratios=[4, 0.7, 1],
+    gs = fig.add_gridspec(3, 2, height_ratios=[4, 0.65, 0.9],
                           width_ratios=[5, 0.7], hspace=0.06, wspace=0.015)
     ax_c  = fig.add_subplot(gs[0, 0])
     ax_vp = fig.add_subplot(gs[0, 1], sharey=ax_c)
@@ -4950,34 +6322,100 @@ def fig_intraday_15m(a: dict) -> "plt.Figure | None":
     ax_a  = fig.add_subplot(gs[2, 0], sharex=ax_c)
     for _ax in [ax_c, ax_vp, ax_v, ax_a]: _ax_style(_ax)
 
-    # ── Candles ───────────────────────────────────────────────────────
-    bull = colors == "#3fb950"
+    # ── Session shading (Asia / London / NY) ───────────────────────────
+    # Asia: 00–07 UTC  London: 07–13 UTC  NY: 13–21 UTC
+    # Off-hours (21–00 UTC) shaded grey so the gap doesn't look like a void
+    _SESSIONS = [("Asia",    0,  7,  "#58a6ff", 0.045),
+                 ("London",  7,  13, "#bc8cff", 0.045),
+                 ("NY",      13, 21, "#f0883e", 0.045),
+                 ("Off",     21, 24, "#484f58", 0.18 )]
+    try:
+        _ts_utc = pd.to_datetime(df15.index)
+        if _ts_utc.tz is not None:
+            _ts_utc = _ts_utc.tz_convert("UTC")
+        for _sname, _sh, _eh, _sc, _sa in _SESSIONS:
+            _in = np.array([_sh <= t.hour < _eh for t in _ts_utc])
+            _seg_start = None
+            for i in range(len(_in)):
+                if _in[i] and _seg_start is None:
+                    _seg_start = i
+                elif not _in[i] and _seg_start is not None:
+                    for _axs in (ax_c, ax_v):
+                        _axs.axvspan(_seg_start - 0.5, i - 0.5, color=_sc, alpha=_sa, zorder=0)
+                    ax_c.text(_seg_start + 0.5, p_hi + _pad * 0.55, _sname,
+                              fontsize=5, color=_sc, alpha=0.65, va="bottom", zorder=1)
+                    _seg_start = None
+            if _seg_start is not None:
+                for _axs in (ax_c, ax_v):
+                    _axs.axvspan(_seg_start - 0.5, n - 0.5, color=_sc, alpha=_sa, zorder=0)
+                ax_c.text(_seg_start + 0.5, p_hi + _pad * 0.55, _sname,
+                          fontsize=5, color=_sc, alpha=0.65, va="bottom", zorder=1)
+    except Exception:
+        pass
+
+    # ── Volatility compression zones (amber — distinct from blue Asia shading) ──
+    _cseg = None
+    for i in range(n):
+        if _compress[i] and _cseg is None:
+            _cseg = i
+        elif not _compress[i] and _cseg is not None:
+            ax_c.axvspan(_cseg - 0.5, i - 0.5, color="#e3b341", alpha=0.09, zorder=0)
+            _cseg = None
+    if _cseg is not None:
+        ax_c.axvspan(_cseg - 0.5, n - 0.5, color="#e3b341", alpha=0.09, zorder=0)
+
+    # ── Liquidity wall overlays ─────────────────────────────────────────
+    for _wp, _wn in _bid_walls[:4]:
+        if p_lo * 0.98 <= _wp <= p_hi * 1.02:
+            _wt = min(2.5, 0.6 + float(_wn) / 3e7)
+            ax_c.axhline(_wp, color="#3fb950", lw=_wt, ls="--", alpha=0.55, zorder=2)
+            ax_c.text(1, _wp, " bid", transform=ax_c.get_yaxis_transform(),
+                      fontsize=5.5, color="#3fb950", va="bottom", alpha=0.8)
+    for _wp, _wn in _ask_walls[:4]:
+        if p_lo * 0.98 <= _wp <= p_hi * 1.02:
+            _wt = min(2.5, 0.6 + float(_wn) / 3e7)
+            ax_c.axhline(_wp, color="#f85149", lw=_wt, ls="--", alpha=0.55, zorder=2)
+            ax_c.text(1, _wp, " ask", transform=ax_c.get_yaxis_transform(),
+                      fontsize=5.5, color="#f85149", va="top", alpha=0.8)
+
+    # ── Candles ────────────────────────────────────────────────────────
     ax_c.bar(xs, closes - opens, 0.55, bottom=opens, color=colors, alpha=1.0, zorder=3)
     ax_c.bar(xs, highs  - lows,  0.12, bottom=lows,  color=colors, alpha=0.9, zorder=3)
 
-    # ── EMAs ─────────────────────────────────────────────────────────
-    ax_c.plot(xs, ema8,  color="#58a6ff", lw=1.4, label="EMA8",  zorder=4)
-    ax_c.plot(xs, ema21, color="#f0883e", lw=1.4, label="EMA21", zorder=4)
+    # ── EMA ribbon: green fill when EMA8 > EMA21, red when below ───────
+    ax_c.fill_between(xs, ema8, ema21, where=(ema8 >= ema21),
+                      color="#3fb950", alpha=0.12, zorder=2, interpolate=True)
+    ax_c.fill_between(xs, ema8, ema21, where=(ema8 < ema21),
+                      color="#f85149", alpha=0.12, zorder=2, interpolate=True)
+    ax_c.plot(xs, ema8,  color="#58a6ff", lw=0.85, alpha=0.70, label="EMA8",  zorder=4)
+    ax_c.plot(xs, ema21, color="#f0883e", lw=1.75,             label="EMA21", zorder=4)
 
-    # ── VWAP ─────────────────────────────────────────────────────────
+    # ── VWAP ──────────────────────────────────────────────────────────
     if vwap_sessions:
         for i, (_xs, _vw) in enumerate(vwap_sessions):
-            ax_c.plot(_xs, _vw, color="#d2a8ff", lw=1.0, ls="--",
+            ax_c.plot(_xs, _vw, color="#d2a8ff", lw=1.05, ls="--",
                       label="VWAP" if i == 0 else "_nolegend_", zorder=4)
 
-    # ── POC line ─────────────────────────────────────────────────────
-    ax_c.axhline(poc_price, color="#e3b341", lw=0.8, ls=(0,(4,4)), alpha=0.75, zorder=2)
+    # ── POC line ──────────────────────────────────────────────────────
+    ax_c.axhline(poc_price, color="#e3b341", lw=0.85, ls=(0,(4,4)), alpha=0.75, zorder=2)
     ax_c.text(0.002, poc_price, " POC \${:,.0f}".format(poc_price),
               transform=ax_c.get_yaxis_transform(),
               color="#e3b341", fontsize=6.5, va="bottom", zorder=5)
 
-    # ── Current price tag (on right y-axis, inside candle area) ─────
+    # ── Market structure labels (last 6 chronologically — mix of highs & lows) ─
+    _struct_sorted = sorted(struct_labels, key=lambda t: t[0])
+    for _sx, _sy, _slbl, _scol, _sside in _struct_sorted[-6:]:
+        _yoff = _pad * 0.35 if _sside == "high" else -_pad * 0.35
+        ax_c.text(_sx, _sy + _yoff, _slbl, fontsize=6.5, color=_scol,
+                  ha="center", va="bottom" if _sside == "high" else "top",
+                  fontweight="bold", zorder=6,
+                  bbox=dict(boxstyle="round,pad=0.1", fc="#0d1117", ec=_scol, lw=0.5, alpha=0.75))
+
+    # ── Current price tag ─────────────────────────────────────────────
     _cur_col = "#3fb950" if closes[-1] >= opens[-1] else "#f85149"
     ax_c.axhline(cur, color=_cur_col, lw=0.6, ls=":", alpha=0.45, zorder=2)
-    # Price tag drawn on ax_vp so it sits in front of the vol profile bars
-    # (drawn after bars are added below)
 
-    # ── Axes ─────────────────────────────────────────────────────────
+    # ── Axes ──────────────────────────────────────────────────────────
     tick_pos  = list(range(0, n, 8))
     tick_lbls = []
     for i in tick_pos:
@@ -4993,36 +6431,59 @@ def fig_intraday_15m(a: dict) -> "plt.Figure | None":
     ax_c.spines["top"].set_visible(False)
     ax_c.spines["right"].set_visible(False)
 
-    ema_lbl = "EMA8 > EMA21 ▲" if ema8[-1] > ema21[-1] else "EMA8 < EMA21 ▼"
-    ema_col = "#3fb950" if ema8[-1] > ema21[-1] else "#f85149"
-    vwap_bias = ("▲ above VWAP" if vwap is not None and cur > vwap[-1] else
-                 "▼ below VWAP" if vwap is not None else "")
-    vwap_col  = "#3fb950" if vwap is not None and cur > vwap[-1] else "#f85149"
+    ema_lbl  = "EMA8 > EMA21 ▲" if ema8[-1] > ema21[-1] else "EMA8 < EMA21 ▼"
+    ema_col  = "#3fb950" if ema8[-1] > ema21[-1] else "#f85149"
+    vwap_str = ("▲ above VWAP" if vwap is not None and cur > vwap[-1] else
+                "▼ below VWAP" if vwap is not None else "")
+    _atr_chg_str = "{:+.0f}% ATR".format(atr_chg_pct) if abs(atr_chg_pct) >= 5 else ""
 
-    # Line 1: chart identity
     ax_c.set_title("BTC / USDT  ·  15-min  ·  24h", color="#c9d1d9",
                    fontsize=9, loc="left", pad=18, fontweight="bold")
-    # Line 2: signal summary — no $ signs (matplotlib would parse as LaTeX)
-    _sig_line = (f"{ema_lbl}   {vwap_bias}   "
-                 "ATR \${:,.0f} ({:.2f}%)   POC \${:,.0f}".format(
-                     atr_now, atr_now / cur * 100, poc_price))
-    ax_c.text(0.0, 1.02, _sig_line, transform=ax_c.transAxes,
-              fontsize=6.8, color="#8b949e", va="bottom", ha="left")
-    # Overlay the EMA portion in its signal colour
+    _meta = "   ".join(filter(None, [vwap_str,
+                                     "ATR {} ({:.2f}%)".format(atr_state, atr_now / cur * 100),
+                                     _atr_chg_str,
+                                     "POC \${:,.0f}".format(poc_price)]))
+    ax_c.text(0.0, 1.02, ema_lbl + "   " + _meta,
+              transform=ax_c.transAxes, fontsize=6.8, color="#8b949e", va="bottom", ha="left")
     ax_c.text(0.0, 1.02, ema_lbl, transform=ax_c.transAxes,
               fontsize=6.8, color=ema_col, va="bottom", ha="left")
 
-    ax_c.legend(loc="upper right", fontsize=7, facecolor="#161b22",
-                labelcolor="#c9d1d9", framealpha=0.88, ncol=3,
-                edgecolor="#30363d", borderpad=0.4, handlelength=1.4)
+    import matplotlib.lines  as _mlines
+    import matplotlib.patches as _mpatches
+    _leg_handles = [
+        _mlines.Line2D([], [], color="#58a6ff", lw=0.9, alpha=0.7, label="EMA 8"),
+        _mlines.Line2D([], [], color="#f0883e", lw=1.8,             label="EMA 21"),
+        _mlines.Line2D([], [], color="#d2a8ff", lw=1.0, ls="--",   label="VWAP"),
+        _mlines.Line2D([], [], color="#e3b341", lw=0.9, ls=(0,(4,4)), label="POC"),
+        _mpatches.Patch(fc="#3fb950", alpha=0.40, ec="none", label="Bull ribbon"),
+        _mpatches.Patch(fc="#f85149", alpha=0.40, ec="none", label="Bear ribbon"),
+        _mpatches.Patch(fc="#58a6ff", alpha=0.30, ec="none", label="Asia 00–07"),
+        _mpatches.Patch(fc="#bc8cff", alpha=0.30, ec="none", label="London 07–13"),
+        _mpatches.Patch(fc="#f0883e", alpha=0.30, ec="none", label="NY 13–21"),
+        _mpatches.Patch(fc="#484f58", alpha=0.50, ec="none", label="Off 21–00"),
+        _mpatches.Patch(fc="#e3b341", alpha=0.35, ec="none", label="Squeeze zone"),
+        _mlines.Line2D([], [], color="#3fb950", lw=0, marker="s", ms=5,
+                       markerfacecolor="#3fb950", label="HH / HL"),
+        _mlines.Line2D([], [], color="#f85149", lw=0, marker="s", ms=5,
+                       markerfacecolor="#f85149", label="LH / LL"),
+        _mlines.Line2D([], [], color="#3fb950", lw=1.4, ls="--", label="Bid wall"),
+        _mlines.Line2D([], [], color="#f85149", lw=1.4, ls="--", label="Ask wall"),
+        _mpatches.Patch(fc="#3fb950", alpha=0.9, ec="none", label="HVN (high vol)"),
+        _mpatches.Patch(fc="#f85149", alpha=0.9, ec="none", label="LVN (low vol)"),
+    ]
+    # Legend placed OUTSIDE below the chart — no chart overlap
 
-    # ── Volume Profile ────────────────────────────────────────────────
+    # ── Volume Profile with HVN/LVN coloring ───────────────────────────
     bin_mid   = (bin_edges[:-1] + bin_edges[1:]) / 2
-    vp_colors = ["#e3b341" if i == poc_idx else "#21262d" for i in range(N_BINS)]
+    vp_colors = []
+    for i in range(N_BINS):
+        if i == poc_idx:             vp_colors.append("#e3b341")   # POC — gold
+        elif vol_prof[i] >= vp_hvn:  vp_colors.append("#3fb950")   # HVN — green (acceptance)
+        elif vol_prof[i] <= vp_lvn:  vp_colors.append("#f85149")   # LVN — red (fast-move zone)
+        else:                        vp_colors.append("#21262d")
     ax_vp.barh(bin_mid, vol_prof / vp_max, height=bin_sz * 0.9,
                color=vp_colors, alpha=0.9, zorder=1)
     ax_vp.axhline(cur, color=_cur_col, lw=0.6, ls=":", alpha=0.4, zorder=2)
-    # Price tag on top of vol profile bars
     ax_vp.text(0.05, cur, "\${:,.0f}".format(cur),
                color=_cur_col, fontsize=7, va="center", fontweight="bold", zorder=5,
                bbox=dict(boxstyle="round,pad=0.18", fc="#0d1117", ec=_cur_col, lw=0.9, alpha=0.95))
@@ -5032,48 +6493,92 @@ def fig_intraday_15m(a: dict) -> "plt.Figure | None":
     ax_vp.set_title("Vol\nProfile", color="#484f58", fontsize=6, pad=2)
     for _sp in ax_vp.spines.values(): _sp.set_visible(False)
 
-    # ── Volume panel ─────────────────────────────────────────────────
-    ax_v.bar(xs, vols, 0.65, color=colors, alpha=0.85)
-    vol_med = np.median(vols)
-    ax_v.axhline(vol_med, color="#30363d", lw=0.7, ls="--", alpha=0.6)
+    # ── Relative-volume panel with z-score coloring ─────────────────────
+    # Dim bars when normal; bright when ≥ 1.5σ spike
+    _v2sig = vol_mean + 2.0 * vol_std
+    ax_v.bar(xs[~_bright_mask &  _bull_mask], vols[~_bright_mask &  _bull_mask],
+             0.65, color="#1e3a2a", alpha=0.7, zorder=2)
+    ax_v.bar(xs[~_bright_mask & ~_bull_mask], vols[~_bright_mask & ~_bull_mask],
+             0.65, color="#2d1b1b", alpha=0.7, zorder=2)
+    ax_v.bar(xs[ _bright_mask &  _bull_mask], vols[ _bright_mask &  _bull_mask],
+             0.65, color="#3fb950", alpha=0.95, zorder=3)
+    ax_v.bar(xs[ _bright_mask & ~_bull_mask], vols[ _bright_mask & ~_bull_mask],
+             0.65, color="#f85149", alpha=0.95, zorder=3)
+    ax_v.axhline(vol_mean, color="#30363d", lw=0.7, ls="--", alpha=0.65, zorder=1)
+    ax_v.axhline(_v2sig,   color="#ffd700", lw=0.6, ls=":",  alpha=0.55, zorder=1)
+    # R.Vol legend
+    _rvol_legend = [
+        _mpatches.Patch(fc="#3fb950", alpha=0.9, ec="none", label="Bull spike ≥1.5σ"),
+        _mpatches.Patch(fc="#f85149", alpha=0.9, ec="none", label="Bear spike ≥1.5σ"),
+        _mpatches.Patch(fc="#1e3a2a", alpha=0.9, ec="none", label="Normal vol"),
+        _mlines.Line2D([], [], color="#ffd700", lw=0.8, ls=":", label="2σ threshold"),
+    ]
+    ax_v.legend(handles=_rvol_legend, loc="upper left", fontsize=5.2,
+                facecolor="#161b22", labelcolor="#c9d1d9", framealpha=0.85,
+                ncol=4, edgecolor="#30363d", borderpad=0.4,
+                handlelength=1.0, handletextpad=0.4, columnspacing=0.6)
     ax_v.set_xticks([])
     ax_v.set_xlim(-1, n + 2)
-    ax_v.set_ylim(0, vols.max() * 1.5)
+    ax_v.set_ylim(0, max(vols.max() * 1.55, _v2sig * 1.1))
     ax_v.yaxis.set_major_formatter(plt.FuncFormatter(
-        lambda v, _: "{:.0f}".format(v / 1e3) + "k" if v >= 1000 else "{:.1f}".format(v)))
+        lambda v, _: "{:.0f}k".format(v / 1e3) if v >= 1000 else "{:.1f}".format(v)))
     ax_v.tick_params(labelsize=5.5, labelcolor="#6e7681")
-    ax_v.set_ylabel("Vol", color="#484f58", fontsize=6.5)
-    ax_v.spines["top"].set_visible(False)
-    ax_v.spines["right"].set_visible(False)
+    ax_v.set_ylabel("R.Vol", color="#484f58", fontsize=6.5)
+    ax_v.spines["top"].set_visible(False); ax_v.spines["right"].set_visible(False)
 
-    # ── ATR panel ────────────────────────────────────────────────────
-    atr_med = np.median(atr)
-    atr_col = np.where(atr > atr_med, "#f0883e", "#21262d")
-    ax_a.bar(xs, atr, 0.65, color=atr_col, alpha=0.85)
-    ax_a.axhline(atr_med, color="#30363d", lw=0.7, ls="--", alpha=0.6)
+    # ── ATR regime panel (percentile bars, not raw values) ──────────────
+    _atr_reg_cols = np.where(atr_rolling_pct < 30, "#58a6ff",
+                    np.where(atr_rolling_pct > 70, "#f85149", "#e3b341"))
+    ax_a.bar(xs, atr_rolling_pct, 0.65, color=_atr_reg_cols, alpha=0.75)
+    ax_a.axhline(30, color="#30363d", lw=0.6, ls="--", alpha=0.5)
+    ax_a.axhline(70, color="#30363d", lw=0.6, ls="--", alpha=0.5)
+    ax_a.fill_between(xs, np.minimum(atr_rolling_pct, 30), 0,
+                      color="#58a6ff", alpha=0.08, zorder=0)   # low-vol shading
+    ax_a.set_ylim(0, 112)
+    ax_a.set_yticks([30, 70])
+    ax_a.set_yticklabels(["30", "70"], fontsize=5, color="#6e7681")
     ax_a.set_xticks(tick_pos)
     ax_a.set_xticklabels(tick_lbls, fontsize=6, color="#6e7681")
     ax_a.set_xlim(-1, n + 2)
-    ax_a.set_ylim(0, atr.max() * 1.5)
-    ax_a.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: "\${:,.0f}".format(v)))
-    ax_a.tick_params(labelsize=5.5, labelcolor="#6e7681")
-    ax_a.set_ylabel("ATR", color="#484f58", fontsize=6.5)
-    ax_a.text(0.99, 0.85, "ATR \${:,.0f}  ({:.2f}%)".format(atr_now, atr_now / cur * 100),
-              transform=ax_a.transAxes, fontsize=7, color="#f0883e",
-              ha="right", va="top")
-    ax_a.spines["top"].set_visible(False)
-    ax_a.spines["right"].set_visible(False)
+    ax_a.set_ylabel("ATR%ile", color="#484f58", fontsize=6)
+    _chg_tag = "  {}{:.0f}% vs avg".format("+" if atr_chg_pct >= 0 else "", atr_chg_pct) \
+               if abs(atr_chg_pct) >= 5 else ""
+    ax_a.text(0.99, 0.88,
+              "ATR {}  {:.2f}%{}".format(atr_state, atr_now / cur * 100, _chg_tag),
+              transform=ax_a.transAxes, fontsize=7, color=atr_sc, ha="right", va="top",
+              fontweight="bold")
+    ax_a.spines["top"].set_visible(False); ax_a.spines["right"].set_visible(False)
+    # ATR%ile inline legend (small, inside thin panel — doesn't block price data)
+    _atr_legend = [
+        _mpatches.Patch(fc="#58a6ff", alpha=0.85, ec="none", label="LOW <30th"),
+        _mpatches.Patch(fc="#e3b341", alpha=0.85, ec="none", label="NORMAL"),
+        _mpatches.Patch(fc="#f85149", alpha=0.85, ec="none", label="HIGH >70th"),
+    ]
+    ax_a.legend(handles=_atr_legend, loc="upper left", fontsize=5.2,
+                facecolor="#161b22", labelcolor="#c9d1d9", framealpha=0.85,
+                ncol=3, edgecolor="#30363d", borderpad=0.4,
+                handlelength=1.0, handletextpad=0.4, columnspacing=0.6)
 
-
-    plt.tight_layout(pad=0.6)
+    # ── Main legend below chart (outside all panels, no overlap) ────────
+    # tight_layout reserves the bottom strip; fig.legend sits in that margin.
+    plt.tight_layout(pad=0.6, rect=[0, 0.10, 1, 1])
+    fig.legend(handles=_leg_handles,
+               loc="lower center",
+               bbox_to_anchor=(0.42, 0.01),   # centred under candle area
+               fontsize=5.8,
+               facecolor="#161b22", labelcolor="#c9d1d9", framealpha=0.92,
+               ncol=7, edgecolor="#30363d", borderpad=0.55,
+               handlelength=1.25, handletextpad=0.45, columnspacing=0.7)
     return fig
 
 
 def fig_rsi(a: dict) -> plt.Figure:
-    """Panel 2: RSI."""
-    fig, ax = plt.subplots(figsize=(13, 2.2))
-    fig.patch.set_facecolor("#0d1117"); _ax_style(ax)
-    plot_df = a["plot_df"]
+    """RSI panel with BTC price below (matches expanded chart format)."""
+    plot_df = a["plot_df"]; price = a["price"]
+    fig, (ax, axp) = plt.subplots(2, 1, figsize=(13, 5.0), sharex=True,
+                                   gridspec_kw={"height_ratios": [1.5, 1], "hspace": 0.08})
+    fig.patch.set_facecolor("#0d1117")
+    for _ax in (ax, axp): _ax_style(_ax)
     ax.plot(plot_df.index, plot_df["RSI"], color="#bc8cff", lw=1.2)
     ax.axhline(70, color="#f85149", ls="--", alpha=0.45, lw=0.9)
     ax.axhline(50, color="#484f58", ls=":",  alpha=0.4,  lw=0.8)
@@ -5081,18 +6586,24 @@ def fig_rsi(a: dict) -> plt.Figure:
     ax.fill_between(plot_df.index, plot_df["RSI"], 30, where=(plot_df["RSI"] < 30), color="#3fb950", alpha=0.15)
     ax.fill_between(plot_df.index, plot_df["RSI"], 70, where=(plot_df["RSI"] > 70), color="#f85149", alpha=0.12)
     rsi_now = float(plot_df["RSI"].dropna().iloc[-1]) if not plot_df["RSI"].dropna().empty else 50
-    ax.text(0.995, 0.95, f"RSI {rsi_now:.1f}", transform=ax.transAxes,
-            fontsize=8, va="top", ha="right", color="#bc8cff")
+    state = "Overbought" if rsi_now > 70 else ("Oversold" if rsi_now < 30 else "Neutral")
+    col   = "#f85149" if rsi_now > 70 else ("#3fb950" if rsi_now < 30 else "#bc8cff")
+    ax.text(0.995, 0.95, f"RSI {rsi_now:.1f}  ·  {state}", transform=ax.transAxes,
+            fontsize=8, va="top", ha="right", color=col)
     ax.set_ylim(0, 100); ax.set_ylabel("RSI", color="#8b949e", fontsize=8)
+    ax.set_title("RSI (14)", color="#8b949e", fontsize=9, loc="left", pad=4)
+    _add_price_panel(axp, plot_df, price)
     plt.tight_layout(pad=0.5)
     return fig
 
 
 def fig_macd(a: dict) -> plt.Figure:
-    """Panel 3: MACD."""
-    fig, ax = plt.subplots(figsize=(13, 2.2))
-    fig.patch.set_facecolor("#0d1117"); _ax_style(ax)
-    plot_df   = a["plot_df"]
+    """MACD panel with BTC price below (matches expanded chart format)."""
+    plot_df = a["plot_df"]; price = a["price"]
+    fig, (ax, axp) = plt.subplots(2, 1, figsize=(13, 5.0), sharex=True,
+                                   gridspec_kw={"height_ratios": [1.5, 1], "hspace": 0.08})
+    fig.patch.set_facecolor("#0d1117")
+    for _ax in (ax, axp): _ax_style(_ax)
     plot_hist = a["df"]["MACD_Hist"].iloc[-365:]
     hist_cols = np.where(plot_hist >= 0, "#3fb950", "#f85149")
     ax.bar(plot_df.index, plot_hist.values, color=hist_cols, alpha=0.55, width=0.6)
@@ -5100,7 +6611,9 @@ def fig_macd(a: dict) -> plt.Figure:
     ax.plot(plot_df.index, a["df"]["MACD_Signal"].iloc[-365:].values, color="#f0883e", lw=1.1, label="Signal")
     ax.axhline(0, color="#484f58", lw=0.7)
     ax.set_ylabel("MACD", color="#8b949e", fontsize=8)
+    ax.set_title("MACD (12, 26, 9)", color="#8b949e", fontsize=9, loc="left", pad=4)
     ax.legend(fontsize=7, facecolor="#161b22", labelcolor="#c9d1d9", loc="upper left", framealpha=0.85)
+    _add_price_panel(axp, plot_df, price)
     plt.tight_layout(pad=0.5)
     return fig
 
@@ -5326,9 +6839,7 @@ def fig_ichimoku(a: dict) -> plt.Figure:
     fig, ax = plt.subplots(figsize=(13, 5.0))
     fig.patch.set_facecolor("#0d1117"); _ax_style(ax)
 
-    colors = np.where(plot_df.Close >= plot_df.Open, "#3fb950", "#f85149")
-    ax.bar(plot_df.index, plot_df.Close - plot_df.Open, 0.5, bottom=plot_df.Open, color=colors, alpha=0.7)
-    ax.bar(plot_df.index, plot_df.High  - plot_df.Low,  0.08, bottom=plot_df.Low, color=colors, alpha=0.7)
+    ax.plot(plot_df.index, plot_df.Close, color="#c9d1d9", lw=1.3, label="Price", zorder=5)
 
     tenkan = plot_df["Ichi_Tenkan"]
     kijun  = plot_df["Ichi_Kijun"]
@@ -5490,6 +7001,83 @@ def _add_price_panel(ax, plot_df, price):
             fontsize=8, va="top", ha="right", color="#c9d1d9")
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"${v/1000:.0f}k"))
     ax.set_title("BTC/USD — Close Price", color="#8b949e", fontsize=9, loc="left", pad=4)
+
+
+def fig_speedometer_24h(score: float, label: str, color: str) -> plt.Figure:
+    """Half-circle speedometer gauge for the 24h bias score."""
+    import matplotlib.patches as mpatches
+
+    fig = plt.figure(figsize=(4.6, 2.9))
+    fig.patch.set_facecolor("#0d1117")
+    ax = fig.add_subplot(111)
+    ax.set_facecolor("#0d1117")
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.set_xlim(-1.45, 1.45)
+    ax.set_ylim(-0.72, 1.3)
+
+    sc = float(np.clip(score, -100, 100))
+
+    def s_to_deg(s):
+        return 180.0 - (s + 100.0) / 200.0 * 180.0
+
+    # Dark background track
+    ax.add_patch(mpatches.Arc((0, 0), 2.0, 2.0, angle=0,
+                              theta1=0, theta2=180,
+                              color="#1c2128", lw=22, zorder=1))
+
+    # Colored zone bands
+    for lo, hi, col, alpha in [
+        (-100, -40, "#f85149", 0.55),
+        (-40,  -20, "#f0883e", 0.55),
+        (-20,   20, "#484f58", 0.45),
+        (20,    40, "#58a6ff", 0.55),
+        (40,   100, "#3fb950", 0.55),
+    ]:
+        ax.add_patch(mpatches.Arc((0, 0), 2.0, 2.0, angle=0,
+                                  theta1=s_to_deg(hi), theta2=s_to_deg(lo),
+                                  color=col, lw=22, alpha=alpha, zorder=2))
+
+    # Active highlight from 0 → score
+    if abs(sc) > 2:
+        t0, ts = s_to_deg(0), s_to_deg(sc)
+        ax.add_patch(mpatches.Arc((0, 0), 2.0, 2.0, angle=0,
+                                  theta1=min(t0, ts), theta2=max(t0, ts),
+                                  color=color, lw=22, alpha=0.92, zorder=3))
+
+    # Tick marks at key levels
+    for ts in (-40, -20, 0, 20, 40):
+        rad = np.deg2rad(s_to_deg(ts))
+        ax.plot([0.87 * np.cos(rad), 1.02 * np.cos(rad)],
+                [0.87 * np.sin(rad), 1.02 * np.sin(rad)],
+                color="#8b949e", lw=1.5, zorder=4)
+
+    # Needle
+    needle_rad = np.deg2rad(s_to_deg(sc))
+    ax.plot([0, 0.80 * np.cos(needle_rad)],
+            [0, 0.80 * np.sin(needle_rad)],
+            color="white", lw=2.8, zorder=6, solid_capstyle="round")
+    ax.add_patch(plt.Circle((0, 0), 0.065, color="#58a6ff", zorder=7))
+
+    # Zone text labels
+    for s_pos, txt, tcol in [(-72, "BEAR", "#f85149"),
+                              (0,   "NEUT", "#484f58"),
+                              (72,  "BULL", "#3fb950")]:
+        rad = np.deg2rad(s_to_deg(s_pos))
+        ax.text(1.21 * np.cos(rad), 1.21 * np.sin(rad), txt,
+                ha="center", va="center", fontsize=6.5, color=tcol, fontweight="700")
+
+    # Score + label
+    sign = "+" if sc >= 0 else ""
+    ax.text(0, -0.10, f"{sign}{sc:.0f}", ha="center", va="center",
+            fontsize=26, fontweight="900", color=color, fontfamily="monospace")
+    ax.text(0, -0.36, label, ha="center", va="center",
+            fontsize=9.5, color="#c9d1d9", fontweight="700")
+    ax.text(0, -0.54, "24H MARKET BIAS", ha="center", va="center",
+            fontsize=6.5, color="#484f58", fontweight="600")
+
+    plt.tight_layout(pad=0.1)
+    return fig
 
 
 def fig_bb_expanded(a: dict) -> plt.Figure:
@@ -5659,10 +7247,7 @@ def fig_ichi_expanded(a: dict) -> plt.Figure:
                                     gridspec_kw={"height_ratios": [3, 1], "hspace": 0.08})
     fig.patch.set_facecolor("#0d1117")
     for ax in (ax1, axp): _ax_style(ax)
-    # Ichimoku chart (unchanged from original)
-    colors = np.where(plot_df.Close >= plot_df.Open, "#3fb950", "#f85149")
-    ax1.bar(plot_df.index, plot_df.Close - plot_df.Open, 0.5, bottom=plot_df.Open, color=colors, alpha=0.7)
-    ax1.bar(plot_df.index, plot_df.High  - plot_df.Low,  0.08, bottom=plot_df.Low, color=colors, alpha=0.7)
+    ax1.plot(plot_df.index, plot_df.Close, color="#c9d1d9", lw=1.3, label="Price", zorder=5)
     tenkan = plot_df["Ichi_Tenkan"]; kijun = plot_df["Ichi_Kijun"]
     span_a = plot_df["Ichi_SpanA"];  span_b = plot_df["Ichi_SpanB"]
     chikou = plot_df["Ichi_Chikou"]
@@ -5697,39 +7282,22 @@ def fig_ichi_expanded(a: dict) -> plt.Figure:
 
 # ── Full-screen dialogs for each expanded indicator ──────────────────────────
 
-@st.dialog("Bollinger Bands — %B & Bandwidth", width="large")
-def _dlg_bb(a):
-    fig = fig_bb_expanded(a)
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
+def _exp_btn(key: str, label: str) -> None:
+    """Toggle expand/close button for an indicator section."""
+    _open = st.session_state.get("_exp_open") == key
+    _btn_label = "✕ Close" if _open else "⛶ Expand"
+    if st.button(_btn_label, key=f"btn_exp_{key}", use_container_width=True):
+        st.session_state["_exp_open"] = None if _open else key
 
 
-@st.dialog("Stochastic Oscillator (14, 3)", width="large")
-def _dlg_stoch(a):
-    fig = fig_stoch_expanded(a)
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
-
-
-@st.dialog("Accelerator Osc. + ATR", width="large")
-def _dlg_ac(a):
-    fig = fig_ac_atr_expanded(a)
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
-
-
-@st.dialog("Fibonacci Retracement", width="large")
-def _dlg_fib(a):
-    fig = fig_fib_expanded(a)
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
-
-
-@st.dialog("Ichimoku Cloud", width="large")
-def _dlg_ichi(a):
-    fig = fig_ichi_expanded(a)
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
+def _exp_inline(key: str, render_fn, a: dict) -> None:
+    """If this key is expanded, render the full chart inline."""
+    if st.session_state.get("_exp_open") != key:
+        return
+    with st.spinner("Rendering full chart…"):
+        _fig = render_fn(a)
+    st.pyplot(_fig, use_container_width=True)
+    plt.close(_fig)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -5799,7 +7367,7 @@ with st.sidebar:
     st.caption(f"🕐 Last refreshed: {_last_refreshed}")
     st.divider()
     st.markdown("**Data Sources**")
-    st.caption("📈 Price: yfinance")
+    st.caption("📈 Price: Binance spot (yfinance fallback)")
     st.caption("😱 Fear & Greed: alternative.me")
     st.caption("🌍 Dominance: CoinGecko")
     st.caption("📊 ETF Flows: yfinance (IBIT/FBTC/ARKB…)")
@@ -5824,6 +7392,22 @@ if not a:
     st.error("Could not fetch BTC data. Check your internet connection.")
     st.stop()
 
+# run_analysis() is cached for 5 minutes — its embedded live-ticker call only
+# fires on a cache miss. Fetch a fresh ticker on every render so the header
+# BTC Price tracks Binance spot in real time, and recompute the 24h % change
+# from the cached prior daily close.
+try:
+    _live_tick = _get_raw("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT")
+    if isinstance(_live_tick, dict) and "price" in _live_tick:
+        _lp = float(_live_tick["price"])
+        if _lp > 0:
+            a["price"] = _lp
+            _cached_closes = a.get("closes") or []
+            if len(_cached_closes) >= 2 and _cached_closes[-2]:
+                a["chg_24h"] = (_lp - _cached_closes[-2]) / _cached_closes[-2] * 100
+except Exception:
+    pass
+
 price      = a["price"]
 chg_24h    = a["chg_24h"]
 cycle      = a["cycle"]
@@ -5832,8 +7416,8 @@ w52        = a["w52"]
 btc_liq    = a["btc_liq"]
 prediction = a["prediction"]
 bias_72h       = a["bias_72h"]
+bias_24h       = a.get("bias_24h", {"score": 0, "label": "N/A", "color": "#8b949e"})
 poly_sentiment = a.get("poly_sentiment", {})
-
 
 # ── Top metrics bar (2 rows of 4 — mobile-friendly) ──────────────
 _mr1c1, _mr1c2, _mr1c3, _mr1c4 = st.columns(4)
@@ -5872,13 +7456,69 @@ with _mr2c4:
 st.divider()
 
 # ── 72-Hour Directional Bias Gauge ───────────────────────────────
-_b12_score  = bias_72h["score"]
-_b12_label  = bias_72h["label"]
-_b12_color  = bias_72h["color"]
+_b12_score_raw = bias_72h["score"]
 _b12_sigs   = bias_72h["signals"]
 _b12_wts    = bias_72h["weights"]
+_b12_regime = bias_72h.get("regime", "transition")
+_b12_adx1h  = bias_72h.get("adx_1h")
+_b12_atrpct = bias_72h.get("atr_percentile", 50)
+_b12_bprob  = bias_72h.get("bull_prob", 50.0)
+_b12_emove  = bias_72h.get("expected_move")
+_b12_erange = bias_72h.get("expected_range")
+_b12_conv   = bias_72h.get("conviction", 0.5)   # ⑫ 0=split signals, 1=full consensus
+_b12_sigstd = bias_72h.get("signal_std", 0.5)
+
+# ① EMA smoothing: α=0.50 = equal-weight blend of raw + previous.
+# Responsive enough to track genuine 5%+ BTC moves within 1–2 refreshes,
+# while still smoothing single-candle spikes.
+# ⑮ Cold-start: initialize to 0 (neutral) not raw score, so the first
+# reading after an app restart doesn't show an unsmoothed spike.
+_EMA_ALPHA  = 0.50
+_prev_ema   = st.session_state.get("_bias_ema", 0.0)
+_b12_score  = round(_EMA_ALPHA * _b12_score_raw + (1 - _EMA_ALPHA) * _prev_ema, 1)
+st.session_state["_bias_ema"] = _b12_score
+
+# Derive label/color from smoothed score
+def _score_to_label_color(s):
+    if s >= 70:  return "STRONG BULL", "#3fb950"
+    if s >= 40:  return "BULL",        "#3fb950"
+    if s >= 25:  return "MILD BULL",   "#58a6ff"
+    if s > -25:  return "NEUTRAL",     "#8b949e"
+    if s > -40:  return "MILD BEAR",   "#f0883e"
+    if s > -70:  return "BEAR",        "#f85149"
+    return "STRONG BEAR", "#f85149"
+
+_b12_label, _b12_color = _score_to_label_color(_b12_score)
 _b12_pct    = (_b12_score + 100) / 200 * 100      # 0–100 for CSS positioning
 _b12_sign   = "+" if _b12_score >= 0 else ""
+
+# ── Regime pill + probabilistic outputs ──────────────────────────
+_regime_color = {"trend": "#ffd700", "range": "#bc8cff", "transition": "#8b949e"}[_b12_regime]
+_regime_label = {"trend": "TRENDING", "range": "RANGING", "transition": "TRANSITION"}[_b12_regime]
+_adx_str = f" · ADX {_b12_adx1h:.0f}" if _b12_adx1h is not None else ""
+_vol_str  = ("· vol HIGH" if _b12_atrpct > 70 else "· vol LOW" if _b12_atrpct < 30 else f"· vol {_b12_atrpct:.0f}th pct")
+_bprob_color = "#3fb950" if _b12_bprob >= 60 else "#f85149" if _b12_bprob <= 40 else "#8b949e"
+_emove_str = (f"Expected move: <b>${abs(_b12_emove):,.0f}</b> {'↑' if _b12_emove and _b12_emove > 0 else '↓'}"
+              f" over 72h · range ±${_b12_erange:,.0f}"
+              if _b12_emove is not None and _b12_erange is not None else "")
+# ⑫ Conviction pill: color-coded consensus quality
+_conv_pct   = int(_b12_conv * 100)
+_conv_color = "#3fb950" if _b12_conv >= 0.65 else "#ffd700" if _b12_conv >= 0.40 else "#f85149"
+_conv_label = "HIGH" if _b12_conv >= 0.65 else ("MED" if _b12_conv >= 0.40 else "LOW")
+st.markdown(f"""
+<div style="display:flex; gap:10px; align-items:center; margin-bottom:10px; flex-wrap:wrap;">
+  <span style="background:{_regime_color}22; border:1px solid {_regime_color}66;
+        color:{_regime_color}; border-radius:6px; padding:3px 10px; font-size:11px; font-weight:700;
+        letter-spacing:.08em;">{_regime_label}{_adx_str} {_vol_str}</span>
+  <span style="background:#161b22; border:1px solid #30363d; border-radius:6px;
+        padding:3px 10px; font-size:11px; color:{_bprob_color}; font-weight:700;">
+    Bull prob: {_b12_bprob:.0f}%</span>
+  <span style="background:{_conv_color}18; border:1px solid {_conv_color}55; border-radius:6px;
+        padding:3px 10px; font-size:11px; color:{_conv_color}; font-weight:700;"
+        title="Conviction = 1 − signal std. High = all signals agree. Low = half bullish, half bearish averaging to noise.">
+    Conviction: {_conv_label} ({_conv_pct}%)</span>
+  {"<span style='font-size:11px; color:#6e7681;'>" + _emove_str + "</span>" if _emove_str else ""}
+</div>""", unsafe_allow_html=True)
 
 # Gradient track: red → grey → green, pointer dot at the right position
 _gauge_html = f"""
@@ -5986,8 +7626,34 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
+# ── 24h Market Bias Speedometer ──────────────────────────────────
+_c24_gauge, _c24_spacer = st.columns([1, 2])
+with _c24_gauge:
+    _f24 = fig_speedometer_24h(bias_24h["score"], bias_24h["label"], bias_24h["color"])
+    st.pyplot(_f24, use_container_width=True)
+    plt.close(_f24)
+with _c24_spacer:
+    st.markdown("")
+    st.markdown(
+        "**24h Market Bias** — reactive reading of current sentiment using 1h/4h indicators "
+        "(RSI, Stochastic, MACD, momentum, EMA align, order book depth, funding rate, CVD, Fear & Greed). "
+        "Volatile by design: moves with the market in real-time.\n\n"
+        "**72h Directional Bias** above is the structural forecast — EMA-smoothed, "
+        "driven by 4h/daily signals. Use both together: 72h tells you the tide, "
+        "24h tells you the current wave."
+    )
+
+st.divider()
+
+# ⑯ 4h data staleness indicator — EMA Structure is 18% of score but cached 15 min
+_4h_fetch_ts   = st.session_state.get("_4h_fetch_ts", 0)
+_4h_age_min    = int((_dt.now(_tz.utc).timestamp() - _4h_fetch_ts) / 60) if _4h_fetch_ts else 0
+_4h_stale      = _4h_age_min >= 10   # flag if 4h data is ≥10 min old
+_4h_stale_note = (f" · ⚠ 4h data {_4h_age_min}min old — EMA Structure may lag"
+                  if _4h_stale else f" · 4h data {_4h_age_min}min ago")
+
 # Signal breakdown inside expander — 2 rows of 6 (dynamic)
-with st.expander(f"📊 72h Bias — Signal Breakdown ({len(_b12_sigs)} signals)", expanded=False):
+with st.expander(f"📊 72h Bias — Signal Breakdown ({len(_b12_sigs)} signals){_4h_stale_note}", expanded=False):
     _sig_items = list(_b12_sigs.items())
     # Row 1: first 6 signals
     _row1_cols = st.columns(6)
@@ -6303,12 +7969,20 @@ if _ai_interp_key:
                     cycle_score    = cycle.get("total", 0),
                     adx_val        = float(a.get("adx_val", float("nan"))),
                     signal_weights = _b12_wts,
+                    # 24h engine
+                    bias_24h_score   = float(bias_24h.get("score", 0.0)),
+                    bias_24h_label   = str(bias_24h.get("label", "N/A")),
+                    bias_24h_regime  = str(bias_24h.get("regime", "N/A")),
+                    bias_24h_signals = bias_24h.get("signals"),
+                    bias_24h_weights = bias_24h.get("weights"),
                     # 15-min chart signals
                     ema_cross_15m     = _ema_cross_15m,
                     vwap_bias_15m     = _vwap_bias_15m,
                     poc_vs_price_15m  = _poc_vs_price_15m,
                     atr_15m           = _atr_15m,
                     atr_pct_15m       = _atr_pct_15m,
+                    # Liquidation map source quality
+                    liq_map_source    = str((btc_liq or {}).get("liq_map_source", "N/A")),
                 )
             st.session_state["_claude_interp"] = _interp_text
         _interp_text = st.session_state.get("_claude_interp", "")
@@ -6407,7 +8081,7 @@ with st.expander(
 
 # ── Signal outcome logging + stability + accuracy ─────────────────
 
-# Resolve any outstanding signals and log current reading (max every 15 min)
+# Resolve any outstanding signals and log current reading (max every 5 min)
 _sig_rows = _resolve_signal_outcomes(price)
 _now_ts   = _dt.now(_tz.utc).timestamp()
 _last_log = st.session_state.get("_last_log_ts", 0)
@@ -6433,7 +8107,7 @@ _total_resolved = sum(v["n"] for v in _acc_stats.values())
 with st.expander(f"📈 72h Bias Accuracy", expanded=False):
 
     # Live log winrate: all logged signals (already filtered to |score| >= 40 at log time)
-    _live_wins = sum(1 for r in _sig_rows if r.get("correct") == "1")
+    _live_wins = sum(1 for r in _sig_rows if r.get("correct") in ("1", "2"))
     _live_loss = sum(1 for r in _sig_rows if r.get("correct") == "0")
     _live_n    = _live_wins + _live_loss
     _live_wr   = round(_live_wins / _live_n * 100) if _live_n > 0 else None
@@ -6443,7 +8117,7 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
                   else "#f85149")
 
     _live_display = f"{_live_wr}%" if _live_wr is not None else "building..."
-    _live_note    = f"{_live_n} trades resolved" if _live_n > 0 else "logs every 5 min when |score| ≥ 10"
+    _live_note    = f"{_live_n} trades resolved" if _live_n > 0 else "logs every 5 min when |score| ≥ 25"
 
     st.markdown(f"""
 <div style="background:#161b22; border:1px solid #30363d; border-radius:10px;
@@ -6453,10 +8127,12 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
     <div style="font-size:48px; font-weight:800; color:{_live_col}; line-height:1;">{_live_display}</div>
     <div style="font-size:10px; color:#484f58; margin-top:6px;">{_live_note}</div>
   </div>
-  <div style="font-size:11px; color:#6e7681; max-width:260px; line-height:1.6;">
-    Win = price moved in signal direction 24h after entry.<br>
-    Full score (Polymarket, hunt zones, order book, technicals).<br>
-    Only signals with |score| ≥ 10 are logged.
+  <div style="font-size:11px; color:#6e7681; max-width:300px; line-height:1.6;">
+    <b style="color:#8b949e;">This number uses the FULL 16-signal score</b> from the live log.<br>
+    Every 5 min when |score| ≥ 25, the timestamp + score + price get logged.
+    72h later, the row is resolved against the actual price:
+    if score sign matched the price move = WIN.<br>
+    <span style="color:#484f58; font-size:10px;">(The legacy technicals-only backtest in a separate panel is just a cold-start placeholder — this live winrate is the real number.)</span>
   </div>
 </div>""", unsafe_allow_html=True)
 
@@ -6473,50 +8149,94 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
         except Exception:
             continue
 
-    if len(_hist_rows) >= 2:
+    # Always render a 72h-wide chart — empty space on the left until data fills in
+    import matplotlib.dates as mdates
+    import datetime as _datetime
+
+    _sgt_tz   = _tz(offset=_datetime.timedelta(hours=8))
+    _now_sgt  = _dt.now(_tz.utc).astimezone(_sgt_tz).replace(tzinfo=None)
+    _x_end    = _now_sgt
+    _x_start  = _now_sgt - _datetime.timedelta(hours=72)
+
+    _sf, _sa = plt.subplots(figsize=(13, 2.6))
+    _sf.patch.set_facecolor("#0d1117")
+    _sa.set_facecolor("#0d1117")
+
+    if len(_hist_rows) >= 1:
         _hist_times  = [h[0] for h in _hist_rows]
         _hist_scores = [h[1] for h in _hist_rows]
-
-        _sf, _sa = plt.subplots(figsize=(13, 2.6))
-        _sf.patch.set_facecolor("#0d1117")
-        _sa.set_facecolor("#0d1117")
-
-        # Colour-fill by zone
         _sv = np.array(_hist_scores)
-        _sa.fill_between(_hist_times, _sv, 0,
-                         where=(_sv >= 25),  color="#3fb950", alpha=0.20)
-        _sa.fill_between(_hist_times, _sv, 0,
-                         where=(_sv <= -25), color="#f85149", alpha=0.20)
-        _sa.fill_between(_hist_times, _sv, 0,
-                         where=((_sv > -25) & (_sv < 25)), color="#8b949e", alpha=0.08)
+        if len(_hist_rows) >= 2:
+            _sa.fill_between(_hist_times, _sv, 0,
+                             where=(_sv >= 25),  color="#3fb950", alpha=0.20)
+            _sa.fill_between(_hist_times, _sv, 0,
+                             where=(_sv <= -25), color="#f85149", alpha=0.20)
+            _sa.fill_between(_hist_times, _sv, 0,
+                             where=((_sv > -25) & (_sv < 25)), color="#8b949e", alpha=0.08)
+        _sa.plot(_hist_times, _sv, color="#58a6ff", lw=1.5, zorder=3)
 
-        _sa.plot(_hist_times, _sv, color="#58a6ff", lw=1.3, zorder=3)
-        _sa.axhline(0,   color="#484f58", lw=0.7, ls="--")
-        _sa.axhline(25,  color="#3fb950", lw=0.6, ls=":", alpha=0.5)
-        _sa.axhline(-25, color="#f85149", lw=0.6, ls=":", alpha=0.5)
-        _sa.axhline(40,  color="#3fb950", lw=0.6, ls="--", alpha=0.4)
-        _sa.axhline(-40, color="#f85149", lw=0.6, ls="--", alpha=0.4)
+    _sa.axhline(0,   color="#484f58", lw=0.7, ls="--")
+    _sa.axhline(25,  color="#3fb950", lw=0.6, ls=":", alpha=0.5)
+    _sa.axhline(-25, color="#f85149", lw=0.6, ls=":", alpha=0.5)
+    _sa.axhline(40,  color="#3fb950", lw=0.6, ls="--", alpha=0.4)
+    _sa.axhline(-40, color="#f85149", lw=0.6, ls="--", alpha=0.4)
 
-        # Zone labels on right axis
-        _sa.text(1.002, 40,  "+40",  transform=_sa.get_yaxis_transform(), fontsize=6, color="#3fb950", va="center")
-        _sa.text(1.002, 25,  "+25",  transform=_sa.get_yaxis_transform(), fontsize=6, color="#3fb950", va="center")
-        _sa.text(1.002, -25, "−25",  transform=_sa.get_yaxis_transform(), fontsize=6, color="#f85149", va="center")
-        _sa.text(1.002, -40, "−40",  transform=_sa.get_yaxis_transform(), fontsize=6, color="#f85149", va="center")
+    _sa.text(1.002, 40,  "+40",  transform=_sa.get_yaxis_transform(), fontsize=6, color="#3fb950", va="center")
+    _sa.text(1.002, 25,  "+25",  transform=_sa.get_yaxis_transform(), fontsize=6, color="#3fb950", va="center")
+    _sa.text(1.002, -25, "−25",  transform=_sa.get_yaxis_transform(), fontsize=6, color="#f85149", va="center")
+    _sa.text(1.002, -40, "−40",  transform=_sa.get_yaxis_transform(), fontsize=6, color="#f85149", va="center")
 
-        _sa.set_ylim(-75, 75)
-        _sa.set_ylabel("Bias Score", color="#8b949e", fontsize=7)
-        _sa.tick_params(colors="#8b949e", labelsize=7)
-        for _sp in _sa.spines.values(): _sp.set_edgecolor("#30363d")
-        _sa.set_title("72h Bias Score History  (every 5 min)",
-                      color="#8b949e", fontsize=8, loc="left", pad=4)
-        import matplotlib.dates as mdates
-        _sa.xaxis.set_major_formatter(mdates.DateFormatter("%d %b %H:%M"))
-        plt.xticks(rotation=20, ha="right")
-        plt.tight_layout(pad=0.4)
-        st.pyplot(_sf, use_container_width=True)
-        plt.close(_sf)
+    _sa.set_xlim(_x_start, _x_end)
+    _sa.set_ylim(-75, 75)
+    _sa.set_ylabel("Bias Score", color="#8b949e", fontsize=7)
+    _sa.tick_params(colors="#8b949e", labelsize=7)
+    for _sp in _sa.spines.values(): _sp.set_edgecolor("#30363d")
+    _sa.set_title("72h Bias Score History  (every 5 min · SGT)",
+                  color="#8b949e", fontsize=8, loc="left", pad=4)
+    _sa.xaxis.set_major_formatter(mdates.DateFormatter("%d %b %H:%M"))
+    _sa.xaxis.set_major_locator(mdates.HourLocator(interval=6))
+    plt.xticks(rotation=20, ha="right")
+    plt.tight_layout(pad=0.4)
+    st.pyplot(_sf, use_container_width=True)
+    plt.close(_sf)
+
+    if len(_hist_rows) == 0:
+        st.caption("No data yet — first point will appear within 5 minutes.")
+
+    # ── Calibration buckets ────────────────────────────────────────
+    # Shows actual hit-rate per score bucket. Monotonicity = well-calibrated model.
+    # Needs resolved signals (correct==1/0) to populate.
+    _resolved = [r for r in _sig_rows if r.get("correct") in ("0", "1", "2")]
+    if len(_resolved) >= 5:
+        _buckets = [
+            ("< −40",  lambda s: s <= -40),
+            ("−40–−25", lambda s: -40 < s <= -25),
+            ("−25–0",  lambda s: -25 < s < 0),
+            ("0–+25",  lambda s: 0 <= s < 25),
+            ("+25–+40", lambda s: 25 <= s < 40),
+            ("> +40",  lambda s: s >= 40),
+        ]
+        _cal_rows = []
+        for _blabel, _bfn in _buckets:
+            _bin_rows = [r for r in _resolved if _bfn(float(r.get("score", 0)))]
+            if _bin_rows:
+                _wins  = sum(1 for r in _bin_rows if r.get("correct") in ("1", "2"))
+                _wr    = round(_wins / len(_bin_rows) * 100)
+                _col   = "#3fb950" if _wr >= 60 else "#ffd700" if _wr >= 50 else "#f85149"
+                _cal_rows.append((_blabel, len(_bin_rows), _wr, _col))
+        if _cal_rows:
+            st.markdown("**Calibration** — hit-rate by score bucket (monotonic = well-calibrated)")
+            _cal_html = '<div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:6px;">'
+            for _bl, _bn, _bwr, _bc in _cal_rows:
+                _cal_html += (f'<div style="background:#161b22; border:1px solid #30363d; border-radius:8px;'
+                              f' padding:8px 14px; text-align:center; min-width:80px;">'
+                              f'<div style="font-size:10px; color:#8b949e;">{_bl}</div>'
+                              f'<div style="font-size:20px; font-weight:800; color:{_bc};">{_bwr}%</div>'
+                              f'<div style="font-size:9px; color:#484f58;">n={_bn}</div></div>')
+            _cal_html += '</div>'
+            st.markdown(_cal_html, unsafe_allow_html=True)
     else:
-        st.caption("Score history will appear here once the log has at least 2 entries.")
+        st.caption(f"Calibration buckets will appear once ≥5 signals resolve (currently {len(_resolved)} resolved).")
 
 
 
@@ -6862,7 +8582,7 @@ with tab1:
 |-----------|-------|--------|---------------|
 | OB Depth Bias | {_liq_bias} ({_depth_ratio:.2f}x) | {"🟢 Bid-heavy" if _liq_bias == "BID" else "🔴 Ask-heavy" if _liq_bias == "ASK" else "⚪ Balanced"} | Ratio of bid vs ask USD depth within ±15% of price. > 1 = more buy support; < 1 = more sell pressure. |
 | Cascade Direction | {_cascade} (ratio {_cascade_r:.2f}x) | {"🟢 UP" if _cascade == "UP" else "🔴 DOWN" if _cascade == "DOWN" else "⚪ Balanced"} | Long vs short liquidation fuel. UP = short squeeze potential; DOWN = long cascade risk. Strongest market-structure signal. |
-| Hunt Zone Pull | {"Upside" if _hunt_pull > 0.1 else "Downside" if _hunt_pull < -0.1 else "Neutral"} ({_hunt_pull:+.2f}) | {"🟢 Upside" if _hunt_pull > 0.1 else "🔴 Downside" if _hunt_pull < -0.1 else "⚪ Neutral"} | ASK walls pull price UP (short stop-hunt); BID walls pull DOWN (long stop-hunt). Weighted by wall size x fuel / distance². |
+| Hunt Zone Pull | {"Upside" if _hunt_pull > 0.1 else "Downside" if _hunt_pull < -0.1 else "Neutral"} ({_hunt_pull:+.2f}) | {"🟢 Upside" if _hunt_pull > 0.1 else "🔴 Downside" if _hunt_pull < -0.1 else "⚪ Neutral"} | Short-liq clusters above pull price UP (squeeze magnet); long-liq clusters below pull DOWN (flush magnet). Score = notional / distance² × cascade chain mult. Order-book walls in the path dampen the pull. |
 | Nearest Bid Wall | {_bid_str} | — | Largest bid-side liquidity cluster below price. Acts as a magnet for downside hunts or strong support. |
 | Nearest Ask Wall | {_ask_str} | — | Largest ask-side liquidity cluster above price. Acts as a short-squeeze target or resistance ceiling. |
 | Depth Ratio | {f"{_depth_ratio:.2f}"} | {"🟢 > 1.15" if _depth_ratio > 1.15 else "🔴 < 0.85" if _depth_ratio < 0.85 else "⚪ Balanced"} | Total USD bids / asks. Smoothed over recent snapshots. Sustained > 1 = buyers absorbing; < 1 = sellers dominant. |
@@ -6941,16 +8661,6 @@ with tab1:
     if f_15m is not None:
         st.pyplot(f_15m, use_container_width=True)
         plt.close(f_15m)
-
-    col_rsi, col_macd = st.columns([1, 1])
-    with col_rsi:
-        f_rsi = fig_rsi(a)
-        st.pyplot(f_rsi, use_container_width=True)
-        plt.close(f_rsi)
-    with col_macd:
-        f_macd = fig_macd(a)
-        st.pyplot(f_macd, use_container_width=True)
-        plt.close(f_macd)
 
 # ── Tab 2: Cycle Signals ─────────────────────────────────────
 with tab2:
@@ -7222,6 +8932,23 @@ with tab4:
 with tab5:
     pdf = a["plot_df"]
 
+    # ── RSI + MACD ─────────────────────────────────────────
+    col_rsi, col_macd = st.columns(2)
+    with col_rsi:
+        st.markdown("##### RSI (14)")
+        st.caption("Relative Strength Index. >70 = overbought, <30 = oversold. Dashed line = EMA-9 signal of RSI.")
+        f_rsi = fig_rsi(a)
+        st.pyplot(f_rsi, use_container_width=True)
+        plt.close(f_rsi)
+    with col_macd:
+        st.markdown("##### MACD (12, 26, 9)")
+        st.caption("Histogram bars show momentum. Blue = MACD line, orange = signal line. Bar above zero & growing = acceleration up.")
+        f_macd = fig_macd(a)
+        st.pyplot(f_macd, use_container_width=True)
+        plt.close(f_macd)
+
+    st.divider()
+
     # ── Quick metrics row ──────────────────────────────────
     def _sl(col):
         s = pdf[col].dropna()
@@ -7263,31 +8990,48 @@ with tab5:
     st.divider()
 
     # ── Ichimoku Cloud ─────────────────────────────────────
-    _hc, _bc = st.columns([0.88, 0.12])
-    with _hc: st.markdown("##### Ichimoku Cloud")
-    with _bc:
-        if st.button("⛶ Expand", key="btn_exp_ichi", use_container_width=True):
-            _dlg_ichi(a)
-    st.caption("Five-component indicator showing trend direction, momentum, and dynamic support/resistance simultaneously.")
-    f_ichi = fig_ichimoku(a)
+    st.markdown("##### Ichimoku Cloud")
+    with st.expander("How to read this chart", expanded=False):
+        st.markdown(
+            """
+**The cloud (Kumo)** — the shaded region.
+- **Green cloud** = bullish regime · **Red cloud** = bearish regime.
+- **Price above the cloud** → uptrend, cloud acts as support.
+- **Price below the cloud** → downtrend, cloud acts as resistance.
+- **Price inside the cloud** → indecision / no-trade zone.
+- **Thick cloud** = strong S/R · **Thin cloud** = weak / about to flip.
+
+**Tenkan (red, 9-period)** — fast trend line. Reacts quickly to price changes.
+**Kijun (blue, 26-period)** — slow trend line. Major support/resistance level.
+- **Tenkan crosses ABOVE Kijun (TK Cross ↑)** → bullish momentum.
+- **Tenkan crosses BELOW Kijun (TK Cross ↓)** → bearish momentum.
+- Strongest signals happen when the cross occurs **above the cloud** (bull) or **below** (bear).
+
+**Chikou (gold dashed, lagging line)** — current close shifted 26 bars back.
+- **Chikou above price 26 bars ago** → bullish confirmation.
+- **Chikou below price 26 bars ago** → bearish confirmation.
+- **Chikou tangled with price** → consolidation, weak signal.
+
+**The strongest setups** stack all three:
+1. Price on the correct side of the cloud
+2. TK cross in the same direction
+3. Chikou confirming above/below historical price
+            """
+        )
+    f_ichi = fig_ichi_expanded(a)
     st.pyplot(f_ichi, use_container_width=True)
     plt.close(f_ichi)
 
     st.divider()
 
-    # ── Bollinger Bands detail + Stochastic side by side ──
+    # ── Bollinger Bands + Stochastic side by side ──────────
     col_bb, col_stoch = st.columns(2)
     with col_bb:
-        _hc, _bc = st.columns([0.78, 0.22])
-        with _hc: st.markdown("##### Bollinger Bands — %B & Bandwidth")
-        with _bc:
-            if st.button("⛶ Expand", key="btn_exp_bb", use_container_width=True):
-                _dlg_bb(a)
+        st.markdown("##### Bollinger Bands — %B & Bandwidth")
         st.caption("**%B** shows where price sits within the band. **Bandwidth** detects squeezes — low bandwidth often precedes a sharp breakout.")
-        f_bb = fig_bollinger_detail(a)
+        f_bb = fig_bb_expanded(a)
         st.pyplot(f_bb, use_container_width=True)
         plt.close(f_bb)
-        # ── Bollinger interpretation ──
         if pctb_v is not None and bw_v is not None:
             _squeeze = bw_v < bw_mean * 0.6
             _expand  = bw_v > bw_mean * 1.4
@@ -7310,13 +9054,9 @@ with tab5:
             st.markdown(_pos_msg)
             st.markdown(_bw_msg)
     with col_stoch:
-        _hc, _bc = st.columns([0.78, 0.22])
-        with _hc: st.markdown("##### Stochastic Oscillator (14, 3)")
-        with _bc:
-            if st.button("⛶ Expand", key="btn_exp_stoch", use_container_width=True):
-                _dlg_stoch(a)
+        st.markdown("##### Stochastic Oscillator (14, 3)")
         st.caption("**%K** vs **%D** crossovers in the overbought (>80) or oversold (<20) zones are the primary signals.")
-        f_st = fig_stochastic(a)
+        f_st = fig_stoch_expanded(a)
         st.pyplot(f_st, use_container_width=True)
         plt.close(f_st)
 
@@ -7325,23 +9065,15 @@ with tab5:
     # ── Fibonacci + AC/ATR side by side ───────────────────
     col_fib, col_ac = st.columns([3, 2])
     with col_fib:
-        _hc, _bc = st.columns([0.82, 0.18])
-        with _hc: st.markdown("##### Fibonacci Retracement")
-        with _bc:
-            if st.button("⛶ Expand", key="btn_exp_fib", use_container_width=True):
-                _dlg_fib(a)
+        st.markdown("##### Fibonacci Retracement")
         st.caption("Auto-detected swing high/low over the last 6 months. Key levels: **38.2%**, **50%**, **61.8%** act as strongest S/R zones.")
-        f_fib = fig_fibonacci_detail(a)
+        f_fib = fig_fib_expanded(a)
         st.pyplot(f_fib, use_container_width=True)
         plt.close(f_fib)
     with col_ac:
-        _hc, _bc = st.columns([0.76, 0.24])
-        with _hc: st.markdown("##### Accelerator Osc. + ATR")
-        with _bc:
-            if st.button("⛶ Expand", key="btn_exp_ac", use_container_width=True):
-                _dlg_ac(a)
+        st.markdown("##### Accelerator Osc. + ATR")
         st.caption("**AC** catches momentum shifts before price moves. **ATR** quantifies daily volatility — rising ATR = expanding moves.")
-        f_ac = fig_ac_atr(a)
+        f_ac = fig_ac_atr_expanded(a)
         st.pyplot(f_ac, use_container_width=True)
         plt.close(f_ac)
 
