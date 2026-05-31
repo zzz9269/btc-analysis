@@ -110,25 +110,40 @@ if run_analysis is None:
 # ─────────────────────────────────────────────────────────────────
 # Supabase REST helpers
 # ─────────────────────────────────────────────────────────────────
-def _supa(method: str, path: str, body=None) -> "list | dict | None":
+import time as _time
+
+def _supa(method: str, path: str, body=None, retries: int = 3) -> "list | dict | None":
+    """Supabase REST call with exponential-backoff retries on transient errors.
+    Returns parsed JSON on success, or None after all attempts fail.
+    4xx client errors (auth, validation) are NOT retried — they won't fix themselves."""
     url  = f"{SUPABASE_URL}/rest/v1{path}"
     data = json.dumps(body).encode() if body is not None else None
-    req  = urllib.request.Request(url, data=data, method=method, headers={
-        "apikey":        SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type":  "application/json",
-        "Prefer":        "return=representation",
-    })
-    try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            raw = r.read()
-            return json.loads(raw) if raw else None
-    except urllib.error.HTTPError as e:
-        print(f"[supabase {method} {path}] HTTP {e.code}: {e.read().decode(errors='replace')[:200]}")
-        return None
-    except Exception as e:
-        print(f"[supabase {method} {path}] {type(e).__name__}: {e}")
-        return None
+    last_err = ""
+    for attempt in range(1, retries + 1):
+        req = urllib.request.Request(url, data=data, method=method, headers={
+            "apikey":        SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type":  "application/json",
+            "Prefer":        "return=representation",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                raw = r.read()
+                return json.loads(raw) if raw else None
+        except urllib.error.HTTPError as e:
+            body_snip = e.read().decode(errors='replace')[:200]
+            last_err = f"HTTP {e.code}: {body_snip}"
+            # 4xx is permanent — don't retry. 5xx and others may be transient.
+            if 400 <= e.code < 500:
+                print(f"[supabase {method} {path}] {last_err} (no retry)")
+                return None
+            print(f"[supabase {method} {path}] {last_err} (attempt {attempt}/{retries})")
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            print(f"[supabase {method} {path}] {last_err} (attempt {attempt}/{retries})")
+        if attempt < retries:
+            _time.sleep(2 ** (attempt - 1))   # 1s, 2s, 4s
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -167,8 +182,10 @@ inserted = _supa("POST", f"/{TABLE}", body=row)
 if inserted:
     print(f"  ✓ logged signal id={inserted[0].get('id') if isinstance(inserted, list) else '?'}")
 else:
-    print("  ✗ Supabase insert failed (see error above)")
-    sys.exit(4)
+    # POST failed after all retries — accept the lost row and continue to
+    # outcome resolution. Exiting non-zero here would skip resolution AND
+    # email the user every time Supabase has a transient blip.
+    print("  ⚠ Supabase insert failed after retries — continuing to resolution")
 
 
 # ─────────────────────────────────────────────────────────────────
