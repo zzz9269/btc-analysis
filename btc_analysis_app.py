@@ -70,6 +70,15 @@ _LOG_FIELDS    = ["ts", "score", "label", "direction",
 _LOG_INTERVAL  = 300    # seconds between log writes (5 min)
 _OUTCOME_HOURS = 72.0   # hours to wait before resolving outcome (matches "72h bias" name)
 
+# Backtest cutoff: rows logged BEFORE this UTC timestamp were produced by an
+# older scoring engine (e.g. the double-EMA-smoothing bug fixed in commit
+# 97d0537 on 2026-05-31 00:24:19 SGT). They still render on the history chart
+# for continuity, but are excluded from winrate and calibration so the numbers
+# reflect ONLY the current engine.
+# Bump this whenever you change the scoring engine in a way that breaks
+# comparability with prior logs.
+_BACKTEST_CUTOFF_UTC_ISO = "2026-05-30T16:24:19+00:00"  # = 2026-05-31 00:24 SGT
+
 
 # ════════════════════════════════════════════════════════════════
 #  SUPABASE HELPERS  (used when SUPABASE_URL + SUPABASE_KEY are set)
@@ -8286,9 +8295,27 @@ _total_resolved = sum(v["n"] for v in _acc_stats.values())
 
 with st.expander(f"📈 72h Bias Accuracy", expanded=False):
 
+    # ── Backtest cutoff: only count rows from the current scoring engine. ──
+    # Pre-cutoff rows came from an older engine (double-EMA bug) and would
+    # poison the winrate. They still appear on the history chart below.
+    try:
+        _cutoff_dt = _dt.fromisoformat(_BACKTEST_CUTOFF_UTC_ISO)
+    except Exception:
+        _cutoff_dt = None
+
+    def _post_cutoff(_r):
+        if _cutoff_dt is None:
+            return True
+        try:
+            return _dt.fromisoformat(_r.get("ts", "")) >= _cutoff_dt
+        except Exception:
+            return False
+
+    _bt_rows = [r for r in _sig_rows if _post_cutoff(r)]
+
     # Live log winrate: all logged signals (already filtered to |score| >= 40 at log time)
-    _live_wins = sum(1 for r in _sig_rows if r.get("correct") in ("1", "2"))
-    _live_loss = sum(1 for r in _sig_rows if r.get("correct") == "0")
+    _live_wins = sum(1 for r in _bt_rows if r.get("correct") in ("1", "2"))
+    _live_loss = sum(1 for r in _bt_rows if r.get("correct") == "0")
     _live_n    = _live_wins + _live_loss
     _live_wr   = round(_live_wins / _live_n * 100) if _live_n > 0 else None
     _live_col  = ("#8b949e" if _live_wr is None
@@ -8297,7 +8324,17 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
                   else "#f85149")
 
     _live_display = f"{_live_wr}%" if _live_wr is not None else "building..."
-    _live_note    = f"{_live_n} trades resolved" if _live_n > 0 else "logs every 5 min when |score| ≥ 25"
+    # Show how many pre-cutoff rows were excluded so the user knows what's
+    # in/out. Pre-cutoff rows came from older scoring engines.
+    _excluded    = sum(1 for r in _sig_rows
+                       if r.get("correct") in ("0", "1", "2")
+                       and not _post_cutoff(r))
+    if _live_n > 0:
+        _live_note = f"{_live_n} trades resolved"
+        if _excluded > 0:
+            _live_note += f"  ({_excluded} pre-patch excluded)"
+    else:
+        _live_note = "building... (excludes pre-patch rows)" if _excluded > 0 else "logs every 5 min"
 
     st.markdown(f"""
 <div style="background:#161b22; border:1px solid #30363d; border-radius:10px;
@@ -8386,7 +8423,7 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
     # ── Calibration buckets ────────────────────────────────────────
     # Shows actual hit-rate per score bucket. Monotonicity = well-calibrated model.
     # Needs resolved signals (correct==1/0) to populate.
-    _resolved = [r for r in _sig_rows if r.get("correct") in ("0", "1", "2")]
+    _resolved = [r for r in _bt_rows if r.get("correct") in ("0", "1", "2")]
     if len(_resolved) >= 5:
         _buckets = [
             ("< −40",  lambda s: s <= -40),
