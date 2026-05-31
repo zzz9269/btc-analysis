@@ -189,6 +189,81 @@ else:
 
 
 # ─────────────────────────────────────────────────────────────────
+# 2b. Phase 0 — per-signal detail rows (signal_detail table)
+#     Enables IC weighting, SHAP, and rolling performance later.
+#     Best-effort: missing table / failures don't fail the run.
+# ─────────────────────────────────────────────────────────────────
+_ts = row["ts"]
+try:
+    sigs = bias_72h.get("signals") or {}
+    wts  = bias_72h.get("weights") or {}
+    detail_rows = []
+    for name, tup in sigs.items():
+        try:
+            raw_v  = float(tup[0]) if tup else 0.0
+            w_v    = float(wts.get(name, 0.0))
+            contr  = raw_v * w_v * 100
+            detail_rows.append({
+                "ts":           _ts,
+                "signal_name":  str(name),
+                "raw_value":    round(raw_v, 4),
+                "weight":       round(w_v, 4),
+                "contribution": round(contr, 4),
+            })
+        except Exception:
+            continue
+    if detail_rows:
+        det_res = _supa("POST", "/signal_detail", body=detail_rows)
+        if det_res is not None:
+            print(f"  ✓ logged {len(detail_rows)} signal_detail rows")
+        else:
+            print(f"  ⚠ signal_detail insert failed (table missing?) — continuing")
+except Exception as e:
+    print(f"  ⚠ signal_detail error: {type(e).__name__}: {e} — continuing")
+
+
+# ─────────────────────────────────────────────────────────────────
+# 2c. Phase 2 prep — Polymarket strike probabilities (polymarket_log)
+#     Enables probability velocity / acceleration analysis later.
+#     Best-effort.
+# ─────────────────────────────────────────────────────────────────
+try:
+    poly_data = result.get("poly_sentiment") or {}
+    poly_mkts = poly_data.get("markets") or []
+    poly_rows = []
+    for m in poly_mkts:
+        try:
+            q       = str(m.get("question") or m.get("event") or "")[:200]
+            mkt_sc  = round(float(m.get("score", 0.0)), 2)
+            mkt_w   = float(m.get("weight", 0))
+            for b in (m.get("buckets") or []):
+                if not b or len(b) < 2:
+                    continue
+                lbl       = str(b[0])[:80]
+                prob_val  = float(b[1])
+                is_bull   = None
+                if len(b) >= 3 and b[2] is not None:
+                    is_bull = bool(b[2])
+                poly_rows.append({
+                    "ts":          _ts,
+                    "question":    q,
+                    "strike_lbl":  lbl,
+                    "probability": round(prob_val, 4),
+                    "is_bull":     is_bull,
+                    "mkt_score":   mkt_sc,
+                    "mkt_weight":  mkt_w,
+                })
+        except Exception:
+            continue
+    if poly_rows:
+        for i in range(0, len(poly_rows), 100):
+            _supa("POST", "/polymarket_log", body=poly_rows[i:i+100])
+        print(f"  ✓ logged {len(poly_rows)} polymarket_log rows")
+except Exception as e:
+    print(f"  ⚠ polymarket_log error: {type(e).__name__}: {e} — continuing")
+
+
+# ─────────────────────────────────────────────────────────────────
 # 3. Resolve outcomes for any rows older than 72h with correct=null
 # ─────────────────────────────────────────────────────────────────
 cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=OUTCOME_HRS)).isoformat()

@@ -106,13 +106,24 @@ def _supa_request(method: str, path: str, body=None) -> "dict | list | None":
 #  SIGNAL OUTCOME LOGGER
 # ════════════════════════════════════════════════════════════════
 
-def _log_bias_signal(score: float, label: str, price: float) -> None:
-    """Append one row to the signal log. Prefers Supabase when configured;
-    always also writes the local CSV as an offline backup."""
+def _log_bias_signal(score: float, label: str, price: float,
+                     bias_72h: dict = None, poly: dict = None) -> None:
+    """Append signal-log rows for this tick. Writes three Supabase tables:
+
+      signal_log     — one row: aggregate score/label/direction/entry_price
+      signal_detail  — N rows:  per-signal (name, raw_value, weight, contribution)
+      polymarket_log — M rows:  per-market (question, strike, prob, weight, score)
+
+    Local CSV always written as offline backup of signal_log. The detail and
+    polymarket tables are Supabase-only — they exist purely to enable
+    IC-weighting, SHAP, calibration, and probability-velocity in the future.
+
+    All writes are best-effort. Missing tables / failures don't crash the app.
+    """
     direction = "LONG" if score >= 25 else ("SHORT" if score <= -25 else "HOLD")
     ts = _dt.now(_tz.utc).isoformat()
 
-    # ── Supabase (server-side, runs even when this PC is off via cron) ────
+    # ── 1. signal_log (Supabase + CSV) ────────────────────────────────────
     if _supa_available():
         try:
             _supa_request("POST", "/rest/v1/signal_log", body={
@@ -128,7 +139,6 @@ def _log_bias_signal(score: float, label: str, price: float) -> None:
         except Exception:
             pass
 
-    # ── Local CSV backup (so the app still works without internet) ────────
     write_hdr = not _SIGNAL_LOG.exists()
     try:
         with open(_SIGNAL_LOG, "a", newline="") as f:
@@ -139,6 +149,68 @@ def _log_bias_signal(score: float, label: str, price: float) -> None:
                         round(price, 2), "", "", ""])
     except Exception:
         pass
+
+    # ── 2. signal_detail (per-signal contributions for IC / SHAP later) ──
+    if _supa_available() and bias_72h:
+        try:
+            _sigs = bias_72h.get("signals") or {}
+            _wts  = bias_72h.get("weights") or {}
+            rows  = []
+            for _name, _tup in _sigs.items():
+                try:
+                    _raw   = float(_tup[0]) if _tup else 0.0
+                    _w     = float(_wts.get(_name, 0.0))
+                    _contr = _raw * _w * 100   # scaled to 0–100 like the score
+                    rows.append({
+                        "ts":           ts,
+                        "signal_name":  str(_name),
+                        "raw_value":    round(_raw, 4),
+                        "weight":       round(_w, 4),
+                        "contribution": round(_contr, 4),
+                    })
+                except Exception:
+                    continue
+            if rows:
+                _supa_request("POST", "/rest/v1/signal_detail", body=rows)
+        except Exception:
+            pass
+
+    # ── 3. polymarket_log (per-strike probabilities for velocity later) ──
+    if _supa_available() and poly:
+        try:
+            _mkts = (poly or {}).get("markets") or []
+            rows  = []
+            for _m in _mkts:
+                try:
+                    _q       = str(_m.get("question") or _m.get("event") or "")[:200]
+                    _buckets = _m.get("buckets") or []
+                    for _b in _buckets:
+                        # buckets are tuples or lists: (label, prob, is_bull)
+                        if not _b or len(_b) < 2:
+                            continue
+                        _lbl    = str(_b[0])
+                        _prob   = float(_b[1])
+                        _is_bull = None
+                        if len(_b) >= 3 and _b[2] is not None:
+                            _is_bull = bool(_b[2])
+                        rows.append({
+                            "ts":          ts,
+                            "question":    _q,
+                            "strike_lbl":  _lbl[:80],
+                            "probability": round(_prob, 4),
+                            "is_bull":     _is_bull,
+                            "mkt_score":   round(float(_m.get("score", 0.0)), 2),
+                            "mkt_weight":  float(_m.get("weight", 0)),
+                        })
+                except Exception:
+                    continue
+            if rows:
+                # Polymarket can have ~50+ strikes per tick across all markets.
+                # Insert in chunks of 100 to keep request bodies small.
+                for i in range(0, len(rows), 100):
+                    _supa_request("POST", "/rest/v1/polymarket_log", body=rows[i:i+100])
+        except Exception:
+            pass
 
 
 def _supa_fetch_signals() -> "list | None":
@@ -4098,8 +4170,11 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
 
     # ── Probabilistic outputs ─────────────────────────────────────────────────
     # bull_prob: logistic transform of score, calibrated so score=0 → 50%, ±60 → ~80/20%
+    # NOTE: the /30 scaling is currently a hand-tuned heuristic. Once enough
+    # resolved signals accumulate, this should be replaced with a logistic
+    # regression fit on (score → actual 72h direction) — i.e. Brier-calibrated.
     bull_prob     = round(100 / (1 + np.exp(-score / 30)), 1)
-    # expected_move: ATR-based 72h range estimate, direction-weighted by score
+    # expected_move: realized-vol-based 72h range, split into directional halves
     try:
         # Realized 72h volatility: std of all 3-day rolling returns in the lookback window.
         # More accurate than ATR×3 because BTC vol clusters — ATR×3 overestimates in calm periods.
@@ -4107,11 +4182,75 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
         _ret_72h    = _cls_daily.pct_change(3).dropna() * 100   # 3-day % returns
         _vol_72h    = float(_ret_72h.std()) if len(_ret_72h) >= 10 else 3.0
         _price_now  = float(_cls_daily.iloc[-1])
-        expected_range = round(_price_now * _vol_72h / 100, 0)
-        expected_move  = round(expected_range * (score / 100) * 0.7, 0)
+        expected_range    = round(_price_now * _vol_72h / 100, 0)
+        # Legacy single-direction expected_move (kept for back-compat with UI)
+        expected_move     = round(expected_range * (score / 100) * 0.7, 0)
+        # ── Magnitude split (Phase 1.1) ──────────────────────────────────────
+        # Up/down expected moves derived from bull_prob, so they don't collapse
+        # at score=0 the way direction-weighted expected_move does. At 50/50
+        # they're both ~half of expected_range; as bull_prob climbs, upside
+        # expands and downside contracts.
+        _bp_dec               = bull_prob / 100.0
+        expected_move_up      = round(expected_range * _bp_dec, 0)
+        expected_move_down    = round(expected_range * (1 - _bp_dec), 0)
     except Exception:
-        expected_move  = None
-        expected_range = None
+        expected_move      = None
+        expected_range     = None
+        expected_move_up   = None
+        expected_move_down = None
+        _vol_72h           = None
+
+    # ── Volatility regime overlay (Phase 1.2) ─────────────────────────────────
+    # Independent of the trend/range/transition classifier. Tells you how
+    # MUCH movement to expect, not which way. Helps filter false signals
+    # (a +30 score in compression is noise; the same +30 in expansion is real).
+    try:
+        # Bollinger-band width percentile on daily candles (20-period, 2σ)
+        _bb_mid   = df["Close"].rolling(20).mean()
+        _bb_std   = df["Close"].rolling(20).std()
+        _bb_width = (_bb_std * 4) / _bb_mid     # full width = 2σ above + 2σ below, normalised to price
+        _bb_width = _bb_width.dropna()
+        _bb_pct   = float(_bb_width.rank(pct=True).iloc[-1]) if len(_bb_width) >= 20 else 0.5
+    except Exception:
+        _bb_pct   = 0.5
+    try:
+        # Realized-vol percentile (vs the lookback window itself)
+        _rv_pct   = float(_ret_72h.rank(pct=True).abs().iloc[-1]) if _vol_72h is not None and len(_ret_72h) >= 20 else 0.5
+    except Exception:
+        _rv_pct   = 0.5
+    # Combine: average of ATR + BB-width + realized-vol percentiles → vol_score [0,1]
+    _vol_score = float(np.mean([_atr_pctile, _bb_pct, _rv_pct]))
+    if   _vol_score >= 0.90: vol_regime = "panic"
+    elif _vol_score >= 0.70: vol_regime = "expansion"
+    elif _vol_score <= 0.30: vol_regime = "compression"
+    else:                    vol_regime = "normal"
+
+    # ── Composite confidence (Phase 1.3) ──────────────────────────────────────
+    # Combines four orthogonal signals of how much to trust today's score:
+    #   1. Signal agreement (existing _conviction)
+    #   2. Data-source quality (Coinglass real > Binance synthetic > N/A)
+    #   3. Regime stability (transition regime is less stable than trend/range)
+    #   4. Volatility regime (panic regimes are inherently low-confidence)
+    _liq_src         = (liq or {}).get("liq_map_source", "N/A")
+    _data_quality    = (
+        1.00 if "Coinglass"   in str(_liq_src)
+        else 0.85 if "Binance"   in str(_liq_src)
+        else 0.70                            # N/A or unknown
+    )
+    _regime_stability = (
+        1.00 if regime in ("trend", "range")
+        else 0.80                            # transition = less stable
+    )
+    _vol_stability    = (
+        0.70 if vol_regime == "panic"        # extreme vol → low confidence
+        else 0.95 if vol_regime == "compression"  # squeeze → slightly low
+        else 1.00
+    )
+    composite_confidence = round(
+        max(0.0, min(1.0,
+            _conviction * _data_quality * _regime_stability * _vol_stability
+        )), 2
+    )
 
     return {"score": score, "label": label, "color": color,
             "signals": signals, "weights": WEIGHTS,
@@ -4120,7 +4259,21 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
             "bull_prob": bull_prob,
             "expected_move": expected_move,
             "expected_range": expected_range,
-            "conviction": _conviction,   # ⑫ 0=split signals, 1=full consensus
+            # Phase 1.1 — directional magnitudes
+            "expected_move_up":   expected_move_up,
+            "expected_move_down": expected_move_down,
+            # Phase 1.2 — volatility regime overlay
+            "vol_regime":         vol_regime,
+            "vol_score":          round(_vol_score, 3),
+            "bb_width_pct":       round(_bb_pct * 100, 0),
+            "realized_vol_pct":   round(_rv_pct * 100, 0),
+            # Phase 1.3 — composite confidence
+            "composite_confidence": composite_confidence,
+            "data_quality":         round(_data_quality, 2),
+            "regime_stability":     round(_regime_stability, 2),
+            "vol_stability":        round(_vol_stability, 2),
+            # Legacy fields kept for back-compat
+            "conviction": _conviction,
             "signal_std": round(_sig_std, 3)}
 
 
@@ -8110,7 +8263,10 @@ _last_log = st.session_state.get("_last_log_ts", 0)
 if _now_ts - _last_log >= _LOG_INTERVAL:
     # Log the raw (unsmoothed) score + label so values match what the
     # headless cron writes — calibration must be environment-independent.
-    _log_bias_signal(_b12_score_raw, bias_72h.get("label", _b12_label), price)
+    # Also pass bias_72h + poly_sentiment so per-signal and per-market
+    # detail rows are written for IC weighting / SHAP / velocity later.
+    _log_bias_signal(_b12_score_raw, bias_72h.get("label", _b12_label), price,
+                     bias_72h=bias_72h, poly=poly_sentiment)
     st.session_state["_last_log_ts"] = _now_ts
 
 # Signal stability — consecutive same-direction refreshes
