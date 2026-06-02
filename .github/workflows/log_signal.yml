@@ -1,21 +1,27 @@
 name: Log 72h Bias Signal
 
+# Why this is a long-running loop and not a */5 cron:
+# GitHub heavily throttles scheduled workflows on small repos overnight —
+# */5 was producing 1-4 hour gaps in production. Hourly+ crons get throttled
+# far less. So instead, we cron only every 6 HOURS (which reliably fires),
+# and inside one job we loop the logger every 5 min for ~5h 45m. GitHub's
+# job timeout is 6h hard, and a public repo has unlimited Actions minutes,
+# so this is free. End result: ~70 logs per cron tick, near-continuous
+# coverage even when GitHub is throttling scheduled workflows.
+
 on:
   schedule:
-    # Every 5 min. Repo is public → unlimited Actions minutes, no budget cap.
-    # GitHub may still delay/skip individual scheduled runs by 1-5 min under
-    # peak load, but losing a tick here and there is fine — the dashboard
-    # reads the latest row and the 72h-resolution job catches up next tick.
-    - cron: "*/5 * * * *"
+    - cron: "0 */6 * * *"   # 00:00, 06:00, 12:00, 18:00 UTC — primary
+    - cron: "30 */6 * * *"  # 00:30, 06:30, … — insurance if primary is dropped
   workflow_dispatch: {}
 
 jobs:
   log:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 350           # 5h 50m, under GitHub's 6h hard cap
     concurrency:
       group: log-signal
-      cancel-in-progress: false
+      cancel-in-progress: false    # insurance cron queues, doesn't kill primary
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -28,9 +34,8 @@ jobs:
 
       - name: Install slim runtime deps
         # log_signal.py stubs streamlit/streamlit_autorefresh before importing
-        # btc_analysis_app.py, so we skip those (~30s saved per run). Everything
-        # btc_analysis_app.py imports at module load — numpy, pandas, matplotlib,
-        # scipy, yfinance — MUST be installed or the module load fails.
+        # btc_analysis_app.py, so we skip those. Everything else the app
+        # imports at module load MUST be installed.
         run: |
           python -m pip install --upgrade pip
           pip install \
@@ -40,8 +45,30 @@ jobs:
             "scipy==1.16.3" \
             "yfinance==1.1.0"
 
-      - name: Run signal logger
+      - name: Loop signal logger every 5 min for ~5h 45m
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        run: python log_signal.py
+        run: |
+          set +e   # tick failure must not kill the loop
+          deadline=$((SECONDS + 20700))   # 5h 45m budget
+          tick=0
+          while [ $SECONDS -lt $deadline ]; do
+            tick=$((tick + 1))
+            echo "=== tick $tick @ $(date -u '+%Y-%m-%d %H:%M:%SZ') ==="
+            python log_signal.py
+            rc=$?
+            [ $rc -ne 0 ] && echo "tick $tick exited rc=$rc — continuing"
+            # Sleep to the next 5-min wall-clock boundary so ticks align with
+            # chart time grid (00, 05, 10, 15, …). If we'd land <60s away, skip
+            # to the slot after to avoid back-to-back invocations.
+            now_mod=$((SECONDS % 300))
+            sleep_for=$((300 - now_mod))
+            [ $sleep_for -lt 60 ] && sleep_for=$((sleep_for + 300))
+            # Don't sleep past the deadline.
+            remaining=$((deadline - SECONDS))
+            [ $sleep_for -gt $remaining ] && break
+            echo "sleeping ${sleep_for}s"
+            sleep $sleep_for
+          done
+          echo "Loop complete: $tick ticks over $SECONDS seconds."
