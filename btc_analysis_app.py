@@ -513,6 +513,26 @@ def _backtest_tech_signals(days: int = 55) -> dict:
 #  DATA FETCHING (cached)
 # ════════════════════════════════════════════════════════════════
 
+def _live_btc_price() -> "float | None":
+    """Live BTC spot price. Prefer yfinance (so the displayed number matches
+    the user's BTC-USD reference), fall back to Binance if yfinance fails or
+    throttles. Returns None if both sources are unreachable."""
+    try:
+        fi = yf.Ticker("BTC-USD").fast_info
+        _p = fi.get("last_price") if hasattr(fi, "get") else getattr(fi, "last_price", None)
+        if _p is not None and float(_p) > 0:
+            return float(_p)
+    except Exception:
+        pass
+    try:
+        _r = _get_raw("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT")
+        if isinstance(_r, dict) and "price" in _r:
+            return float(_r["price"])
+    except Exception:
+        pass
+    return None
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_ohlc(ticker: str, days: int = LOOKBACK_DAYS) -> pd.DataFrame:
     # Prefer Binance daily klines for BTC — single source of truth across the app.
@@ -985,10 +1005,30 @@ The engine already routes questions: same-day → 24h signal (1.5× boost), 24�
 If RSI < 32 or Stoch < 22 → SHORT carries reversal risk; name invalidation level. If RSI > 68 or Stoch > 78 → LONG carries same risk.
 
 ## SCORE THRESHOLDS
-≥70 STRONG · 40–69 BULL/BEAR · 15–39 MILD · ±14 NEUTRAL. Actionable trade only at |score| ≥ 40.
+≥55 STRONG · 30–54 BULL/BEAR · 15–29 MILD · ±14 NEUTRAL. Actionable trade only at |score| ≥ 30.
 
-## POSITION SIZING
-STRONG: 100% · BUY/SELL: 75% · LEAN: 40% · NEUTRAL: 0%. Reduce one tier if `liq_map_source` = orderbook_proxy AND liq-cluster signals are dominant drivers.
+## POSITION SIZING — CONFIDENCE × VERDICT MATRIX (size MUST follow this; do not freelance)
+- STRONG + HIGH conf:      90–100%
+- STRONG + MEDIUM conf:    60–75%
+- BUY/SELL + HIGH conf:    60–75%
+- BUY/SELL + MEDIUM conf:  35–55%
+- LEAN + HIGH/MEDIUM conf: 20–35%
+- ANY + LOW conf:          10–20%  (cap)
+- NEUTRAL:                 0%
+Reduce one band if `liq_map_source` = orderbook_proxy AND liq-cluster signals are dominant drivers.
+
+## TRADE SETUP RULES (these failures repeat — follow strictly)
+1. **Pick ONE entry mechanism**, never both:
+   - LIMIT: "Entry at $X (limit)" — filled at that exact price
+   - TRIGGER: "Enter at market on 1h close below/above $X" — fill price is the close, not the trigger level
+   Never write "Entry at $A on 1h close below $B" with A ≠ B.
+2. **R:R is a calculation, not a claim.** Show it:
+   `R:R = |target − entry| ÷ |stop − entry| = $X ÷ $Y = 1:Z.Z`
+   The output ratio MUST equal that arithmetic. No rounding to a worse ratio.
+3. **Target must cite the input that justifies the level.** Acceptable citations:
+   liq cluster ($X bid/ask cluster), hunt zone ($X), 52W low/high, POC, prior swing low/high.
+   Don't write "next structural level" without naming what makes it structural.
+4. **Stop must cite invalidation.** What signal flip kills the thesis (EMA cross, VWAP reclaim, level retake).
 
 ## OUTPUT FORMAT — EXACTLY this structure:
 
@@ -1003,7 +1043,7 @@ STRONG: 100% · BUY/SELL: 75% · LEAN: 40% · NEUTRAL: 0%. Reduce one tier if `l
 
 **Key conflict or alignment:** [One sentence. Name the two signals most opposed — or confirm conviction.]
 
-**Trade setup:** "Direction · entry (price + 1h close trigger) · stop (invalidation) · target · R:R · structural reason." Calculate R:R explicitly. If |score| < 40, state the exact level/signal change that would validate the trade.
+**Trade setup:** Direction · entry ($X via LIMIT or TRIGGER) · stop $Y (invalidation: <named signal flip>) · target $Z (citing: <named input>) · R:R = |Z−X|÷|Y−X| = 1:N.N · structural reason. If |score| < 30, state the exact level/signal change that would validate a trade instead.
 
 **Confidence:**
 - HIGH: Tier 1 signals agree + 24h confirms + no major counter-signal
@@ -1032,6 +1072,7 @@ def _call_claude_interpretation(
     pct_from_low:  "float | None" = None,
     cycle_phase: str = "N/A",
     cycle_score: int = 0,
+    cycle_max:   int = 30,
     adx_val: float = float("nan"),
     signal_weights: "dict | None" = None,
     # 24h engine
@@ -1048,6 +1089,16 @@ def _call_claude_interpretation(
     atr_pct_15m: str = "N/A",
     # Liquidation map source quality
     liq_map_source: str = "N/A",
+    # Newly surfaced indicators (already computed elsewhere)
+    etf_flow_trend: str = "N/A",
+    etf_flow_detail: str = "N/A",
+    dominance_trend: str = "N/A",
+    oi_24h_delta_pct: "float | None" = None,
+    cycle_signals: "dict | None" = None,
+    liq_bid_clusters: "list | None" = None,
+    liq_ask_clusters: "list | None" = None,
+    hunt_zones: "list | None" = None,
+    cascade_direction: str = "N/A",
 ) -> str:
     """Call Claude with full system prompt to interpret all dashboard signals."""
     weights = signal_weights or {}
@@ -1086,15 +1137,73 @@ def _call_claude_interpretation(
     _adx_str = f"{adx_val:.0f}" if adx_val == adx_val else "N/A"  # nan check
     _pfh_str = f"{pct_from_high:.0f}% from ATH area" if pct_from_high is not None else "N/A"
     _pfl_str = f"+{pct_from_low:.0f}% from 52w low" if pct_from_low is not None else "N/A"
+    _adx_regime = ("trending" if isinstance(adx_val, (int, float)) and adx_val == adx_val and adx_val >= 25
+                   else "ranging" if isinstance(adx_val, (int, float)) and adx_val == adx_val and adx_val < 20
+                   else "transitional")
+    _oi_delta_str = f"{oi_24h_delta_pct:+.1f}%" if isinstance(oi_24h_delta_pct, (int, float)) else "N/A"
+
+    # Cycle signal breakdown — surface the top contributors so Claude isn't blind
+    # to *which* sub-signals drive the cycle composite.
+    _cyc_pos, _cyc_neg = [], []
+    if isinstance(cycle_signals, dict):
+        for _name, _val in cycle_signals.items():
+            if isinstance(_val, tuple) and len(_val) >= 2:
+                _s, _e = _val[0], _val[1]
+                if   _s >= 2: _cyc_pos.append(f"  • [{_s:+d}] {_name}: {_e}")
+                elif _s <= -2: _cyc_neg.append(f"  • [{_s:+d}] {_name}: {_e}")
+    _cyc_pos_block = "\n".join(_cyc_pos) if _cyc_pos else "  (no strong positive cycle signals)"
+    _cyc_neg_block = "\n".join(_cyc_neg) if _cyc_neg else "  (no strong negative cycle signals)"
+
+    # Liquidity map detail — bid/ask clusters and hunt zones
+    def _fmt_clusters(cl, kind):
+        if not cl:
+            return f"  ({kind} clusters unavailable)"
+        try:
+            top = sorted(cl, key=lambda x: -float(x.get("notional", x.get("size", 0))))[:4]
+            lines = []
+            for c in top:
+                _p = c.get("price", 0)
+                _n = c.get("notional", c.get("size", 0))
+                _d = c.get("dist_pct", c.get("distance_pct", None))
+                _dstr = f" ({_d:+.1f}% from spot)" if isinstance(_d, (int, float)) else ""
+                lines.append(f"  • ${_p:,.0f}: ${_n/1e6:.1f}M notional{_dstr}")
+            return "\n".join(lines) if lines else f"  ({kind} clusters empty)"
+        except Exception:
+            return f"  ({kind} cluster format error)"
+
+    _bid_block = _fmt_clusters(liq_bid_clusters, "bid")
+    _ask_block = _fmt_clusters(liq_ask_clusters, "ask")
+
+    _hz_lines = []
+    if hunt_zones:
+        try:
+            for hz in hunt_zones[:4]:
+                _p = hz.get("price", 0)
+                _side = hz.get("side", "?")
+                _mag = hz.get("magnitude", hz.get("notional", 0))
+                _hz_lines.append(f"  • {_side} hunt @ ${_p:,.0f} (magnitude {_mag/1e6:.1f}M)")
+        except Exception:
+            pass
+    _hz_block = "\n".join(_hz_lines) if _hz_lines else "  (no active hunt zones)"
 
     user_msg = f"""=== MACRO CONTEXT ===
 BTC Price: ${price:,.0f}
 Fear & Greed: {fear_greed}
-BTC Dominance: {btc_dominance}  (rising dominance = BTC outperforming alts = risk-on for BTC)
+BTC Dominance: {btc_dominance} — {dominance_trend}  (rising dominance = BTC outperforming alts = risk-on for BTC)
 7d Return: {momentum_7d}  |  30d Return: {momentum_30d}
 52-Week Range: {_pfl_str}, {_pfh_str}
-ADX Trend Strength: {_adx_str} (>25 = strong directional trend, <20 = choppy/ranging)
-Cycle Phase: {cycle_phase} ({cycle_score:+d}/24)  (positive = accumulation/bull; negative = distribution/bear)
+ADX Trend Strength: {_adx_str} ({_adx_regime}; >25 = strong directional trend, <20 = choppy/ranging)
+Cycle Phase: {cycle_phase} ({cycle_score:+d}/{cycle_max})  (positive = accumulation/bull; negative = distribution/bear)
+
+=== INSTITUTIONAL + DERIVATIVES FLOW ===
+ETF Flow Trend: {etf_flow_trend} — {etf_flow_detail}  (institutional spot demand; accelerating flows often lead price by days)
+OI 24h Delta: {_oi_delta_str}  (rising OI on price up = trend conviction; rising OI on price down = bearish positioning building)
+
+=== CYCLE PHASE — TOP DRIVERS ===
+Strongest bullish cycle inputs:
+{_cyc_pos_block}
+Strongest bearish cycle inputs:
+{_cyc_neg_block}
 
 === 72h DIRECTIONAL BIAS: {bias_score:+.0f}/100 ({bias_label}) ===
 Signal breakdown (weight → influence on composite score):
@@ -1123,6 +1232,14 @@ Drives Hunt Zone Pull, Swept Reversal, Cascade Direction (72h) and Nearby Liq Ma
 Quality ladder: coinglass > hyblock > binance_synthetic > orderbook_proxy.
 If source is binance_synthetic, treat liq-cluster signals with ~80% confidence.
 If source is orderbook_proxy, treat liq-cluster signals as noise and lean on technicals + Polymarket.
+Cascade direction: {cascade_direction}  (which side breaks first if price moves — fuel for trend continuation)
+
+Heaviest BID-side liquidation clusters (downside magnets):
+{_bid_block}
+Heaviest ASK-side liquidation clusters (upside magnets):
+{_ask_block}
+Active hunt zones (price tends to reach for these before reversing):
+{_hz_block}
 
 Now give your analysis using the OUTPUT FORMAT in the system prompt: 72h read, 24h read, cycle/far-term, conflict/alignment, trade setup."""
 
@@ -1473,7 +1590,7 @@ def fetch_polymarket_btc_sentiment(current_price: float) -> dict:
                 "category": "PRICE_RANGE", "weight": w,
                 "individual_score": score, "market_data": summary,
                 "rationale": rat, "display_type": "range",
-                "outcomes_display": buckets[:6],   # top 6 by prob
+                "outcomes_display": buckets,   # pass all buckets so displayed probs sum to 100%
                 "target_price": None,
             }
 
@@ -2670,10 +2787,17 @@ def calculate_fibonacci_levels(closes: list, lookback: int = 365) -> dict:
 #  CYCLE PHASE DETECTOR
 # ════════════════════════════════════════════════════════════════
 
-def detect_btc_cycle_phase(closes, rsi_series, crypto_sig, obv_trend, div_rsi) -> dict:
+def detect_btc_cycle_phase(closes, rsi_series, crypto_sig, obv_trend, div_rsi,
+                           oi_funding: dict = None,
+                           poly: dict = None,
+                           btc_liq: dict = None,
+                           df_daily: "pd.DataFrame | None" = None) -> dict:
     signals = {}
     total   = 0
     price   = closes[-1] if closes else 0
+    oi_funding = oi_funding or {}
+    poly       = poly or {}
+    btc_liq    = btc_liq or {}
 
     # 1. Fear & Greed
     fgi = crypto_sig.get("fear_greed_value", "N/A")
@@ -2724,7 +2848,7 @@ def detect_btc_cycle_phase(closes, rsi_series, crypto_sig, obv_trend, div_rsi) -
     rsi_score = max(-3, min(3, rsi_score))
     signals["RSI + Divergence"] = (rsi_score, rsi_e); total += rsi_score
 
-    # 4. Funding / Momentum
+    # 4. Price Momentum (7d/30d return tiers)
     m7  = crypto_sig.get("momentum_7d",  "N/A")
     m30 = crypto_sig.get("momentum_30d", "N/A")
     try:
@@ -2797,15 +2921,139 @@ def detect_btc_cycle_phase(closes, rsi_series, crypto_sig, obv_trend, div_rsi) -
     else:                                    s, e =  0, "OBV neutral"
     signals["OBV Divergence"] = (s, e); total += s
 
-    # Phase label
-    if total >= 12:    phase, phase_col, emoji, advice = "PROBABLE BOTTOM", "green",  "🟢", "High confluence of bottom signals. Strong case for accumulation."
-    elif total >= 6:   phase, phase_col, emoji, advice = "BOTTOM FORMING",  "yellow", "🟡", "Multiple bottom signals aligning. Start building position in tranches."
-    elif total >= -5:  phase, phase_col, emoji, advice = "MID-CYCLE",       "gray",   "⚪", "No clear cycle extreme. Follow trend, manage risk normally."
-    elif total >= -11: phase, phase_col, emoji, advice = "TOP FORMING",     "yellow", "🟡", "Multiple top signals aligning. Reduce exposure, tighten stops."
+    # 9. Funding Rate (perpetual swap positioning)
+    # Sustained high positive funding = crowded longs paying premium = late-cycle.
+    # Negative funding = shorts paying longs = capitulation / squeeze setup.
+    # Use 8h-average to filter single-print noise; report as %/8h for readability.
+    _fr_avg = oi_funding.get("funding_rate_avg8h")
+    _fr_now = oi_funding.get("funding_rate")
+    if _fr_avg is not None:
+        _fr_pct = float(_fr_avg) * 100  # rate is decimal; *100 → %/8h
+        if   _fr_pct <= -0.05: s, e = +3, f"Funding {_fr_pct:+.3f}%/8h - deep capitulation, shorts paying"
+        elif _fr_pct <= -0.02: s, e = +2, f"Funding {_fr_pct:+.3f}%/8h - negative, short squeeze setup"
+        elif _fr_pct <= -0.005:s, e = +1, f"Funding {_fr_pct:+.3f}%/8h - mildly negative"
+        elif _fr_pct <=  0.015:s, e =  0, f"Funding {_fr_pct:+.3f}%/8h - neutral"
+        elif _fr_pct <=  0.04: s, e = -1, f"Funding {_fr_pct:+.3f}%/8h - elevated long bias"
+        elif _fr_pct <=  0.08: s, e = -2, f"Funding {_fr_pct:+.3f}%/8h - crowded longs, top risk"
+        else:                  s, e = -3, f"Funding {_fr_pct:+.3f}%/8h - extreme greed, longs overleveraged"
+    else:
+        s, e = 0, "Funding rate N/A"
+    signals["Funding Rate"] = (s, e); total += s
+
+    # 10. Pi Cycle Top (111DMA vs 350DMA×2)
+    # When 111DMA crosses ABOVE 350DMA×2 → historical top within ±3 days
+    # (called every BTC cycle top: 2013, 2017, 2021). Proximity to the cross
+    # also informative: ratio approaching 1.0 = top warning, well below = healthy.
+    _cs = pd.Series(closes)
+    if len(_cs) >= 350:
+        _dma111 = _cs.rolling(111).mean().iloc[-1]
+        _dma350 = _cs.rolling(350).mean().iloc[-1]
+        if not (np.isnan(_dma111) or np.isnan(_dma350)) and _dma350 > 0:
+            _x2     = _dma350 * 2.0
+            _ratio  = _dma111 / _x2          # >= 1.0 = cross fired
+            _bull_x = _dma111 / _dma350      # 111 vs 350 (no x2) — bear/bull regime
+            if   _ratio >= 1.00:  s, e = -3, f"Pi Cycle Top FIRED (111DMA/2×350DMA = {_ratio:.2f}) - historical top signal"
+            elif _ratio >= 0.95:  s, e = -2, f"Pi Cycle approaching ({_ratio:.2f}) - top warning"
+            elif _ratio >= 0.85:  s, e = -1, f"Pi Cycle elevated ({_ratio:.2f}) - late cycle"
+            elif _bull_x < 1.00:  s, e = +2, f"111DMA below 350DMA ({_bull_x:.2f}) - bear regime, late accumulation zone"
+            elif _ratio <= 0.55:  s, e = +1, f"Pi Cycle low ({_ratio:.2f}) - early/mid cycle"
+            else:                 s, e =  0, f"Pi Cycle neutral ({_ratio:.2f})"
+        else:
+            s, e = 0, "Pi Cycle data insufficient"
+    else:
+        s, e = 0, f"Pi Cycle needs 350d (have {len(_cs)})"
+    signals["Pi Cycle Top"] = (s, e); total += s
+
+    # 11. Polymarket Long-Horizon Thesis
+    # Crowd thesis on multi-week/month BTC outcomes. Real money at risk.
+    try:
+        _pm_th   = float(poly.get("thesis_score", 0.0))   # -10..+10
+        _pm_conf = float(poly.get("confidence",   0.0))   # 0..1
+        _pm_n    = int(poly.get("markets_used",   0))
+        if _pm_n >= 2 and _pm_conf >= 0.4:
+            # Map thesis ±10 → ±2 cycle points, weighted by confidence
+            _pm_pts = float(np.clip(_pm_th * _pm_conf / 5.0, -2.0, 2.0))
+            s = int(round(_pm_pts))
+            e = f"Polymarket thesis {_pm_th:+.1f}/10 ({_pm_n} mkts, {_pm_conf:.0%} agree)"
+        else:
+            s, e = 0, f"Polymarket: thin ({_pm_n} mkts, {_pm_conf:.0%} conf)"
+    except Exception:
+        s, e = 0, "Polymarket N/A"
+    signals["Polymarket Thesis"] = (s, e); total += s
+
+    # 12. CVD Long-Term Trend (60-day buy/sell pressure)
+    # If df_daily available, compute CVD over last 60 daily bars: persistent
+    # accumulation = bullish cycle confirmation; persistent distribution = bearish.
+    try:
+        if df_daily is not None and len(df_daily) >= 60:
+            _last60 = df_daily.iloc[-60:].copy()
+            _direction = np.where(_last60["Close"] >= _last60["Open"], 1.0, -1.0)
+            _cvd60     = float(np.sum(_last60["Volume"].values * _direction))
+            _vol60     = float(np.sum(_last60["Volume"].values))
+            _cvd_pct   = (_cvd60 / _vol60) if _vol60 > 0 else 0.0   # in [-1, +1]
+            if   _cvd_pct >= 0.30: s, e = +2, f"CVD60 +{_cvd_pct:.0%} - strong accumulation"
+            elif _cvd_pct >= 0.10: s, e = +1, f"CVD60 +{_cvd_pct:.0%} - mild accumulation"
+            elif _cvd_pct <= -0.30: s, e = -2, f"CVD60 {_cvd_pct:.0%} - strong distribution"
+            elif _cvd_pct <= -0.10: s, e = -1, f"CVD60 {_cvd_pct:.0%} - mild distribution"
+            else:                  s, e = 0,  f"CVD60 {_cvd_pct:+.0%} - balanced"
+        else:
+            s, e = 0, "CVD60 data insufficient"
+    except Exception:
+        s, e = 0, "CVD60 N/A"
+    signals["CVD60 Trend"] = (s, e); total += s
+
+    # 13. ADX Compression Bonus
+    # Low ADX + extreme F&G = volatility compression at an extreme = imminent
+    # break in the contrarian direction. Adds ±1 only when both conditions align.
+    try:
+        if df_daily is not None and len(df_daily) >= 30:
+            _adx_d = calculate_adx(df_daily, period=14)
+            _fg_v  = crypto_sig.get("fear_greed_value", 50)
+            _fg_v  = int(_fg_v) if isinstance(_fg_v, (int, float, str)) and str(_fg_v).strip().isdigit() else 50
+            if not np.isnan(_adx_d) and _adx_d < 18:
+                if _fg_v <= 25:    s, e = +1, f"ADX {_adx_d:.0f} compression + F&G {_fg_v} extreme fear - coiled bullish"
+                elif _fg_v >= 75:  s, e = -1, f"ADX {_adx_d:.0f} compression + F&G {_fg_v} extreme greed - coiled bearish"
+                else:              s, e =  0, f"ADX {_adx_d:.0f} compression but F&G neutral ({_fg_v})"
+            else:
+                s, e = 0, f"ADX {_adx_d:.0f} - no compression"
+        else:
+            s, e = 0, "ADX compression: data insufficient"
+    except Exception:
+        s, e = 0, "ADX compression N/A"
+    signals["ADX Compression"] = (s, e); total += s
+
+    # 14. Liquidation Cluster Asymmetry
+    # Heavy liq clusters far below price = forced-sell magnets exhausted (bullish);
+    # heavy clusters above = upside fuel waiting; balanced = neutral. We compare
+    # total notional in bid vs ask clusters within a reasonable window.
+    try:
+        _bidc = btc_liq.get("liq_bid_clusters") or []
+        _askc = btc_liq.get("liq_ask_clusters") or []
+        def _sum_notl(arr):
+            return float(sum((c.get("notional", c.get("size", 0)) or 0) for c in arr))
+        _bsum, _asum = _sum_notl(_bidc), _sum_notl(_askc)
+        _tot = _bsum + _asum
+        if _tot > 0:
+            _asym = (_asum - _bsum) / _tot   # +1 = all upside fuel, -1 = all downside magnets
+            if   _asym >= +0.40: s, e = +1, f"Liq asymmetry {_asym:+.0%} - heavy upside fuel above"
+            elif _asym <= -0.40: s, e = -1, f"Liq asymmetry {_asym:+.0%} - heavy downside magnets below"
+            else:               s, e = 0,  f"Liq asymmetry {_asym:+.0%} - balanced"
+        else:
+            s, e = 0, "Liq clusters unavailable"
+    except Exception:
+        s, e = 0, "Liq asymmetry N/A"
+    signals["Liq Asymmetry"] = (s, e); total += s
+
+    # Phase label — max is now 30 (orig 10 signals @ ±3) + 6 (new: ±2,±2,±1,±1) = 36
+    # Thresholds scaled proportionally from the original (15/8/-7/-14 over 30).
+    if total >= 18:    phase, phase_col, emoji, advice = "PROBABLE BOTTOM", "green",  "🟢", "High confluence of bottom signals. Strong case for accumulation."
+    elif total >= 10:  phase, phase_col, emoji, advice = "BOTTOM FORMING",  "yellow", "🟡", "Multiple bottom signals aligning. Start building position in tranches."
+    elif total >= -8:  phase, phase_col, emoji, advice = "MID-CYCLE",       "gray",   "⚪", "No clear cycle extreme. Follow trend, manage risk normally."
+    elif total >= -17: phase, phase_col, emoji, advice = "TOP FORMING",     "yellow", "🟡", "Multiple top signals aligning. Reduce exposure, tighten stops."
     else:              phase, phase_col, emoji, advice = "PROBABLE TOP",    "red",    "🔴", "High confluence of top signals. Strong case for taking profits."
 
     return {
-        "total": total, "max": 24,
+        "total": total, "max": 36,
         "phase": phase, "emoji": emoji, "advice": advice, "signals": signals,
     }
 
@@ -3476,7 +3724,8 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
                      short_df: "pd.DataFrame | None" = None,
                      poly: "dict | None" = None,
                      oi_data: "dict | None" = None,
-                     df_4h: "pd.DataFrame | None" = None) -> dict:
+                     df_4h: "pd.DataFrame | None" = None,
+                     crypto_sig: "dict | None" = None) -> dict:
     """
     Weighted 72-hour directional bias score from −100 (strong bear) to +100 (strong bull).
 
@@ -3557,6 +3806,23 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
         "MACD Momentum":        0.01,  # 1h MACD histogram; noisy
         "Short Momentum":       0.01,  # 24h price change; partially redundant with 4h RSI
         "Stochastic Zone":      0.00,  # 1h oscillator; too short for 72h
+        # NEW — already-computed signals previously unused at 72h:
+        "ETF Flow":             0.04,  # institutional spot demand; multi-day persistence
+        "Med Momentum":         0.03,  # 7d/30d return tier from CoinGecko
+        "BTC Dominance":        0.02,  # cycle context — extreme alt season or BTC season
+        "Fear Greed (cont.)":   0.03,  # continuous F&G score, not just extremes
+        # REVERSAL signals — explicitly oppose the trend when extremes hit. Without
+        # these the engine just describes the current direction; with them it can
+        # actually forecast mean-reversion / capitulation turns.
+        "Mean Reversion":       0.05,  # z-score vs 20d mean — pushes against stretched moves
+        "OI Flush":             0.04,  # post-cascade reversal (longs/shorts flushed → fuel gone)
+        "F&G Extreme":          0.03,  # contrarian at F&G tails (≤20 or ≥80)
+        "Funding Extreme":      0.03,  # contrarian at crowded-positioning tails
+        # FORECAST / EXHAUSTION signals — leading rather than coincident
+        "Poly Forward":         0.05,  # Polymarket implied-price vs spot (literal forward rate)
+        "ADX Roll":             0.04,  # ADX peaked & declining = trend exhausting
+        "BB Compression":       0.03,  # post-expansion vol crush = blowoff complete
+        "TF Coherence":         0.04,  # 1h+4h+daily EMA alignment = real conviction (or disagreement = no)
     }
     # TREND: EMA dominant; mean-reversion signals suppressed; volume/momentum confirm
     _W_TREND = {
@@ -3576,6 +3842,22 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
         "MACD Momentum":        0.02,  # boosted — momentum confirms trend
         "Short Momentum":       0.01,
         "Stochastic Zone":      0.00,
+        "ETF Flow":             0.04,  # institutional flow confirms trend
+        "Med Momentum":         0.04,  # 7d/30d return — directional in trend
+        "BTC Dominance":        0.02,
+        "Fear Greed (cont.)":   0.02,  # less weight in trend (contrarian fights trend)
+        # REVERSAL signals — lower weight in trend so they don't fight the move on
+        # normal days, but still contribute at genuine extremes (z-score 2σ+, F&G≤15, etc.)
+        "Mean Reversion":       0.03,
+        "OI Flush":             0.03,
+        "F&G Extreme":          0.02,
+        "Funding Extreme":      0.02,
+        # FORECAST signals — Poly Forward & TF Coherence shine in trend (alignment confirms trend);
+        # ADX Roll & BB Compression are exhaustion calls so lower-weighted in trend regime.
+        "Poly Forward":         0.04,
+        "ADX Roll":             0.03,
+        "BB Compression":       0.02,
+        "TF Coherence":         0.05,
     }
     # RANGE: 4h RSI + RSI Div lead; EMA suppressed; CVD and traps confirm reversal zones
     _W_RANGE = {
@@ -3595,6 +3877,23 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
         "MACD Momentum":        0.01,
         "Short Momentum":       0.01,
         "Stochastic Zone":      0.00,
+        "ETF Flow":             0.03,
+        "Med Momentum":         0.02,
+        "BTC Dominance":        0.02,
+        "Fear Greed (cont.)":   0.04,  # contrarian sentiment shines in range
+        # REVERSAL signals — highest weight in range. This is when mean-reversion
+        # actually works, and capitulation/squeeze setups are most tradeable.
+        "Mean Reversion":       0.08,
+        "OI Flush":             0.06,
+        "F&G Extreme":          0.05,
+        "Funding Extreme":      0.04,
+        # FORECAST signals — Poly Forward + exhaustion signals critical in range
+        # (turning points are the whole game). TF Coherence lower because
+        # timeframes often disagree in choppy ranges (signal goes to ~0).
+        "Poly Forward":         0.06,
+        "ADX Roll":             0.04,
+        "BB Compression":       0.05,
+        "TF Coherence":         0.03,
     }
     WEIGHTS = {"trend": _W_TREND, "range": _W_RANGE, "transition": _W_BASE}[regime]
 
@@ -3613,13 +3912,29 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
         "CVD Trend":            0.65,  # 1–2 days
         "RSI Level":            0.65,  # 1h RSI; directional only 12–24h
         "MACD Momentum":        0.75,  # 1–3 days; trend-confirming but lags
+        "Fear Greed (cont.)":   0.85,  # sentiment shifts gradually over days
         "Price Structure":      0.85,  # 4h traps last 1–3 days
         "RSI Divergence":       0.95,  # 4h divergences persist days
         "MACD Divergence":      0.95,  # 4h divergences persist multiple days
         "OI Funding":           0.95,  # funding cycles are 8h–days level
+        "ETF Flow":             0.95,  # institutional flows have multi-day persistence
+        "Med Momentum":         1.00,  # 7d/30d return is structural by definition
+        "BTC Dominance":        1.00,  # macro cycle context, no intraday decay
         "4h RSI":               1.00,  # structural — directly 72h-relevant
         "EMA Structure":        1.00,  # daily — no decay
         "Polymarket Sentiment": 1.00,  # 24h+ crowd consensus — no decay
+        # REVERSAL signals: capitulation/squeeze setups play out over hours to days,
+        # not weeks. Decay moderately so they don't dominate a 72h forecast.
+        "Mean Reversion":       1.00,  # 20d structural baseline — no decay
+        "OI Flush":             0.80,  # cascade is a moment; reversal bounce 1–3 days
+        "F&G Extreme":          0.85,  # sentiment tails resolve over a few days
+        "Funding Extreme":      0.75,  # 8h funding cycle resets quickly
+        # FORECAST signals: structural by construction (Poly markets price the future;
+        # multi-TF alignment is by definition forward; exhaustion plays out over days).
+        "Poly Forward":         1.00,  # literal implied price for days ahead
+        "ADX Roll":             0.90,  # trend exhaustion plays out 1–3 days
+        "BB Compression":       0.85,  # post-blowoff drift over 2–4 days
+        "TF Coherence":         1.00,  # multi-TF alignment is structural
     }
     _decay_total_before = sum(WEIGHTS.values())
     for _dk, _dd in _HORIZON_DECAY.items():
@@ -4130,6 +4445,340 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
     signals["OI Funding"] = (raw, note)
     weighted_sum += raw * WEIGHTS["OI Funding"]
 
+    # ── 14. ETF Flow ────────────────────────────────────────────────
+    # Spot ETF flows (composite of IBIT/FBTC/ARKB/BITB/HODL/BTCO/EZBC).
+    # Sustained positive flows = institutional bid; accelerating amplifies.
+    try:
+        _cs = crypto_sig or {}
+        _et = str(_cs.get("etf_flow_trend", "Neutral"))
+        _ea = bool((_cs.get("etf_flow_stats", {}) or {}).get("accelerating", False))
+        _et_map = {"Positive": +0.5, "Negative": -0.5, "Mixed": 0.0, "Neutral": 0.0}
+        _et_raw = _et_map.get(_et, 0.0) * (1.5 if _ea else 1.0)
+        raw = float(np.clip(_et_raw, -1.0, 1.0))
+        note = f"ETF flows {_et}" + (" (accelerating)" if _ea else "")
+    except Exception:
+        raw, note = 0.0, "ETF Flow N/A"
+    signals["ETF Flow"] = (raw, note)
+    weighted_sum += raw * WEIGHTS.get("ETF Flow", 0.0)
+
+    # ── 15. Med Momentum (7d/30d return tiers) ──────────────────────
+    # Multi-day momentum from CoinGecko. Tier-mapped to avoid noise on small moves.
+    try:
+        _cs = crypto_sig or {}
+        _m7  = float(str(_cs.get("momentum_7d",  "0")).replace("%", "").replace("+", ""))
+        _m30 = float(str(_cs.get("momentum_30d", "0")).replace("%", "").replace("+", ""))
+        # Average of normalized 7d and 30d returns; tanh-bounded.
+        _mom_score = 0.5 * np.tanh(_m7 / 8.0) + 0.5 * np.tanh(_m30 / 15.0)
+        raw = float(np.clip(_mom_score, -1.0, 1.0))
+        note = f"Med momentum: 7d {_m7:+.1f}%, 30d {_m30:+.1f}%"
+    except Exception:
+        raw, note = 0.0, "Med Momentum N/A"
+    signals["Med Momentum"] = (raw, note)
+    weighted_sum += raw * WEIGHTS.get("Med Momentum", 0.0)
+
+    # ── 16. BTC Dominance ───────────────────────────────────────────
+    # Rising dominance = BTC outperforming alts (risk-on for BTC specifically).
+    # Falling dominance into 40s = alt season = topping risk for BTC cycle.
+    try:
+        _cs = crypto_sig or {}
+        _dom = float(str(_cs.get("btc_dominance", "0")).replace("%", ""))
+        if   _dom >= 60: raw = +0.5
+        elif _dom >= 55: raw = +0.25
+        elif _dom >= 48: raw = 0.0
+        elif _dom >= 40: raw = -0.25
+        else:            raw = -0.5
+        note = f"Dominance {_dom:.1f}%"
+    except Exception:
+        raw, note = 0.0, "Dominance N/A"
+    signals["BTC Dominance"] = (raw, note)
+    weighted_sum += raw * WEIGHTS.get("BTC Dominance", 0.0)
+
+    # ── 17. Fear & Greed continuous ─────────────────────────────────
+    # Contrarian: extreme fear = bullish, extreme greed = bearish. Continuous (not
+    # gated on extremes like the 24h engine), since 72h horizon lets gradients pay.
+    try:
+        _cs = crypto_sig or {}
+        _fg = _cs.get("fear_greed_value")
+        if isinstance(_fg, (int, float)):
+            raw  = float(np.tanh((50.0 - _fg) / 20.0))   # ±50 from neutral → ±0.99
+            note = f"F&G {_fg:.0f} (contrarian-bounded)"
+        else:
+            raw, note = 0.0, "F&G N/A"
+    except Exception:
+        raw, note = 0.0, "F&G N/A"
+    signals["Fear Greed (cont.)"] = (raw, note)
+    weighted_sum += raw * WEIGHTS.get("Fear Greed (cont.)", 0.0)
+
+    # ── 18. Mean Reversion (REVERSAL) ─────────────────────────────────────────
+    # Price z-score vs 20-day rolling mean. >+1σ above mean → bearish reversion
+    # pressure; >-1σ below mean → bullish reversion pressure. Sign flip is the
+    # whole point — this signal *opposes* the trend at extremes so the gauge
+    # can call mean-reversion turns instead of just describing direction.
+    try:
+        _mr_src = df["Close"].dropna()
+        if len(_mr_src) >= 20:
+            _mr_mean = float(_mr_src.rolling(20).mean().iloc[-1])
+            _mr_std  = float(_mr_src.rolling(20).std().iloc[-1])
+            if _mr_std > 0:
+                _mr_z = (price - _mr_mean) / _mr_std
+                if abs(_mr_z) < 1.0:
+                    raw  = 0.0
+                    note = f"Price at {_mr_z:+.1f}σ from 20d mean (no stretch)"
+                else:
+                    # tanh ramp on (|z|-1): gentle just past 1σ, saturates near 3σ
+                    _mag = float(np.tanh((abs(_mr_z) - 1.0) / 1.0))
+                    raw  = -float(np.sign(_mr_z)) * _mag
+                    _zone = "stretched UP → reversion bearish" if _mr_z > 0 else "stretched DOWN → reversion bullish"
+                    note = f"Price {_mr_z:+.1f}σ from 20d mean — {_zone} ({raw:+.2f})"
+            else:
+                raw, note = 0.0, "Mean reversion: zero std"
+        else:
+            raw, note = 0.0, "Mean reversion: insufficient history"
+        # In panic vol, the mean is moving fast — mean-reversion logic less reliable
+        if _vol_high:
+            raw *= 0.55
+    except Exception:
+        raw, note = 0.0, "Mean reversion N/A"
+    signals["Mean Reversion"] = (raw, note)
+    weighted_sum += raw * WEIGHTS.get("Mean Reversion", 0.0)
+
+    # ── 19. OI Flush (REVERSAL) ────────────────────────────────────────────────
+    # Cascade-complete reversal detector. Sharp OI decline AFTER a big price
+    # move = liquidations are done firing → no more fuel in that direction →
+    # reversal odds spike. Price down ≥3% + OI24 ≤ -5% → longs flushed → bull
+    # reversal. Price up ≥3% + OI24 ≤ -5% → shorts squeezed/closed → bear fade.
+    try:
+        _of      = oi_data or {}
+        _of_oi24 = _of.get("oi_24h_delta_pct", None)
+        _p24     = closes[-24] if len(closes) >= 24 else closes[0]
+        _of_r24  = (price - _p24) / _p24 * 100 if _p24 else 0.0
+        if _of_oi24 is None or abs(_of_r24) < 3.0 or _of_oi24 > -5.0:
+            _disp_oi = f"{_of_oi24:+.1f}%" if isinstance(_of_oi24, (int, float)) else "N/A"
+            raw, note = 0.0, f"No OI flush (ret24 {_of_r24:+.1f}%, OI24 {_disp_oi})"
+        else:
+            # OI drop magnitude: 5%→0, 12%→tanh(1)≈0.76, 20%→tanh(2.1)≈0.97
+            _flush_mag = float(np.tanh((abs(_of_oi24) - 5.0) / 7.0))
+            _of_dir    = +1.0 if _of_r24 < 0 else -1.0
+            raw  = _of_dir * _flush_mag
+            _tag = "Long flush — bullish reversal" if _of_r24 < 0 else "Short squeeze done — bearish fade"
+            note = f"{_tag} (ret24 {_of_r24:+.1f}%, OI24 {_of_oi24:+.1f}%, mag {_flush_mag:.2f})"
+    except Exception:
+        raw, note = 0.0, "OI Flush N/A"
+    signals["OI Flush"] = (raw, note)
+    weighted_sum += raw * WEIGHTS.get("OI Flush", 0.0)
+
+    # ── 20. F&G Extreme (REVERSAL) ─────────────────────────────────────────────
+    # Non-linear contrarian at the tails. "Fear Greed (cont.)" already supplies
+    # a smooth linear contrarian; this signal adds extra punch only when F&G
+    # enters the extreme zones (≤20 or ≥80) where reversal odds spike.
+    try:
+        _cs_fge = crypto_sig or {}
+        _fge    = _cs_fge.get("fear_greed_value")
+        if isinstance(_fge, (int, float)):
+            _fge = float(_fge)
+            if _fge <= 20:
+                raw  = float(np.tanh((20.0 - _fge) / 8.0))
+                note = f"F&G {_fge:.0f} — extreme fear (contrarian bull {raw:+.2f})"
+            elif _fge >= 80:
+                raw  = -float(np.tanh((_fge - 80.0) / 8.0))
+                note = f"F&G {_fge:.0f} — extreme greed (contrarian bear {raw:+.2f})"
+            else:
+                raw, note = 0.0, f"F&G {_fge:.0f} — outside extreme zone"
+        else:
+            raw, note = 0.0, "F&G Extreme N/A"
+    except Exception:
+        raw, note = 0.0, "F&G Extreme N/A"
+    signals["F&G Extreme"] = (raw, note)
+    weighted_sum += raw * WEIGHTS.get("F&G Extreme", 0.0)
+
+    # ── 21. Funding Extreme (REVERSAL) ─────────────────────────────────────────
+    # Crowded-positioning contrarian. "OI Funding" treats funding linearly;
+    # this signal kicks in only when funding is in the squeeze zone (|fr| ≥ 0.04%/8h).
+    # Deeply negative funding → overcrowded shorts → squeeze pump (bullish).
+    # Deeply positive funding → overcrowded longs → flush dump (bearish).
+    try:
+        _of_fe  = oi_data or {}
+        _fe_fr  = _of_fe.get("funding_rate", None)
+        if _fe_fr is None:
+            raw, note = 0.0, "Funding Extreme: N/A"
+        else:
+            _fr  = float(_fe_fr)
+            _THR = 0.0004   # 0.04%/8h — empirical squeeze zone
+            if abs(_fr) < _THR:
+                raw, note = 0.0, f"Funding {_fr*100:+.4f}%/8h — not extreme"
+            else:
+                _excess = (abs(_fr) - _THR) / _THR
+                _mag    = float(np.tanh(_excess))
+                raw  = -float(np.sign(_fr)) * _mag
+                _tag = "crowded shorts → squeeze" if _fr < 0 else "crowded longs → flush"
+                note = f"Funding {_fr*100:+.4f}%/8h — {_tag} ({raw:+.2f})"
+    except Exception:
+        raw, note = 0.0, "Funding Extreme N/A"
+    signals["Funding Extreme"] = (raw, note)
+    weighted_sum += raw * WEIGHTS.get("Funding Extreme", 0.0)
+
+    # ── 22. Poly Forward (FORECAST) ────────────────────────────────────────────
+    # Treats Polymarket as a literal forward rate, not crowd sentiment. Each
+    # market's strike buckets imply an expected resolution price; comparing the
+    # weighted-average implied price to current spot gives a directional forecast.
+    # >2% above spot → bullish; >2% below → bearish. This is the only signal in
+    # the engine that actually projects a future price level.
+    try:
+        import re as _re_pf
+        def _midp(lbl: str) -> "float | None":
+            # Range "$X–$Y" or "$X-$Y" (en-dash or hyphen)
+            m = _re_pf.search(r'\$?\s*([\d,]+)\s*[–\-]\s*\$?\s*([\d,]+)', lbl)
+            if m:
+                lo = float(m.group(1).replace(",", "")); hi = float(m.group(2).replace(",", ""))
+                if lo > 10000 and hi > 10000:
+                    return (lo + hi) / 2
+            # Open-ended ">$X" / "+$X" / "above X"
+            m = _re_pf.search(r'^[>+]\s*\$?\s*([\d,]+)', lbl) or _re_pf.search(r'(?i)\b(?:above|over)\s+\$?\s*([\d,]+)', lbl)
+            if m:
+                v = float(m.group(1).replace(",", ""))
+                if v > 10000: return v * 1.05
+            # Open-ended "<$X" / "below X"
+            m = _re_pf.search(r'^<\s*\$?\s*([\d,]+)', lbl) or _re_pf.search(r'(?i)\b(?:below|under)\s+\$?\s*([\d,]+)', lbl)
+            if m:
+                v = float(m.group(1).replace(",", ""))
+                if v > 10000: return v * 0.95
+            return None
+
+        implied_sum = 0.0
+        w_sum       = 0.0
+        n_mkts      = 0
+        for _mkt in (poly or {}).get("markets", []):
+            _bkts = _mkt.get("buckets") or []
+            if not _bkts:
+                continue
+            mkt_imp = 0.0; mkt_p = 0.0
+            for _b in _bkts:
+                if not _b or len(_b) < 2:
+                    continue
+                _lbl = str(_b[0]); _pr = float(_b[1] or 0)
+                _mp  = _midp(_lbl)
+                if _mp is None or _pr <= 0:
+                    continue
+                mkt_imp += _mp * _pr
+                mkt_p   += _pr
+            if mkt_p < 0.5:
+                continue   # need ≥50% of probability mass parsed
+            mkt_w = float(_mkt.get("weight", 1) or 1)
+            implied_sum += (mkt_imp / mkt_p) * mkt_w
+            w_sum       += mkt_w
+            n_mkts      += 1
+        if w_sum < 1.0 or n_mkts == 0:
+            raw, note = 0.0, "Poly Forward: no parseable strike markets"
+        else:
+            _implied = implied_sum / w_sum
+            _div_pct = (_implied - price) / price * 100
+            # ±2% divergence → ~±0.76; ±4% → ~±0.96
+            raw  = float(np.tanh(_div_pct / 2.0))
+            note = (f"Poly forward implied ${_implied:,.0f} vs spot ${price:,.0f} "
+                    f"({_div_pct:+.2f}%, {n_mkts} mkts)")
+    except Exception:
+        raw, note = 0.0, "Poly Forward N/A"
+    signals["Poly Forward"] = (raw, note)
+    weighted_sum += raw * WEIGHTS.get("Poly Forward", 0.0)
+
+    # ── 23. ADX Roll (FORECAST — trend exhaustion) ─────────────────────────────
+    # ADX climbing from a peak above 30 = strong trend. ADX rolling over from a
+    # peak = trend losing steam. Signals OPPOSITE to the trend direction when
+    # ADX is rolling off, because that's when reversal odds spike.
+    try:
+        if _adx_ok and _adx_1h > 25 and len(_ti) >= 25:
+            _adx_5b = float(calculate_adx(_ti.iloc[:-5], period=14))
+            _adx_peak = max(_adx_5b, _adx_1h) if not np.isnan(_adx_5b) else _adx_1h
+            _adx_drop = _adx_peak - _adx_1h
+            _c10 = closes[-10] if len(closes) >= 10 else closes[0]
+            _ret10 = (closes[-1] - _c10) / _c10 * 100 if _c10 else 0.0
+            _trend_dir = +1 if _ret10 > 1.0 else (-1 if _ret10 < -1.0 else 0)
+            if _adx_peak >= 30 and _adx_drop >= 4 and _trend_dir != 0:
+                _exhaust_mag = float(np.tanh(_adx_drop / 8.0))   # 4→0.46, 8→0.76
+                raw  = -float(_trend_dir) * _exhaust_mag
+                _tag = ("BULL trend losing momentum" if _trend_dir > 0
+                        else "BEAR trend losing momentum")
+                note = f"{_tag} — ADX {_adx_peak:.0f}→{_adx_1h:.0f} (Δ-{_adx_drop:.0f}) → reversal pressure"
+            else:
+                raw, note = 0.0, f"ADX trending steady (ADX {_adx_1h:.0f}, peak {_adx_peak:.0f})"
+        else:
+            raw, note = 0.0, f"ADX Roll: ADX too low or insufficient history"
+    except Exception:
+        raw, note = 0.0, "ADX Roll N/A"
+    signals["ADX Roll"] = (raw, note)
+    weighted_sum += raw * WEIGHTS.get("ADX Roll", 0.0)
+
+    # ── 24. BB Compression (FORECAST — post-blowoff vol crush) ─────────────────
+    # Bollinger-band width crushed to <75% of recent peak AFTER having expanded
+    # = vol blowoff complete = trend exhaustion → reversal pressure. Different
+    # from Mean Reversion (which is position-based); this is volatility-state-based.
+    try:
+        _bb_w_m  = df["Close"].rolling(20).mean()
+        _bb_w_s  = df["Close"].rolling(20).std()
+        _bb_w_se = ((_bb_w_s * 4) / _bb_w_m).dropna()
+        if len(_bb_w_se) >= 30:
+            _bb_now    = float(_bb_w_se.iloc[-1])
+            _bb_max10  = float(_bb_w_se.iloc[-10:].max())
+            _bb_q70    = float(_bb_w_se.quantile(0.70))
+            _was_hot   = _bb_max10 >= _bb_q70                      # was expanded
+            _crush     = _bb_now / _bb_max10 if _bb_max10 > 0 else 1.0
+            _c10       = closes[-10] if len(closes) >= 10 else closes[0]
+            _ret10     = (closes[-1] - _c10) / _c10 * 100 if _c10 else 0.0
+            _trend_dir = +1 if _ret10 > 1.5 else (-1 if _ret10 < -1.5 else 0)
+            if _was_hot and _crush < 0.75 and _trend_dir != 0:
+                _crush_mag = float(np.tanh((1.0 - _crush) * 2.0))
+                raw  = -float(_trend_dir) * _crush_mag
+                _tag = ("Post-bull blowoff vol crush" if _trend_dir > 0
+                        else "Post-bear capitulation vol crush")
+                note = f"{_tag} — BB width {_crush:.0%} of recent peak ({_crush_mag:.2f})"
+            else:
+                raw, note = 0.0, f"No vol crush (BB width {_crush:.0%} of recent peak)"
+        else:
+            raw, note = 0.0, "BB Compression: insufficient history"
+    except Exception:
+        raw, note = 0.0, "BB Compression N/A"
+    signals["BB Compression"] = (raw, note)
+    weighted_sum += raw * WEIGHTS.get("BB Compression", 0.0)
+
+    # ── 25. TF Coherence (FORECAST — multi-timeframe alignment) ────────────────
+    # 1h, 4h, daily EMA20 vs EMA50 each "vote" bull or bear. Coherence = signed
+    # mean of votes. All aligned = high conviction directional; disagreement
+    # = no real conviction → near-zero signal (forces other signals to do the
+    # talking instead of riding a fake consensus).
+    try:
+        _votes = []
+        if len(_ti) >= 50:
+            _e20 = float(_ti["Close"].ewm(span=20, adjust=False).mean().iloc[-1])
+            _e50 = float(_ti["Close"].ewm(span=50, adjust=False).mean().iloc[-1])
+            _votes.append(("1h", +1 if _e20 > _e50 else -1))
+        if _tf4h is not None and len(_tf4h) >= 50:
+            _e20 = float(_tf4h["Close"].ewm(span=20, adjust=False).mean().iloc[-1])
+            _e50 = float(_tf4h["Close"].ewm(span=50, adjust=False).mean().iloc[-1])
+            _votes.append(("4h", +1 if _e20 > _e50 else -1))
+        if len(df) >= 50:
+            _e20 = float(df["Close"].ewm(span=20, adjust=False).mean().iloc[-1])
+            _e50 = float(df["Close"].ewm(span=50, adjust=False).mean().iloc[-1])
+            _votes.append(("1d", +1 if _e20 > _e50 else -1))
+        if len(_votes) < 2:
+            raw, note = 0.0, "TF Coherence: <2 timeframes available"
+        else:
+            _sum = sum(v for _, v in _votes)
+            raw  = float(_sum) / len(_votes)
+            _bull = sum(1 for _, v in _votes if v > 0)
+            _bear = len(_votes) - _bull
+            _detail = ", ".join(f"{lbl}{'↑' if v > 0 else '↓'}" for lbl, v in _votes)
+            if abs(raw) >= 0.99:
+                _tag = "All TFs aligned"
+            elif abs(raw) >= 0.5:
+                _tag = "Majority aligned"
+            else:
+                _tag = "TFs disagree"
+            note = f"{_tag} ({_bull}↑/{_bear}↓): {_detail}"
+    except Exception:
+        raw, note = 0.0, "TF Coherence N/A"
+    signals["TF Coherence"] = (raw, note)
+    weighted_sum += raw * WEIGHTS.get("TF Coherence", 0.0)
+
     # ── Signal family normalization — cap each family before summing ──────────
     # Prevents correlated signals from compounding false confidence.
     # Each family is capped at ±1 effective unit; the individual weights still apply.
@@ -4149,9 +4798,37 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
     _family_cap(["RSI Level", "Stochastic Zone", "RSI Divergence", "4h RSI", "MACD Divergence"],  cap=0.95)
     _family_cap(["Hunt Zone Pull", "Swept Reversal", "Cascade Direction", "Order Book Depth"],  cap=0.95)
     _family_cap(["CVD Trend", "OI Funding"],                                  cap=0.95)
+    # Reversal/contrarian family — they all co-fire at capitulation/squeeze
+    # setups (F&G≤15 + funding<-0.05% + OI flushed + price -3σ all happen at
+    # the same bottoms). Cap prevents 4 aligned +1's from contributing 100%
+    # uncontested while preserving the signal that all four agree.
+    _family_cap(["Mean Reversion", "OI Flush", "F&G Extreme", "Funding Extreme",
+                 "Fear Greed (cont.)"],                                       cap=0.95)
+    # Trend-exhaustion family — ADX rolling over and BB compression both fire
+    # at end-of-move conditions and tend to agree at blowoff tops/bottoms.
+    _family_cap(["ADX Roll", "BB Compression"],                               cap=0.95)
+    # Forecast/forward family — Poly Forward and TF Coherence are independent
+    # data sources, but capping them together keeps a single Polymarket pull
+    # from dominating when alt timeframes all align the same way.
+    _family_cap(["Poly Forward", "TF Coherence"],                             cap=0.95)
 
     # Recompute weighted_sum after family normalization
     weighted_sum = sum(sig * WEIGHTS.get(name, 0) for name, (sig, _) in signals.items())
+
+    # ── Reversal-pressure subscore ────────────────────────────────────────────
+    # Sum of the weighted contribution from signals that explicitly *oppose*
+    # the trend (mean-reversion, capitulation, divergences, swept reversals).
+    # Exposed so the UI can show "trend X, reversal pressure Y, net Z" instead
+    # of just the net — same diagnostic the user asked for: "is BEAR weakening?"
+    _rev_keys = ["Mean Reversion", "OI Flush", "F&G Extreme", "Funding Extreme",
+                 "RSI Divergence", "MACD Divergence", "Swept Reversal",
+                 "Fear Greed (cont.)",
+                 # Forecast/exhaustion signals are also explicitly trend-opposing
+                 "ADX Roll", "BB Compression"]
+    _rev_pressure = round(
+        sum(signals[k][0] * WEIGHTS.get(k, 0.0) for k in _rev_keys if k in signals) * 100,
+        1
+    )
 
     # ⑫ Signal dispersion — std of raw signal values measures genuine consensus.
     # Low std = all signals agree → real conviction.
@@ -4178,11 +4855,19 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
     else:              label, color = "STRONG BEAR",  "#f85149"
 
     # ── Probabilistic outputs ─────────────────────────────────────────────────
-    # bull_prob: logistic transform of score, calibrated so score=0 → 50%, ±60 → ~80/20%
-    # NOTE: the /30 scaling is currently a hand-tuned heuristic. Once enough
-    # resolved signals accumulate, this should be replaced with a logistic
-    # regression fit on (score → actual 72h direction) — i.e. Brier-calibrated.
-    bull_prob     = round(100 / (1 + np.exp(-score / 30)), 1)
+    # bull_prob: confidence-adjusted logistic transform. The old /30 hand-tuned
+    # constant ignored that score=60 with all signals agreeing means something
+    # very different from score=60 with half-split signals. Now the divisor
+    # widens as conviction drops, flattening the sigmoid toward 50% when the
+    # engine itself isn't sure. Also clamped to [3%, 97%] — no engine should
+    # claim >97% certainty on a 72h forecast, ever.
+    # When enough resolved signals accumulate (~500+), this should be replaced
+    # with a logistic regression fit on (score, conviction → resolved direction).
+    _calib_conf  = _conviction * (0.85 if regime == "transition" else 1.0)
+    _calib_conf  = max(0.30, min(1.00, _calib_conf))      # floor at 0.30 so it doesn't explode
+    _calib_temp  = 30.0 / _calib_conf                      # range ~ [30, 100]
+    bull_prob    = round(100 / (1 + np.exp(-score / _calib_temp)), 1)
+    bull_prob    = max(3.0, min(97.0, bull_prob))
     # expected_move: realized-vol-based 72h range, split into directional halves
     try:
         # Realized 72h volatility: std of all 3-day rolling returns in the lookback window.
@@ -4281,6 +4966,8 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
             "data_quality":         round(_data_quality, 2),
             "regime_stability":     round(_regime_stability, 2),
             "vol_stability":        round(_vol_stability, 2),
+            # Reversal-pressure subscore (added with reversal signals)
+            "reversal_pressure":    _rev_pressure,
             # Legacy fields kept for back-compat
             "conviction": _conviction,
             "signal_std": round(_sig_std, 3)}
@@ -4290,7 +4977,8 @@ def compute_24h_bias(df: pd.DataFrame, btc_liq: dict = None,
                      short_df: pd.DataFrame = None,
                      oi_data: dict = None,
                      crypto_sig: dict = None,
-                     poly: dict = None) -> dict:
+                     poly: dict = None,
+                     cycle: dict = None) -> dict:
     """
     24-hour directional bias with full ADX regime switching (④).
     Distinct from 72h engine:
@@ -4319,6 +5007,10 @@ def compute_24h_bias(df: pd.DataFrame, btc_liq: dict = None,
     # ⑭ Weight tables: microstructure signals get boosted vs structural ones.
     # OB depth, CVD, liq imbalance, and momentum matter most over 24h.
     # RSI/Stoch get less weight than in 72h since mean-reversion over 24h is noisy.
+    # NEW signals added at small weights — renormalization handles the rest:
+    #   ETF Flow: institutional spot pulse, matters intraday
+    #   OI Delta: positioning conviction, separate from funding rate
+    #   Cycle Context: dampen counter-cycle calls at extremes (top/bottom)
     _W24_BASE = {
         "RSI7":              0.07,
         "Stochastic":        0.04,
@@ -4329,24 +5021,29 @@ def compute_24h_bias(df: pd.DataFrame, btc_liq: dict = None,
         "Funding":           0.11,
         "CVD":               0.14,
         "Liq Imbalance":     0.14,   # trimmed for Nearby Liq Magnet
-        "Nearby Liq Magnet": 0.04,   # NEW — projected liq clusters within ±2.5%
+        "Nearby Liq Magnet": 0.04,   # projected liq clusters within ±2.5%
         "EMA Align":         0.08,
         "Polymarket":        0.03,
         "Fear Greed":        0.01,
+        "ETF Flow":          0.02,
+        "OI Delta":          0.02,
+        "Cycle Context":     0.01,
     }
     _W24_TREND = {
         "RSI7":              0.04, "Stochastic":        0.02, "Fast MACD":     0.12,
         "Momentum":          0.14, "Candle Pos":        0.06, "Order Book":    0.04,
         "Funding":           0.09, "CVD":               0.13, "Liq Imbalance": 0.16,
         "Nearby Liq Magnet": 0.03, "EMA Align":         0.10, "Polymarket":    0.03,
-        "Fear Greed":        0.04,
+        "Fear Greed":        0.04, "ETF Flow":          0.02, "OI Delta":      0.03,
+        "Cycle Context":     0.01,
     }
     _W24_RANGE = {
         "RSI7":              0.12, "Stochastic":        0.09, "Fast MACD":     0.07,
         "Momentum":          0.08, "Candle Pos":        0.07, "Order Book":    0.05,
         "Funding":           0.10, "CVD":               0.13, "Liq Imbalance": 0.13,
         "Nearby Liq Magnet": 0.06, "EMA Align":         0.04, "Polymarket":    0.03,
-        "Fear Greed":        0.03,
+        "Fear Greed":        0.03, "ETF Flow":          0.03, "OI Delta":      0.02,
+        "Cycle Context":     0.02,
     }
     _W24 = {"trend": _W24_TREND, "range": _W24_RANGE, "transition": _W24_BASE}[_regime24]
     # Normalise weights to sum to 1.0
@@ -4563,14 +5260,59 @@ def compute_24h_bias(df: pd.DataFrame, btc_liq: dict = None,
     except Exception:
         _sigs24["Fear Greed"] = 0.0
 
+    # 12. ETF Flow — institutional spot pulse. Map trend label to a small signal;
+    # accelerating flows amplify by 1.5×. Mostly relevant in US trading hours but
+    # carry-over of conviction matters intraday.
+    try:
+        _etf_trend = (crypto_sig or {}).get("etf_flow_trend", "Neutral")
+        _etf_accel = ((crypto_sig or {}).get("etf_flow_stats", {}) or {}).get("accelerating", False)
+        _etf_map = {"Positive": +0.5, "Negative": -0.5, "Mixed": 0.0, "Neutral": 0.0}
+        _etf_raw = _etf_map.get(str(_etf_trend), 0.0)
+        if _etf_accel:
+            _etf_raw *= 1.5
+        _sigs24["ETF Flow"] = float(np.clip(_etf_raw, -1.0, 1.0))
+    except Exception:
+        _sigs24["ETF Flow"] = 0.0
+
+    # 13. OI Delta — separate from funding rate. Rising OI = positioning building.
+    # Sign comes from short-term return: rising OI on price up = trend conviction (+);
+    # rising OI on price down = bearish positioning (–). Falling OI = squaring up (≈0).
+    try:
+        _oi_d = (oi_data or {}).get("oi_24h_delta_pct")
+        if isinstance(_oi_d, (int, float)) and short_df is not None and len(short_df) >= 24:
+            _ret24 = (float(short_df["Close"].iloc[-1]) / float(short_df["Close"].iloc[-24]) - 1.0)
+            # Magnitude tanh-scaled on OI; sign from price direction over the same window.
+            _oi_mag = float(np.tanh(_oi_d / 5.0))   # ±5% delta ≈ ±0.76
+            _sigs24["OI Delta"] = float(np.clip(_oi_mag * np.sign(_ret24 if _ret24 != 0 else 0.0001), -1.0, 1.0))
+        else:
+            _sigs24["OI Delta"] = 0.0
+    except Exception:
+        _sigs24["OI Delta"] = 0.0
+
+    # 14. Cycle Context — nudge intraday bias toward cycle direction at extremes only.
+    # Probable bottom (+15) → mild bullish nudge; probable top (–15) → mild bearish nudge.
+    # Tanh keeps it bounded; mid-cycle (–7..+7) contributes ~0.
+    try:
+        _cyc_total = (cycle or {}).get("total")
+        if isinstance(_cyc_total, (int, float)):
+            _sigs24["Cycle Context"] = float(np.tanh(_cyc_total / 15.0))
+        else:
+            _sigs24["Cycle Context"] = 0.0
+    except Exception:
+        _sigs24["Cycle Context"] = 0.0
+
     # Weighted sum
     _ws24 = sum(_sigs24.get(k, 0.0) * w for k, w in _W24.items())
     score_100 = float(np.clip(_ws24 * 100, -100, 100))
 
-    if   score_100 >= 40: lab, col = "BULLISH",   "#3fb950"
-    elif score_100 >= 20: lab, col = "MILD BULL", "#58a6ff"
-    elif score_100 > -20: lab, col = "NEUTRAL",   "#8b949e"
-    elif score_100 > -40: lab, col = "MILD BEAR", "#f0883e"
+    # Label bands tightened: real composite scores rarely exceed ±50 due to
+    # signal disagreement and tanh-bounded individual contributions. Wide ±40
+    # bands under-classified strong directional moves. New bands: NEUTRAL ±15,
+    # MILD ±15-30, BEARISH/BULLISH beyond ±30.
+    if   score_100 >= 30: lab, col = "BULLISH",   "#3fb950"
+    elif score_100 >= 15: lab, col = "MILD BULL", "#58a6ff"
+    elif score_100 > -15: lab, col = "NEUTRAL",   "#8b949e"
+    elif score_100 > -30: lab, col = "MILD BEAR", "#f0883e"
     else:                 lab, col = "BEARISH",   "#f85149"
 
     return {"score": score_100, "label": lab, "color": col,
@@ -4750,6 +5492,59 @@ def _fetch_4h_ohlcv():
     except Exception:
         pass
     return None
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_fear_greed_history(limit: int = 90) -> "pd.DataFrame | None":
+    """Fetch historical Fear & Greed index from alternative.me.
+    Returns DataFrame[date, value, classification] or None on failure."""
+    try:
+        data = _get_raw(f"https://api.alternative.me/fng/?limit={int(limit)}")
+        if not isinstance(data, dict) or not data.get("data"):
+            return None
+        rows = []
+        for r in data["data"]:
+            try:
+                rows.append({
+                    "date":  pd.to_datetime(int(r["timestamp"]), unit="s"),
+                    "value": int(r["value"]),
+                    "class": r.get("value_classification", ""),
+                })
+            except Exception:
+                continue
+        if not rows:
+            return None
+        df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+        return df
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_funding_history(limit: int = 60) -> "pd.DataFrame | None":
+    """Fetch historical BTC perpetual funding rates from Binance.
+    Returns DataFrame[time, rate_pct] or None on failure."""
+    try:
+        fr_data = _get_raw(
+            f"https://fapi.binance.com/fapi/v1/fundingRate"
+            f"?symbol=BTCUSDT&limit={int(limit)}"
+        )
+        if not isinstance(fr_data, list) or not fr_data:
+            return None
+        rows = []
+        for r in fr_data:
+            try:
+                rows.append({
+                    "time":     pd.to_datetime(int(r["fundingTime"]), unit="ms"),
+                    "rate_pct": float(r["fundingRate"]) * 100.0,
+                })
+            except Exception:
+                continue
+        if not rows:
+            return None
+        return pd.DataFrame(rows).sort_values("time").reset_index(drop=True)
+    except Exception:
+        return None
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -6160,17 +6955,13 @@ def run_analysis(ticker: str = "BTC-USD") -> dict:
 
     closes = df["Close"].tolist()
     price  = closes[-1]
-    # Override with live Binance spot price — yfinance daily lags by 5-30 min via cache+latency.
-    # Only applies for BTC; other tickers keep yfinance value.
+    # Override with live spot price so we don't render against a stale daily close.
+    # Prefer yfinance (matches the BTC-USD quote users compare against), fall back
+    # to Binance if yfinance fails/throttles.
     if "BTC" in ticker.upper():
-        try:
-            _live = _get_raw("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT")
-            if isinstance(_live, dict) and "price" in _live:
-                _p = float(_live["price"])
-                if _p > 0:
-                    price = _p
-        except Exception:
-            pass
+        _p = _live_btc_price()
+        if _p and _p > 0:
+            price = _p
     df["MA50"]  = df["Close"].rolling(50).mean()
     df["MA200"] = df["Close"].rolling(200).mean()
     rsi_series  = calculate_rsi(df["Close"])
@@ -6214,9 +7005,14 @@ def run_analysis(ticker: str = "BTC-USD") -> dict:
     price_key  = round(price / 100) * 100
     btc_liq    = fetch_btc_liquidity_cached(price_key)
     has_liq    = bool(btc_liq and btc_liq.get("liq_bid_clusters"))
+    # Fetched here (instead of after) so cycle detector can use funding rate.
+    oi_funding = fetch_oi_funding()
+    # Polymarket fetched here too so cycle detector can use long-horizon thesis.
+    poly_sentiment = fetch_polymarket_btc_sentiment(price)
     cycle      = detect_btc_cycle_phase(
         closes=closes, rsi_series=rsi_series,
-        crypto_sig=crypto_sig, obv_trend=obv_trend, div_rsi=div_rsi
+        crypto_sig=crypto_sig, obv_trend=obv_trend, div_rsi=div_rsi,
+        oi_funding=oi_funding, poly=poly_sentiment, btc_liq=btc_liq, df_daily=df,
     )
 
     short_df      = _fetch_short_term_ohlcv()
@@ -6228,20 +7024,36 @@ def run_analysis(ticker: str = "BTC-USD") -> dict:
     if _4h_cur_len != _4h_prev_len:
         st.session_state["_4h_fetch_ts"]   = _dt.now(_tz.utc).timestamp()
         st.session_state["_4h_cached_len"] = _4h_cur_len
-    poly_sentiment = fetch_polymarket_btc_sentiment(price)
-    oi_funding    = fetch_oi_funding()
     prediction    = predict_direction(df, btc_liq)
     bias_72h      = compute_72h_bias(df, btc_liq, short_df=short_df, poly=poly_sentiment,
-                                     oi_data=oi_funding, df_4h=df_4h)
+                                     oi_data=oi_funding, df_4h=df_4h, crypto_sig=crypto_sig)
     bias_24h      = compute_24h_bias(df, btc_liq, short_df=short_df,
                                      oi_data=oi_funding, crypto_sig=crypto_sig,
-                                     poly=poly_sentiment)
+                                     poly=poly_sentiment, cycle=cycle)
 
     # 24h price change from last two rows
     prev_close = closes[-2] if len(closes) >= 2 else price
     chg_24h    = (price - prev_close) / prev_close * 100
 
     plot_df = df.iloc[-365:].copy()
+
+    # OBV line (full series, used by Volume section in Advanced Indicators tab)
+    try:
+        _c = df["Close"].values; _v = df["Volume"].values
+        _obv = np.zeros(len(_c))
+        for i in range(1, len(_c)):
+            if   _c[i] > _c[i-1]: _obv[i] = _obv[i-1] + _v[i]
+            elif _c[i] < _c[i-1]: _obv[i] = _obv[i-1] - _v[i]
+            else:                  _obv[i] = _obv[i-1]
+        df["OBV"] = _obv
+        plot_df["OBV"] = df["OBV"].iloc[-365:].values
+    except Exception:
+        df["OBV"] = np.nan
+        plot_df["OBV"] = np.nan
+
+    # Sentiment histories for Advanced Indicators tab (cached separately, optional)
+    fg_history       = fetch_fear_greed_history(365)
+    funding_history  = fetch_funding_history(1000)
 
     return dict(
         df=df, plot_df=plot_df, short_df=short_df, closes=closes, price=price,
@@ -6252,6 +7064,8 @@ def run_analysis(ticker: str = "BTC-USD") -> dict:
         cycle=cycle, prediction=prediction, bias_72h=bias_72h, bias_24h=bias_24h,
         poly_sentiment=poly_sentiment,
         chg_24h=chg_24h, ticker=ticker,
+        fg_history=fg_history, funding_history=funding_history,
+        oi_funding=oi_funding,
     )
 
 
@@ -6600,11 +7414,19 @@ def fig_intraday_15m(a: dict) -> "plt.Figure | None":
     ax_c.axhline(cur, color=_cur_col, lw=0.6, ls=":", alpha=0.45, zorder=2)
 
     # ── Axes ──────────────────────────────────────────────────────────
+    # Tick labels in SGT (UTC+8) so the viewer sees their wall-clock time.
+    # Session shading below remains anchored to UTC hour windows because
+    # Asia/London/NY are real market sessions, not viewer-local.
     tick_pos  = list(range(0, n, 8))
     tick_lbls = []
     for i in tick_pos:
-        try:   tick_lbls.append(pd.Timestamp(df15.index[i]).strftime("%H:%M"))
-        except: tick_lbls.append("")
+        try:
+            _t = pd.Timestamp(df15.index[i])
+            if _t.tz is None:
+                _t = _t.tz_localize("UTC")
+            tick_lbls.append(_t.tz_convert("Asia/Singapore").strftime("%H:%M"))
+        except Exception:
+            tick_lbls.append("")
 
     ax_c.set_xlim(-1, n)
     ax_c.set_ylim(p_lo - _pad, p_hi + _pad)
@@ -6621,7 +7443,7 @@ def fig_intraday_15m(a: dict) -> "plt.Figure | None":
                 "▼ below VWAP" if vwap is not None else "")
     _atr_chg_str = "{:+.0f}% ATR".format(atr_chg_pct) if abs(atr_chg_pct) >= 5 else ""
 
-    ax_c.set_title("BTC / USDT  ·  15-min  ·  24h", color="#c9d1d9",
+    ax_c.set_title("BTC / USDT  ·  15-min  ·  24h  ·  SGT", color="#c9d1d9",
                    fontsize=9, loc="left", pad=18, fontweight="bold")
     _meta = "   ".join(filter(None, [vwap_str,
                                      "ATR {} ({:.2f}%)".format(atr_state, atr_now / cur * 100),
@@ -6641,10 +7463,10 @@ def fig_intraday_15m(a: dict) -> "plt.Figure | None":
         _mlines.Line2D([], [], color="#e3b341", lw=0.9, ls=(0,(4,4)), label="POC"),
         _mpatches.Patch(fc="#3fb950", alpha=0.40, ec="none", label="Bull ribbon"),
         _mpatches.Patch(fc="#f85149", alpha=0.40, ec="none", label="Bear ribbon"),
-        _mpatches.Patch(fc="#58a6ff", alpha=0.30, ec="none", label="Asia 00–07"),
-        _mpatches.Patch(fc="#bc8cff", alpha=0.30, ec="none", label="London 07–13"),
-        _mpatches.Patch(fc="#f0883e", alpha=0.30, ec="none", label="NY 13–21"),
-        _mpatches.Patch(fc="#484f58", alpha=0.50, ec="none", label="Off 21–00"),
+        _mpatches.Patch(fc="#58a6ff", alpha=0.30, ec="none", label="Asia 08–15 SGT"),
+        _mpatches.Patch(fc="#bc8cff", alpha=0.30, ec="none", label="London 15–21 SGT"),
+        _mpatches.Patch(fc="#f0883e", alpha=0.30, ec="none", label="NY 21–05 SGT"),
+        _mpatches.Patch(fc="#484f58", alpha=0.50, ec="none", label="Off 05–08 SGT"),
         _mpatches.Patch(fc="#e3b341", alpha=0.35, ec="none", label="Squeeze zone"),
         _mlines.Line2D([], [], color="#3fb950", lw=0, marker="s", ms=5,
                        markerfacecolor="#3fb950", label="HH / HL"),
@@ -6774,6 +7596,19 @@ def fig_rsi(a: dict) -> plt.Figure:
     col   = "#f85149" if rsi_now > 70 else ("#3fb950" if rsi_now < 30 else "#bc8cff")
     ax.text(0.995, 0.95, f"RSI {rsi_now:.1f}  ·  {state}", transform=ax.transAxes,
             fontsize=8, va="top", ha="right", color=col)
+    # Observation badge (top-left): RSI zone → bullish/bearish call
+    _rsi_arr = plot_df["RSI"].dropna().values
+    _rsi_rising = len(_rsi_arr) >= 2 and _rsi_arr[-1] > _rsi_arr[-2]
+    _arrow = "↑" if _rsi_rising else "↓"
+    if   rsi_now >= 80: _r_msg, _r_col = f"RSI {rsi_now:.0f} {_arrow} — Extremely overbought, reversal risk high", "#f85149"
+    elif rsi_now >= 70: _r_msg, _r_col = f"RSI {rsi_now:.0f} {_arrow} — Overbought, bearish bias",                 "#f85149"
+    elif rsi_now <= 20: _r_msg, _r_col = f"RSI {rsi_now:.0f} {_arrow} — Deeply oversold, reversal setup",          "#3fb950"
+    elif rsi_now <= 30: _r_msg, _r_col = f"RSI {rsi_now:.0f} {_arrow} — Oversold, bullish bias",                   "#3fb950"
+    elif rsi_now > 55:  _r_msg, _r_col = f"RSI {rsi_now:.0f} {_arrow} — Above mid, mildly bullish",                "#3fb950"
+    elif rsi_now < 45:  _r_msg, _r_col = f"RSI {rsi_now:.0f} {_arrow} — Below mid, mildly bearish",                "#f85149"
+    else:               _r_msg, _r_col = f"RSI {rsi_now:.0f} {_arrow} — Neutral",                                  "#8b949e"
+    ax.text(0.005, 0.95, _r_msg, transform=ax.transAxes, fontsize=8, va="top", ha="left",
+            color=_r_col, bbox=dict(boxstyle="round,pad=0.3", fc="#0d1117", ec=_r_col, alpha=0.9, lw=0.7))
     ax.set_ylim(0, 100); ax.set_ylabel("RSI", color="#8b949e", fontsize=8)
     ax.set_title("RSI (14)", color="#8b949e", fontsize=9, loc="left", pad=4)
     _add_price_panel(axp, plot_df, price)
@@ -6796,7 +7631,25 @@ def fig_macd(a: dict) -> plt.Figure:
     ax.axhline(0, color="#484f58", lw=0.7)
     ax.set_ylabel("MACD", color="#8b949e", fontsize=8)
     ax.set_title("MACD (12, 26, 9)", color="#8b949e", fontsize=9, loc="left", pad=4)
-    ax.legend(fontsize=7, facecolor="#161b22", labelcolor="#c9d1d9", loc="upper left", framealpha=0.85)
+    # Observation badge (top-left): MACD vs Signal cross + histogram direction
+    _macd_s   = a["df"]["MACD"].dropna()
+    _sig_s    = a["df"]["MACD_Signal"].dropna()
+    _hist_s   = a["df"]["MACD_Hist"].dropna()
+    macd_now  = float(_macd_s.iloc[-1]) if not _macd_s.empty else 0.0
+    sig_now   = float(_sig_s.iloc[-1])  if not _sig_s.empty  else 0.0
+    h_now     = float(_hist_s.iloc[-1]) if not _hist_s.empty else 0.0
+    h_prev    = float(_hist_s.iloc[-2]) if len(_hist_s) >= 2 else 0.0
+    _rising   = h_now > h_prev
+    if   macd_now > sig_now and h_now > 0 and _rising:     _m_msg, _m_col = f"MACD > Signal · hist {h_now:+,.0f} rising — Bullish acceleration",   "#3fb950"
+    elif macd_now > sig_now and h_now > 0:                  _m_msg, _m_col = f"MACD > Signal · hist {h_now:+,.0f} fading — Bullish weakening",      "#3fb950"
+    elif macd_now > sig_now:                                 _m_msg, _m_col = f"MACD > Signal · hist {h_now:+,.0f} — Bullish but losing steam",      "#3fb950"
+    elif macd_now < sig_now and h_now < 0 and not _rising:  _m_msg, _m_col = f"MACD < Signal · hist {h_now:+,.0f} falling — Bearish acceleration",  "#f85149"
+    elif macd_now < sig_now and h_now < 0:                   _m_msg, _m_col = f"MACD < Signal · hist {h_now:+,.0f} recovering — Bearish fading",     "#f85149"
+    elif macd_now < sig_now:                                  _m_msg, _m_col = f"MACD < Signal · hist {h_now:+,.0f} — Bearish but lifting",            "#f85149"
+    else:                                                      _m_msg, _m_col = f"MACD ≈ Signal · hist {h_now:+,.0f} — Neutral",                        "#8b949e"
+    ax.text(0.005, 0.95, _m_msg, transform=ax.transAxes, fontsize=8, va="top", ha="left",
+            color=_m_col, bbox=dict(boxstyle="round,pad=0.3", fc="#0d1117", ec=_m_col, alpha=0.9, lw=0.7))
+    ax.legend(fontsize=7, facecolor="#161b22", labelcolor="#c9d1d9", loc="lower left", framealpha=0.85)
     _add_price_panel(axp, plot_df, price)
     plt.tight_layout(pad=0.5)
     return fig
@@ -7285,6 +8138,17 @@ def fig_bb_expanded(a: dict) -> plt.Figure:
     # Bandwidth
     bw = plot_df["BB_bw"]
     bw_mean = float(bw.dropna().mean()) if not bw.dropna().empty else 1
+    # Observation badge (top-left): %B position + squeeze flag
+    bw_now = float(bw.dropna().iloc[-1]) if not bw.dropna().empty else bw_mean
+    if   pctb_now > 1.0:  _bb_msg, _bb_col = f"Price ABOVE upper band (%B {pctb_now:.2f}) — Overbought", "#f85149"
+    elif pctb_now < 0.0:  _bb_msg, _bb_col = f"Price BELOW lower band (%B {pctb_now:.2f}) — Oversold",   "#3fb950"
+    elif pctb_now > 0.8:  _bb_msg, _bb_col = f"Near upper band (%B {pctb_now:.2f}) — Bullish bias",      "#3fb950"
+    elif pctb_now < 0.2:  _bb_msg, _bb_col = f"Near lower band (%B {pctb_now:.2f}) — Bearish bias",      "#f85149"
+    else:                 _bb_msg, _bb_col = f"Mid-band (%B {pctb_now:.2f}) — Neutral",                  "#8b949e"
+    if bw_now < bw_mean * 0.6:
+        _bb_msg += "  ·  Squeeze ⚡"
+    ax1.text(0.005, 0.95, _bb_msg, transform=ax1.transAxes, fontsize=8, va="top", ha="left",
+             color=_bb_col, bbox=dict(boxstyle="round,pad=0.3", fc="#0d1117", ec=_bb_col, alpha=0.9, lw=0.7))
     ax2.plot(plot_df.index, bw, color="#58a6ff", lw=1.2, label="Bandwidth %")
     ax2.axhline(bw_mean, color="#484f58", ls="--", lw=0.8, alpha=0.5, label=f"Mean {bw_mean:.1f}%")
     ax2.fill_between(plot_df.index, bw, bw_mean * 0.6, where=(bw < bw_mean * 0.6), color="#ffd700", alpha=0.2, label="Squeeze zone")
@@ -7325,9 +8189,20 @@ def fig_stoch_expanded(a: dict) -> plt.Figure:
     col   = "#f85149" if k_now > 80 else ("#3fb950" if k_now < 20 else "#8b949e")
     ax1.text(0.995, 0.95, f"Stoch %K {k_now:.0f}  %D {d_now:.0f}  ·  {state}",
              transform=ax1.transAxes, fontsize=8, va="top", ha="right", color=col)
+    # Observation badge (top-left): zone + cross direction → bullish/bearish call
+    _cross = "%K above %D ↑" if k_now > d_now else "%K below %D ↓"
+    if   k_now > 80 and k_now < d_now: _st_msg, _st_col = f"Overbought ({k_now:.0f}) — Bearish reversal setup",                  "#f85149"
+    elif k_now > 80:                    _st_msg, _st_col = f"Overbought ({k_now:.0f}) — Momentum strong but stretched",          "#f85149"
+    elif k_now < 20 and k_now > d_now:  _st_msg, _st_col = f"Oversold ({k_now:.0f}) — Bullish reversal setup",                   "#3fb950"
+    elif k_now < 20:                    _st_msg, _st_col = f"Oversold ({k_now:.0f}) — Selling pressure, watch for bottom",       "#3fb950"
+    elif k_now > 50 and k_now > d_now:  _st_msg, _st_col = f"Stoch {k_now:.0f} above midline · {_cross} — Mild bullish",         "#3fb950"
+    elif k_now < 50 and k_now < d_now:  _st_msg, _st_col = f"Stoch {k_now:.0f} below midline · {_cross} — Mild bearish",         "#f85149"
+    else:                               _st_msg, _st_col = f"Stoch {k_now:.0f} · {_cross} — Neutral",                            "#8b949e"
+    ax1.text(0.005, 0.95, _st_msg, transform=ax1.transAxes, fontsize=8, va="top", ha="left",
+             color=_st_col, bbox=dict(boxstyle="round,pad=0.3", fc="#0d1117", ec=_st_col, alpha=0.9, lw=0.7))
     ax1.set_ylim(-5, 105)
     ax1.set_ylabel("Stochastic", color="#8b949e", fontsize=8)
-    ax1.legend(fontsize=7, facecolor="#161b22", labelcolor="#c9d1d9", loc="upper left", ncol=2, framealpha=0.85)
+    ax1.legend(fontsize=7, facecolor="#161b22", labelcolor="#c9d1d9", loc="lower right", ncol=2, framealpha=0.85)
     ax1.set_title("Stochastic Oscillator (14,3)  ·  %K/%D crossovers", color="#8b949e", fontsize=9, loc="left", pad=5)
     # Price
     _add_price_panel(axp, plot_df, price)
@@ -7335,44 +8210,268 @@ def fig_stoch_expanded(a: dict) -> plt.Figure:
     return fig
 
 
-def fig_ac_atr_expanded(a: dict) -> plt.Figure:
+def fig_ac_expanded(a: dict) -> plt.Figure:
+    """Accelerator Oscillator (AC + AO) with its own price reference panel."""
     plot_df = a["plot_df"]; price = a["price"]
-    fig, (ax1, ax2, axp) = plt.subplots(3, 1, figsize=(13, 7.0), sharex=True,
-                                         gridspec_kw={"height_ratios": [1.2, 1.2, 1], "hspace": 0.08})
+    fig, (ax1, axp) = plt.subplots(2, 1, figsize=(13, 5.5), sharex=True,
+                                    gridspec_kw={"height_ratios": [1.4, 1], "hspace": 0.08})
     fig.patch.set_facecolor("#0d1117")
-    for ax in (ax1, ax2, axp): _ax_style(ax)
-    # Accelerator Oscillator
+    for ax in (ax1, axp): _ax_style(ax)
     ac = plot_df["AC"]; ao = plot_df["AO"]
     ac_col = np.where(ac >= 0, "#3fb950", "#f85149")
     ax1.bar(plot_df.index, ac.values, color=ac_col, alpha=0.7, width=0.6)
     ax1.plot(plot_df.index, ao, color="#58a6ff", lw=1.0, alpha=0.6, label="AO")
     ax1.axhline(0, color="#484f58", lw=0.8)
     ac_now = float(ac.dropna().iloc[-1]) if not ac.dropna().empty else 0
-    ao_now = float(ao.dropna().iloc[-1]) if not ao.dropna().empty else 0
     accel_state = "Accelerating ↑" if ac_now > 0 else "Decelerating ↓"
     ax1.text(0.995, 0.95, f"AC {ac_now:+.0f}  ·  {accel_state}",
              transform=ax1.transAxes, fontsize=8, va="top", ha="right",
              color="#3fb950" if ac_now > 0 else "#f85149")
+    # Observation badge (top-left): sign + last-3-bar trend → bullish/bearish call
+    _ac_arr = ac.dropna().values
+    _rising  = len(_ac_arr) >= 3 and _ac_arr[-1] > _ac_arr[-2] > _ac_arr[-3]
+    _falling = len(_ac_arr) >= 3 and _ac_arr[-1] < _ac_arr[-2] < _ac_arr[-3]
+    if   ac_now > 0 and _rising:  _ac_msg, _ac_col = f"AC rising above zero ({ac_now:+.0f}) — Strong bullish acceleration", "#3fb950"
+    elif ac_now > 0:              _ac_msg, _ac_col = f"AC above zero ({ac_now:+.0f}) — Bullish momentum",                   "#3fb950"
+    elif ac_now < 0 and _falling: _ac_msg, _ac_col = f"AC falling below zero ({ac_now:+.0f}) — Strong bearish acceleration","#f85149"
+    elif ac_now < 0:              _ac_msg, _ac_col = f"AC below zero ({ac_now:+.0f}) — Bearish momentum",                   "#f85149"
+    else:                          _ac_msg, _ac_col = f"AC {ac_now:+.0f} — Neutral",                                         "#8b949e"
+    ax1.text(0.005, 0.95, _ac_msg, transform=ax1.transAxes, fontsize=8, va="top", ha="left",
+             color=_ac_col, bbox=dict(boxstyle="round,pad=0.3", fc="#0d1117", ec=_ac_col, alpha=0.9, lw=0.7))
     ax1.set_title("Accelerator Oscillator (AC)", color="#8b949e", fontsize=9, loc="left", pad=4)
     ax1.set_ylabel("AC / AO", color="#8b949e", fontsize=8)
     ax1.legend(fontsize=7, facecolor="#161b22", labelcolor="#c9d1d9", loc="lower left")
-    # ATR
+    _add_price_panel(axp, plot_df, price)
+    plt.tight_layout(pad=0.5)
+    return fig
+
+
+def fig_atr_expanded(a: dict) -> plt.Figure:
+    """Average True Range with its own price reference panel."""
+    plot_df = a["plot_df"]; price = a["price"]
+    fig, (ax2, axp) = plt.subplots(2, 1, figsize=(13, 5.5), sharex=True,
+                                    gridspec_kw={"height_ratios": [1.4, 1], "hspace": 0.08})
+    fig.patch.set_facecolor("#0d1117")
+    for ax in (ax2, axp): _ax_style(ax)
     atr = plot_df["ATR"]
     atr_mean = float(atr.dropna().mean()) if not atr.dropna().empty else 1
     ax2.plot(plot_df.index, atr, color="#f0883e", lw=1.3, label="ATR (14)")
     ax2.axhline(atr_mean, color="#484f58", ls="--", lw=0.8, alpha=0.5, label=f"Mean ${atr_mean:,.0f}")
-    ax2.fill_between(plot_df.index, atr, atr_mean, where=(atr > atr_mean * 1.3), color="#f0883e", alpha=0.15, label="High vol zone")
+    ax2.fill_between(plot_df.index, atr, atr_mean, where=(atr > atr_mean * 1.3),
+                     color="#f0883e", alpha=0.15, label="High vol zone")
     atr_now = float(atr.dropna().iloc[-1]) if not atr.dropna().empty else 0
     atr_pct = atr_now / price * 100
     vol_state = "High" if atr_now > atr_mean * 1.3 else ("Low" if atr_now < atr_mean * 0.7 else "Normal")
     ax2.text(0.995, 0.95, f"ATR ${atr_now:,.0f}  ({atr_pct:.1f}%)  ·  {vol_state}",
              transform=ax2.transAxes, fontsize=8, va="top", ha="right",
-             color="#f85149" if vol_state == "High" else ("#3fb950" if vol_state == "Low" else "#8b949e"))
+             color="#f0883e" if vol_state == "High" else ("#58a6ff" if vol_state == "Low" else "#8b949e"))
+    # Observation badge (top-left): vol regime → caution / breakout-pending / normal.
+    # ATR isn't directional, so use orange (caution) and blue (compressed) instead of red/green.
+    if   vol_state == "High": _at_msg, _at_col = f"High volatility (ATR ${atr_now:,.0f} = {atr_pct:.1f}% of price) — Expanding range, risk on", "#f0883e"
+    elif vol_state == "Low":  _at_msg, _at_col = f"Low volatility (ATR ${atr_now:,.0f} = {atr_pct:.1f}% of price) — Compressed, breakout pending", "#58a6ff"
+    else:                     _at_msg, _at_col = f"Normal volatility (ATR ${atr_now:,.0f} = {atr_pct:.1f}% of price)",                              "#8b949e"
+    ax2.text(0.005, 0.95, _at_msg, transform=ax2.transAxes, fontsize=8, va="top", ha="left",
+             color=_at_col, bbox=dict(boxstyle="round,pad=0.3", fc="#0d1117", ec=_at_col, alpha=0.9, lw=0.7))
     ax2.set_title("Average True Range  ·  Volatility", color="#8b949e", fontsize=9, loc="left", pad=4)
     ax2.set_ylabel("ATR", color="#8b949e", fontsize=8)
     ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"${v:,.0f}"))
-    ax2.legend(fontsize=7, facecolor="#161b22", labelcolor="#c9d1d9", loc="upper left")
-    # Price
+    ax2.legend(fontsize=7, facecolor="#161b22", labelcolor="#c9d1d9", loc="lower left")
+    _add_price_panel(axp, plot_df, price)
+    plt.tight_layout(pad=0.5)
+    return fig
+
+
+def fig_ma_expanded(a: dict) -> plt.Figure:
+    """MA50 vs MA200 trend chart (golden/death cross detector) with price panel."""
+    plot_df = a["plot_df"]; price = a["price"]
+    fig, (ax1, axp) = plt.subplots(2, 1, figsize=(13, 5.5), sharex=True,
+                                    gridspec_kw={"height_ratios": [1.6, 1], "hspace": 0.08})
+    fig.patch.set_facecolor("#0d1117")
+    for ax in (ax1, axp): _ax_style(ax)
+    close = plot_df["Close"]; ma50 = plot_df["MA50"]; ma200 = plot_df["MA200"]
+    ax1.plot(plot_df.index, close, color="#e6edf3", lw=1.0, alpha=0.75, label="Close")
+    ax1.plot(plot_df.index, ma50,  color="#58a6ff", lw=1.3, label="MA 50")
+    ax1.plot(plot_df.index, ma200, color="#f0883e", lw=1.3, label="MA 200")
+    # Cross markers (golden = MA50↑ above MA200, death = MA50↓ below MA200)
+    diff      = (ma50 - ma200).fillna(0).values
+    gold_mask = (diff[1:] > 0) & (diff[:-1] <= 0)
+    death_msk = (diff[1:] < 0) & (diff[:-1] >= 0)
+    x_idx     = plot_df.index[1:]
+    if gold_mask.any():
+        ax1.scatter(x_idx[gold_mask], ma50.values[1:][gold_mask], marker="^",
+                    color="#3fb950", s=55, zorder=5, label="Golden cross")
+    if death_msk.any():
+        ax1.scatter(x_idx[death_msk], ma50.values[1:][death_msk], marker="v",
+                    color="#f85149", s=55, zorder=5, label="Death cross")
+    ma50_now  = float(ma50.dropna().iloc[-1])  if not ma50.dropna().empty  else price
+    ma200_now = float(ma200.dropna().iloc[-1]) if not ma200.dropna().empty else price
+    spread_pct = (ma50_now - ma200_now) / ma200_now * 100 if ma200_now else 0
+    # Observation badge: regime call from price vs MAs + 50/200 spread
+    if   price > ma50_now > ma200_now: _ma_msg, _ma_col = f"Price > MA50 > MA200 · spread {spread_pct:+.1f}% — Bullish trend stack", "#3fb950"
+    elif price > ma200_now and ma50_now > ma200_now: _ma_msg, _ma_col = f"MA50 above MA200 (golden regime, {spread_pct:+.1f}%) — Bullish bias", "#3fb950"
+    elif price < ma50_now < ma200_now: _ma_msg, _ma_col = f"Price < MA50 < MA200 · spread {spread_pct:+.1f}% — Bearish trend stack", "#f85149"
+    elif price < ma200_now and ma50_now < ma200_now: _ma_msg, _ma_col = f"MA50 below MA200 (death regime, {spread_pct:+.1f}%) — Bearish bias", "#f85149"
+    else:                              _ma_msg, _ma_col = f"Price tangled with MAs · spread {spread_pct:+.1f}% — Transition / range", "#8b949e"
+    ax1.text(0.005, 0.95, _ma_msg, transform=ax1.transAxes, fontsize=8, va="top", ha="left",
+             color=_ma_col, bbox=dict(boxstyle="round,pad=0.3", fc="#0d1117", ec=_ma_col, alpha=0.9, lw=0.7))
+    ax1.text(0.995, 0.95, f"MA50 ${ma50_now:,.0f}  ·  MA200 ${ma200_now:,.0f}",
+             transform=ax1.transAxes, fontsize=8, va="top", ha="right", color="#8b949e")
+    ax1.set_title("Moving Averages  ·  MA50 / MA200 cross", color="#8b949e", fontsize=9, loc="left", pad=4)
+    ax1.set_ylabel("Price", color="#8b949e", fontsize=8)
+    ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"${v:,.0f}"))
+    ax1.legend(fontsize=7, facecolor="#161b22", labelcolor="#c9d1d9", loc="lower right", ncol=2, framealpha=0.85)
+    _add_price_panel(axp, plot_df, price)
+    plt.tight_layout(pad=0.5)
+    return fig
+
+
+def fig_obv_expanded(a: dict) -> plt.Figure:
+    """On-Balance Volume with rolling SMA, divergence-style badge, and price panel."""
+    plot_df = a["plot_df"]; price = a["price"]
+    fig, (ax1, axp) = plt.subplots(2, 1, figsize=(13, 5.5), sharex=True,
+                                    gridspec_kw={"height_ratios": [1.4, 1], "hspace": 0.08})
+    fig.patch.set_facecolor("#0d1117")
+    for ax in (ax1, axp): _ax_style(ax)
+    obv     = plot_df["OBV"]
+    obv_ma  = obv.rolling(20, min_periods=5).mean()
+    ax1.plot(plot_df.index, obv,    color="#bc8cff", lw=1.2, label="OBV")
+    ax1.plot(plot_df.index, obv_ma, color="#58a6ff", lw=1.0, ls="--", label="OBV MA20")
+    ax1.axhline(0, color="#484f58", lw=0.7)
+    # Compare OBV trend vs price trend over last 20 bars → accumulation / distribution / divergence
+    look = 20
+    obv_arr = obv.dropna().values
+    cls_arr = plot_df["Close"].dropna().values
+    if len(obv_arr) > look and len(cls_arr) > look:
+        obv_chg = (obv_arr[-1] - obv_arr[-look]) / (abs(obv_arr[-look]) + 1.0)
+        prc_chg = (cls_arr[-1] - cls_arr[-look]) / cls_arr[-look]
+    else:
+        obv_chg, prc_chg = 0.0, 0.0
+    if   obv_chg >  0.10 and prc_chg <  0.0:  _ob_msg, _ob_col = f"OBV {obv_chg:+.1%} vs price {prc_chg:+.1%} — Strong accumulation (bullish divergence)", "#3fb950"
+    elif obv_chg < -0.10 and prc_chg >  0.0:  _ob_msg, _ob_col = f"OBV {obv_chg:+.1%} vs price {prc_chg:+.1%} — Strong distribution (bearish divergence)", "#f85149"
+    elif obv_chg >  0.05:                      _ob_msg, _ob_col = f"OBV {obv_chg:+.1%} vs price {prc_chg:+.1%} — Accumulation",                              "#3fb950"
+    elif obv_chg < -0.05:                      _ob_msg, _ob_col = f"OBV {obv_chg:+.1%} vs price {prc_chg:+.1%} — Distribution",                              "#f85149"
+    else:                                       _ob_msg, _ob_col = f"OBV {obv_chg:+.1%} vs price {prc_chg:+.1%} — Neutral flow",                              "#8b949e"
+    ax1.text(0.005, 0.95, _ob_msg, transform=ax1.transAxes, fontsize=8, va="top", ha="left",
+             color=_ob_col, bbox=dict(boxstyle="round,pad=0.3", fc="#0d1117", ec=_ob_col, alpha=0.9, lw=0.7))
+    ax1.set_title("On-Balance Volume (OBV)  ·  Accumulation / Distribution flow", color="#8b949e", fontsize=9, loc="left", pad=4)
+    ax1.set_ylabel("OBV (cumulative)", color="#8b949e", fontsize=8)
+    ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v/1e9:,.1f}B"))
+    ax1.legend(fontsize=7, facecolor="#161b22", labelcolor="#c9d1d9", loc="lower right", framealpha=0.85)
+    _add_price_panel(axp, plot_df, price)
+    plt.tight_layout(pad=0.5)
+    return fig
+
+
+def fig_volume_expanded(a: dict) -> plt.Figure:
+    """Daily volume bars (coloured by candle direction) + 20-day rolling mean."""
+    plot_df = a["plot_df"]; price = a["price"]
+    fig, (ax1, axp) = plt.subplots(2, 1, figsize=(13, 5.5), sharex=True,
+                                    gridspec_kw={"height_ratios": [1.4, 1], "hspace": 0.08})
+    fig.patch.set_facecolor("#0d1117")
+    for ax in (ax1, axp): _ax_style(ax)
+    vol     = plot_df["Volume"]
+    vol_ma  = vol.rolling(20, min_periods=5).mean()
+    direction = np.where(plot_df["Close"] >= plot_df["Open"], "#3fb950", "#f85149")
+    ax1.bar(plot_df.index, vol.values, color=direction, alpha=0.7, width=0.8)
+    ax1.plot(plot_df.index, vol_ma, color="#ffd700", lw=1.3, label="Volume MA20")
+    vol_now = float(vol.dropna().iloc[-1])    if not vol.dropna().empty    else 0
+    vma_now = float(vol_ma.dropna().iloc[-1]) if not vol_ma.dropna().empty else 1
+    ratio   = vol_now / vma_now if vma_now else 1
+    last_green = bool(plot_df["Close"].iloc[-1] >= plot_df["Open"].iloc[-1])
+    if   ratio > 1.5  and last_green:   _v_msg, _v_col = f"Volume {ratio:.1f}× MA20 on green candle — Strong buying conviction",   "#3fb950"
+    elif ratio > 1.5  and not last_green: _v_msg, _v_col = f"Volume {ratio:.1f}× MA20 on red candle — Strong selling conviction",   "#f85149"
+    elif ratio < 0.6:                    _v_msg, _v_col = f"Volume {ratio:.1f}× MA20 — Low participation, lacks conviction",        "#8b949e"
+    elif last_green:                     _v_msg, _v_col = f"Volume {ratio:.1f}× MA20 on green candle — Normal buying",              "#3fb950"
+    else:                                _v_msg, _v_col = f"Volume {ratio:.1f}× MA20 on red candle — Normal selling",               "#f85149"
+    ax1.text(0.005, 0.95, _v_msg, transform=ax1.transAxes, fontsize=8, va="top", ha="left",
+             color=_v_col, bbox=dict(boxstyle="round,pad=0.3", fc="#0d1117", ec=_v_col, alpha=0.9, lw=0.7))
+    ax1.set_title("Volume  ·  Daily bars + 20-day mean", color="#8b949e", fontsize=9, loc="left", pad=4)
+    ax1.set_ylabel("Volume", color="#8b949e", fontsize=8)
+    ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v/1e3:,.0f}K"))
+    ax1.legend(fontsize=7, facecolor="#161b22", labelcolor="#c9d1d9", loc="upper right", framealpha=0.85)
+    _add_price_panel(axp, plot_df, price)
+    plt.tight_layout(pad=0.5)
+    return fig
+
+
+def fig_fg_expanded(a: dict) -> plt.Figure:
+    """Fear & Greed Index history (alternative.me) with zone bands + price panel."""
+    plot_df = a["plot_df"]; price = a["price"]
+    fg_df   = a.get("fg_history")
+    fig, (ax1, axp) = plt.subplots(2, 1, figsize=(13, 5.5), sharex=True,
+                                    gridspec_kw={"height_ratios": [1.5, 1], "hspace": 0.08})
+    fig.patch.set_facecolor("#0d1117")
+    for ax in (ax1, axp): _ax_style(ax)
+    if fg_df is None or fg_df.empty:
+        ax1.text(0.5, 0.5, "Fear & Greed history unavailable",
+                 ha="center", va="center", color="#8b949e",
+                 transform=ax1.transAxes, fontsize=10)
+        _add_price_panel(axp, plot_df, price)
+        plt.tight_layout(pad=0.5)
+        return fig
+    ax1.axhspan(75, 100, color="#f85149", alpha=0.10)
+    ax1.axhspan(55,  75, color="#f0883e", alpha=0.08)
+    ax1.axhspan(45,  55, color="#484f58", alpha=0.08)
+    ax1.axhspan(25,  45, color="#58a6ff", alpha=0.08)
+    ax1.axhspan( 0,  25, color="#3fb950", alpha=0.10)
+    ax1.plot(fg_df["date"], fg_df["value"], color="#ffd700", lw=1.4)
+    ax1.axhline(75, color="#f85149", ls="--", lw=0.8, alpha=0.5)
+    ax1.axhline(25, color="#3fb950", ls="--", lw=0.8, alpha=0.5)
+    fg_now = int(fg_df["value"].iloc[-1])
+    fg_cls = str(fg_df["class"].iloc[-1])
+    if   fg_now <= 20: _f_msg, _f_col = f"Extreme Fear ({fg_now}) — Contrarian BUY signal", "#3fb950"
+    elif fg_now <= 35: _f_msg, _f_col = f"Fear ({fg_now}) — Mildly bullish (contrarian)",   "#3fb950"
+    elif fg_now <= 55: _f_msg, _f_col = f"Neutral ({fg_now}) — No sentiment edge",          "#8b949e"
+    elif fg_now <= 75: _f_msg, _f_col = f"Greed ({fg_now}) — Elevated, be cautious",        "#f0883e"
+    else:               _f_msg, _f_col = f"Extreme Greed ({fg_now}) — Contrarian SELL signal","#f85149"
+    ax1.text(0.005, 0.95, _f_msg, transform=ax1.transAxes, fontsize=8, va="top", ha="left",
+             color=_f_col, bbox=dict(boxstyle="round,pad=0.3", fc="#0d1117", ec=_f_col, alpha=0.9, lw=0.7))
+    ax1.text(0.995, 0.95, f"F&G {fg_now}  ·  {fg_cls}",
+             transform=ax1.transAxes, fontsize=8, va="top", ha="right", color="#ffd700")
+    ax1.set_ylim(0, 100)
+    ax1.set_title("Fear & Greed Index  ·  365-day history", color="#8b949e", fontsize=9, loc="left", pad=4)
+    ax1.set_ylabel("F&G (0–100)", color="#8b949e", fontsize=8)
+    _add_price_panel(axp, plot_df, price)
+    plt.tight_layout(pad=0.5)
+    return fig
+
+
+def fig_funding_expanded(a: dict) -> plt.Figure:
+    """BTC perp funding rate history (Binance, 8h periods) with bias bands + price panel."""
+    plot_df = a["plot_df"]; price = a["price"]
+    fh = a.get("funding_history")
+    fig, (ax1, axp) = plt.subplots(2, 1, figsize=(13, 5.5), sharex=True,
+                                    gridspec_kw={"height_ratios": [1.5, 1], "hspace": 0.08})
+    fig.patch.set_facecolor("#0d1117")
+    for ax in (ax1, axp): _ax_style(ax)
+    if fh is None or fh.empty:
+        ax1.text(0.5, 0.5, "Funding history unavailable",
+                 ha="center", va="center", color="#8b949e",
+                 transform=ax1.transAxes, fontsize=10)
+        _add_price_panel(axp, plot_df, price)
+        plt.tight_layout(pad=0.5)
+        return fig
+    rates = fh["rate_pct"].values
+    bar_col = np.where(rates >= 0, "#3fb950", "#f85149")
+    ax1.bar(fh["time"], rates, color=bar_col, alpha=0.65, width=0.28)
+    ax1.axhline(0.0,  color="#484f58", lw=0.7)
+    ax1.axhline(0.01, color="#f0883e", ls="--", lw=0.7, alpha=0.5)   # neutral upper
+    ax1.axhline(-0.01,color="#58a6ff", ls="--", lw=0.7, alpha=0.5)
+    fr_now = float(rates[-1])
+    fr_avg = float(np.mean(rates[-8:])) if len(rates) >= 1 else fr_now
+    # Funding rate is in % per 8h; >0.05% sustained = euphoric, <-0.05% = capitulation
+    if   fr_avg >  0.05: _fr_msg, _fr_col = f"Funding {fr_now:+.3f}% (avg8 {fr_avg:+.3f}%) — Longs overcrowded, bearish setup",  "#f85149"
+    elif fr_avg >  0.02: _fr_msg, _fr_col = f"Funding {fr_now:+.3f}% (avg8 {fr_avg:+.3f}%) — Mildly long-biased",                 "#f0883e"
+    elif fr_avg < -0.05: _fr_msg, _fr_col = f"Funding {fr_now:+.3f}% (avg8 {fr_avg:+.3f}%) — Shorts overcrowded, bullish setup",  "#3fb950"
+    elif fr_avg < -0.02: _fr_msg, _fr_col = f"Funding {fr_now:+.3f}% (avg8 {fr_avg:+.3f}%) — Mildly short-biased",                "#58a6ff"
+    else:                 _fr_msg, _fr_col = f"Funding {fr_now:+.3f}% (avg8 {fr_avg:+.3f}%) — Neutral positioning",                "#8b949e"
+    ax1.text(0.005, 0.95, _fr_msg, transform=ax1.transAxes, fontsize=8, va="top", ha="left",
+             color=_fr_col, bbox=dict(boxstyle="round,pad=0.3", fc="#0d1117", ec=_fr_col, alpha=0.9, lw=0.7))
+    ax1.text(0.995, 0.95, f"Latest {fr_now:+.3f}% / 8h",
+             transform=ax1.transAxes, fontsize=8, va="top", ha="right", color="#8b949e")
+    ax1.set_title("Funding Rate  ·  BTC Perp (Binance, 8h periods)", color="#8b949e", fontsize=9, loc="left", pad=4)
+    ax1.set_ylabel("Rate %/8h", color="#8b949e", fontsize=8)
+    ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:+.3f}%"))
     _add_price_panel(axp, plot_df, price)
     plt.tight_layout(pad=0.5)
     return fig
@@ -7578,19 +8677,14 @@ if not a:
 
 # run_analysis() is cached for 5 minutes — its embedded live-ticker call only
 # fires on a cache miss. Fetch a fresh ticker on every render so the header
-# BTC Price tracks Binance spot in real time, and recompute the 24h % change
+# BTC Price tracks live spot in real time, and recompute the 24h % change
 # from the cached prior daily close.
-try:
-    _live_tick = _get_raw("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT")
-    if isinstance(_live_tick, dict) and "price" in _live_tick:
-        _lp = float(_live_tick["price"])
-        if _lp > 0:
-            a["price"] = _lp
-            _cached_closes = a.get("closes") or []
-            if len(_cached_closes) >= 2 and _cached_closes[-2]:
-                a["chg_24h"] = (_lp - _cached_closes[-2]) / _cached_closes[-2] * 100
-except Exception:
-    pass
+_lp = _live_btc_price()
+if _lp and _lp > 0:
+    a["price"] = _lp
+    _cached_closes = a.get("closes") or []
+    if len(_cached_closes) >= 2 and _cached_closes[-2]:
+        a["chg_24h"] = (_lp - _cached_closes[-2]) / _cached_closes[-2] * 100
 
 price      = a["price"]
 chg_24h    = a["chg_24h"]
@@ -7651,25 +8745,31 @@ _b12_emove  = bias_72h.get("expected_move")
 _b12_erange = bias_72h.get("expected_range")
 _b12_conv   = bias_72h.get("conviction", 0.5)   # ⑫ 0=split signals, 1=full consensus
 _b12_sigstd = bias_72h.get("signal_std", 0.5)
+_b12_revp   = bias_72h.get("reversal_pressure", 0.0)
 
-# ① EMA smoothing: α=0.50 = equal-weight blend of raw + previous.
-# Responsive enough to track genuine 5%+ BTC moves within 1–2 refreshes,
-# while still smoothing single-candle spikes.
-# ⑮ Cold-start: initialize to 0 (neutral) not raw score, so the first
-# reading after an app restart doesn't show an unsmoothed spike.
-_EMA_ALPHA  = 0.50
+# Reversal-aware EMA smoothing: base α=0.50 (equal-weight blend), accelerating
+# up to α=0.80 when reversal pressure is significant. This addresses the user's
+# original complaint that the gauge felt descriptive — when reversal signals
+# are firing strongly the displayed score reacts faster instead of being
+# dragged by the trend-side EMA inertia. When reversal pressure is near zero,
+# smoothing reverts to the original 0.50 behavior.
+# Cold-start: initialize to 0 (neutral) so first reading after restart isn't a spike.
+_rev_abs    = min(abs(_b12_revp) / 100.0, 1.0)
+_EMA_ALPHA  = 0.50 + 0.30 * _rev_abs            # [0.50, 0.80]
 _prev_ema   = st.session_state.get("_bias_ema", 0.0)
 _b12_score  = round(_EMA_ALPHA * _b12_score_raw + (1 - _EMA_ALPHA) * _prev_ema, 1)
 st.session_state["_bias_ema"] = _b12_score
 
 # Derive label/color from smoothed score
+# Bands aligned with the engine's internal labeler (compute_72h_bias L4482):
+# NEUTRAL ±15, MILD ±15-30, BIAS ±30-55, STRONG beyond ±55.
 def _score_to_label_color(s):
-    if s >= 70:  return "STRONG BULL", "#3fb950"
-    if s >= 40:  return "BULL",        "#3fb950"
-    if s >= 25:  return "MILD BULL",   "#58a6ff"
-    if s > -25:  return "NEUTRAL",     "#8b949e"
-    if s > -40:  return "MILD BEAR",   "#f0883e"
-    if s > -70:  return "BEAR",        "#f85149"
+    if s >= 55:  return "STRONG BULL", "#3fb950"
+    if s >= 30:  return "BULL",        "#3fb950"
+    if s >= 15:  return "MILD BULL",   "#58a6ff"
+    if s > -15:  return "NEUTRAL",     "#8b949e"
+    if s > -30:  return "MILD BEAR",   "#f0883e"
+    if s > -55:  return "BEAR",        "#f85149"
     return "STRONG BEAR", "#f85149"
 
 _b12_label, _b12_color = _score_to_label_color(_b12_score)
@@ -7689,6 +8789,17 @@ _emove_str = (f"Expected move: <b>${abs(_b12_emove):,.0f}</b> {'↑' if _b12_emo
 _conv_pct   = int(_b12_conv * 100)
 _conv_color = "#3fb950" if _b12_conv >= 0.65 else "#ffd700" if _b12_conv >= 0.40 else "#f85149"
 _conv_label = "HIGH" if _b12_conv >= 0.65 else ("MED" if _b12_conv >= 0.40 else "LOW")
+# Reversal-pressure pill: shows the forecasting/contrarian sub-score so user can
+# read "score X, reversal pressure Y" instead of just the net. Color reflects
+# whether reversal pressure agrees with or opposes the current score direction.
+_revp_aligned = (_b12_revp * _b12_score) > 0   # same sign = confirms current direction
+_revp_color   = ("#3fb950" if (_b12_revp > 0 and not _revp_aligned)
+                 else "#f85149" if (_b12_revp < 0 and not _revp_aligned)
+                 else "#8b949e")
+_revp_sign    = "+" if _b12_revp >= 0 else ""
+_revp_tag     = ("opposing trend" if not _revp_aligned and abs(_b12_revp) >= 5
+                 else "confirming" if abs(_b12_revp) >= 5
+                 else "neutral")
 st.markdown(f"""
 <div style="display:flex; gap:10px; align-items:center; margin-bottom:10px; flex-wrap:wrap;">
   <span style="background:{_regime_color}22; border:1px solid {_regime_color}66;
@@ -7701,6 +8812,10 @@ st.markdown(f"""
         padding:3px 10px; font-size:11px; color:{_conv_color}; font-weight:700;"
         title="Conviction = 1 − signal std. High = all signals agree. Low = half bullish, half bearish averaging to noise.">
     Conviction: {_conv_label} ({_conv_pct}%)</span>
+  <span style="background:{_revp_color}18; border:1px solid {_revp_color}55; border-radius:6px;
+        padding:3px 10px; font-size:11px; color:{_revp_color}; font-weight:700;"
+        title="Reversal pressure = weighted sum of mean-reversion, divergence, exhaustion, and capitulation signals on the same -100..+100 scale as the main score. Opposite sign to score = reversal building. Same sign = continuation confirmed.">
+    Reversal: {_revp_sign}{_b12_revp:.0f} ({_revp_tag})</span>
   {"<span style='font-size:11px; color:#6e7681;'>" + _emove_str + "</span>" if _emove_str else ""}
 </div>""", unsafe_allow_html=True)
 
@@ -8004,11 +9119,20 @@ def _pm_card_range(mk):
         wc   = "#3fb950" if wsc > 0 else ("#f85149" if wsc < 0 else "#8b949e")
         bdr  = "#3fb950" if sc > 0.5 else ("#f85149" if sc < -0.5 else "#30363d")
 
-    # Build bucket bars (show up to 6).
+    # Show ALL buckets so the displayed probabilities sum to 100%.
+    # If a market has many low-prob buckets, aggregate the tail (those below 1%)
+    # into an "Others" row to keep the card compact while preserving the 100% total.
     # is_bull=True → green (directional bull target above current price)
     # is_bull=False → red (bear target)
     # is_bull=None → grey floor (already-exceeded support, de-emphasised)
-    visible = od[:8]
+    _MIN_VISIBLE_P = 0.01  # buckets below 1% get aggregated
+    _major = [b for b in od if b[1] >= _MIN_VISIBLE_P]
+    _minor = [b for b in od if b[1] <  _MIN_VISIBLE_P]
+    if len(od) > 10 and _minor:
+        _other_p = sum(p for _, p, _ in _minor)
+        visible  = _major + [(f"Others ({len(_minor)})", _other_p, None)]
+    else:
+        visible = od
     # Scale bars to the highest probability across ALL shown options so widths
     # are directly comparable — a 93% floor bar and an 8% ceiling bar both reflect
     # their true probability relative to the same scale.
@@ -8151,6 +9275,7 @@ if _ai_interp_key:
                     pct_from_low   = w52.get("pct_from_low"),
                     cycle_phase    = cycle.get("phase", "N/A"),
                     cycle_score    = cycle.get("total", 0),
+                    cycle_max      = cycle.get("max", 30),
                     adx_val        = float(a.get("adx_val", float("nan"))),
                     signal_weights = _b12_wts,
                     # 24h engine
@@ -8167,6 +9292,16 @@ if _ai_interp_key:
                     atr_pct_15m       = _atr_pct_15m,
                     # Liquidation map source quality
                     liq_map_source    = str((btc_liq or {}).get("liq_map_source", "N/A")),
+                    # Newly surfaced indicators
+                    etf_flow_trend    = str(crypto_sig.get("etf_flow_trend",  "N/A")),
+                    etf_flow_detail   = str(crypto_sig.get("etf_flow_detail", "N/A")),
+                    dominance_trend   = str(crypto_sig.get("dominance_trend", "N/A")),
+                    oi_24h_delta_pct  = (a.get("oi_funding") or {}).get("oi_24h_delta_pct"),
+                    cycle_signals     = cycle.get("signals"),
+                    liq_bid_clusters  = (btc_liq or {}).get("liq_bid_clusters"),
+                    liq_ask_clusters  = (btc_liq or {}).get("liq_ask_clusters"),
+                    hunt_zones        = (btc_liq or {}).get("hunt_zones"),
+                    cascade_direction = str((btc_liq or {}).get("cascade_direction", "N/A")),
                 )
             st.session_state["_claude_interp"] = _interp_text
         _interp_text = st.session_state.get("_claude_interp", "")
@@ -8379,6 +9514,14 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
     _sf.patch.set_facecolor("#0d1117")
     _sa.set_facecolor("#0d1117")
 
+    # Reference lines first so the data line draws on top of them
+    _sa.axhline(0,   color="#484f58", lw=0.7, ls="--", zorder=1)
+    _sa.axhline(25,  color="#3fb950", lw=0.6, ls=":",  alpha=0.5, zorder=1)
+    _sa.axhline(-25, color="#f85149", lw=0.6, ls=":",  alpha=0.5, zorder=1)
+    _sa.axhline(40,  color="#3fb950", lw=0.6, ls="--", alpha=0.4, zorder=1)
+    _sa.axhline(-40, color="#f85149", lw=0.6, ls="--", alpha=0.4, zorder=1)
+
+    _y_abs = 25  # default range keeps ±25 reference visible even with no data
     if len(_hist_rows) >= 1:
         _hist_times  = [h[0] for h in _hist_rows]
         _hist_scores = [h[1] for h in _hist_rows]
@@ -8390,13 +9533,12 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
                              where=(_sv <= -25), color="#f85149", alpha=0.20)
             _sa.fill_between(_hist_times, _sv, 0,
                              where=((_sv > -25) & (_sv < 25)), color="#8b949e", alpha=0.08)
-        _sa.plot(_hist_times, _sv, color="#58a6ff", lw=1.5, zorder=3)
-
-    _sa.axhline(0,   color="#484f58", lw=0.7, ls="--")
-    _sa.axhline(25,  color="#3fb950", lw=0.6, ls=":", alpha=0.5)
-    _sa.axhline(-25, color="#f85149", lw=0.6, ls=":", alpha=0.5)
-    _sa.axhline(40,  color="#3fb950", lw=0.6, ls="--", alpha=0.4)
-    _sa.axhline(-40, color="#f85149", lw=0.6, ls="--", alpha=0.4)
+        # Markers make each 5-min reading visible even when scores are tiny
+        _sa.plot(_hist_times, _sv, color="#58a6ff", lw=1.8,
+                 marker="o", ms=2.2, mfc="#58a6ff", mec="#58a6ff", zorder=3)
+        # Auto-zoom Y so a flat line near zero is still visible, but keep
+        # ±25 in view as the minimum reference window. Cap at ±75.
+        _y_abs = float(min(max(np.abs(_sv).max() * 1.25, 25), 75))
 
     _sa.text(1.002, 40,  "+40",  transform=_sa.get_yaxis_transform(), fontsize=6, color="#3fb950", va="center")
     _sa.text(1.002, 25,  "+25",  transform=_sa.get_yaxis_transform(), fontsize=6, color="#3fb950", va="center")
@@ -8404,7 +9546,7 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
     _sa.text(1.002, -40, "−40",  transform=_sa.get_yaxis_transform(), fontsize=6, color="#f85149", va="center")
 
     _sa.set_xlim(_x_start, _x_end)
-    _sa.set_ylim(-75, 75)
+    _sa.set_ylim(-_y_abs, _y_abs)
     _sa.set_ylabel("Bias Score", color="#8b949e", fontsize=7)
     _sa.tick_params(colors="#8b949e", labelsize=7)
     for _sp in _sa.spines.values(): _sp.set_edgecolor("#30363d")
@@ -8416,6 +9558,37 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
     plt.tight_layout(pad=0.4)
     st.pyplot(_sf, use_container_width=True)
     plt.close(_sf)
+
+    # ── Continuity diagnostic ────────────────────────────────────
+    # If the chart looks empty/sparse, this tells you which side of the
+    # pipeline is broken: Supabase config, cron writes, or local CSV.
+    _supa_ok    = _supa_available()
+    _hist_n     = len(_hist_rows)
+    _diag_parts = [f"Supabase: {'✓' if _supa_ok else '✗ (not configured)'}",
+                   f"rows in 72h: {_hist_n}"]
+    if _hist_n >= 1:
+        _ts_sorted = sorted(h[0] for h in _hist_rows)
+        _first, _last = _ts_sorted[0], _ts_sorted[-1]
+        _diag_parts.append(f"first: {_first.strftime('%d %b %H:%M')} SGT")
+        _diag_parts.append(f"last: {_last.strftime('%d %b %H:%M')} SGT")
+        if _hist_n >= 2:
+            _gaps_min = [(_ts_sorted[i] - _ts_sorted[i-1]).total_seconds() / 60
+                         for i in range(1, _hist_n)]
+            _max_gap = max(_gaps_min)
+            _diag_parts.append(
+                f"max gap: {_max_gap/60:.1f}h" if _max_gap >= 60
+                else f"max gap: {_max_gap:.0f} min"
+            )
+        # Leading edge: if data starts well after the 72h window did, that's
+        # cron not running before this PC came online.
+        _missing_lead_h = (_first - _x_start).total_seconds() / 3600
+        if _missing_lead_h > 1:
+            _diag_parts.append(f"missing first {_missing_lead_h:.1f}h")
+    st.markdown(
+        f"<div style='font-size:10px; color:#6e7681; padding:2px 4px 0;'>"
+        f"{'  •  '.join(_diag_parts)}</div>",
+        unsafe_allow_html=True,
+    )
 
     if len(_hist_rows) == 0:
         st.caption("No data yet — first point will appear within 5 minutes.")
@@ -8916,26 +10089,52 @@ with tab2:
         "PROBABLE TOP":    "#f85149",
     }
     banner_col = _col_map.get(cycle["phase"], "#8b949e")
-    bar_filled = int((cycle["total"] + 24) / 48 * 20)
+    _c_max     = cycle.get("max", 30)
+    bar_filled = int((cycle["total"] + _c_max) / (_c_max * 2) * 20)
     bar_str    = "█" * bar_filled + "░" * (20 - bar_filled)
+    # Top contributors — show the 3 signals moving the score in the direction
+    # of the current phase, so the user sees what's actually driving the call.
+    _csigs   = cycle.get("signals", {})
+    _phase_p = cycle["phase"] in ("PROBABLE BOTTOM", "BOTTOM FORMING")
+    _phase_n = cycle["phase"] in ("PROBABLE TOP",    "TOP FORMING")
+    if _phase_p:
+        _top = sorted(_csigs.items(), key=lambda kv: -kv[1][0])[:3]
+        _top = [(n, s) for n, (s, _e) in _top if s > 0]
+    elif _phase_n:
+        _top = sorted(_csigs.items(), key=lambda kv:  kv[1][0])[:3]
+        _top = [(n, s) for n, (s, _e) in _top if s < 0]
+    else:
+        # MID-CYCLE: show the 3 strongest signals in either direction
+        _top = sorted(_csigs.items(), key=lambda kv: -abs(kv[1][0]))[:3]
+        _top = [(n, s) for n, (s, _e) in _top if s != 0]
+    _drivers_html = ""
+    if _top:
+        _parts = []
+        for _n, _s in _top:
+            _c = "#3fb950" if _s > 0 else ("#f85149" if _s < 0 else "#8b949e")
+            _parts.append(f"<span style='color:{_c};font-weight:600;'>{_n} {_s:+d}</span>")
+        _drivers_html = (
+            f"<div style='font-size:11px; color:#8b949e; margin-top:6px;'>"
+            f"Driven by: {' · '.join(_parts)}</div>"
+        )
     st.markdown(f"""
 <div style="background:{banner_col}18; border:1px solid {banner_col};
      border-radius:10px; padding:16px 20px; margin-bottom:16px;">
   <div style="font-size:22px; font-weight:700; color:{banner_col};">
-    {cycle['emoji']} {cycle['phase']} &nbsp; <span style="font-size:14px; font-weight:400;">{cycle['total']:+d} / 24</span>
+    {cycle['emoji']} {cycle['phase']} &nbsp; <span style="font-size:14px; font-weight:400;">{cycle['total']:+d} / {_c_max}</span>
   </div>
   <div style="font-family:monospace; font-size:13px; color:{banner_col}; margin:4px 0;">[{bar_str}]</div>
   <div style="font-size:13px; color:#c9d1d9; margin-top:6px;">{cycle['advice']}</div>
+  {_drivers_html}
 </div>
 """, unsafe_allow_html=True)
 
-    # 8 signal cards
+    # Signal cards — 4 columns per row, grows to handle 10 signals (3 rows max)
     signals  = cycle.get("signals", {})
     sig_list = list(signals.items())
-    row1     = st.columns(4)
-    row2     = st.columns(4)
+    _rows    = [st.columns(4) for _ in range((len(sig_list) + 3) // 4)]
     for i, (name, (score, explanation)) in enumerate(sig_list):
-        col     = row1[i] if i < 4 else row2[i - 4]
+        col     = _rows[i // 4][i % 4]
         pill_cls = "sig-bull" if score > 0 else ("sig-bear" if score < 0 else "sig-neut")
         icon     = "↑" if score > 0 else ("↓" if score < 0 else "→")
         with col:
@@ -9149,24 +10348,7 @@ with tab4:
 with tab5:
     pdf = a["plot_df"]
 
-    # ── RSI + MACD ─────────────────────────────────────────
-    col_rsi, col_macd = st.columns(2)
-    with col_rsi:
-        st.markdown("##### RSI (14)")
-        st.caption("Relative Strength Index. >70 = overbought, <30 = oversold. Dashed line = EMA-9 signal of RSI.")
-        f_rsi = fig_rsi(a)
-        st.pyplot(f_rsi, use_container_width=True)
-        plt.close(f_rsi)
-    with col_macd:
-        st.markdown("##### MACD (12, 26, 9)")
-        st.caption("Histogram bars show momentum. Blue = MACD line, orange = signal line. Bar above zero & growing = acceleration up.")
-        f_macd = fig_macd(a)
-        st.pyplot(f_macd, use_container_width=True)
-        plt.close(f_macd)
-
-    st.divider()
-
-    # ── Quick metrics row ──────────────────────────────────
+    # ── Quick metrics row (overview) ───────────────────────
     def _sl(col):
         s = pdf[col].dropna()
         return float(s.iloc[-1]) if not s.empty else None
@@ -9206,7 +10388,13 @@ with tab5:
 
     st.divider()
 
-    # ── Ichimoku Cloud ─────────────────────────────────────
+    # ════════════════════════════════════════════════════════════
+    # 📈 TREND INDICATORS (LAGGING)
+    # ════════════════════════════════════════════════════════════
+    st.subheader("📈 Trend Indicators (Lagging)")
+    st.caption("Confirm the direction of the prevailing trend. Slow to flip, but high reliability when they do.")
+
+    # ── Ichimoku Cloud (full width) ────────────────────────
     st.markdown("##### Ichimoku Cloud")
     with st.expander("How to read this chart", expanded=False):
         st.markdown(
@@ -9239,10 +10427,60 @@ with tab5:
     st.pyplot(f_ichi, use_container_width=True)
     plt.close(f_ichi)
 
+    # ── MA50/MA200 + MACD side by side ─────────────────────
+    col_ma, col_macd = st.columns(2)
+    with col_ma:
+        st.markdown("##### Moving Averages (50 / 200)")
+        st.caption("Golden cross (MA50 crosses ABOVE MA200) = long-term bullish regime; death cross = bearish. Price above both MAs confirms the trend.")
+        f_ma = fig_ma_expanded(a)
+        st.pyplot(f_ma, use_container_width=True)
+        plt.close(f_ma)
+    with col_macd:
+        st.markdown("##### MACD (12, 26, 9)")
+        st.caption("Histogram bars show momentum. Blue = MACD line, orange = signal line. Bar above zero & growing = acceleration up.")
+        f_macd = fig_macd(a)
+        st.pyplot(f_macd, use_container_width=True)
+        plt.close(f_macd)
+
     st.divider()
 
-    # ── Bollinger Bands + Stochastic side by side ──────────
-    col_bb, col_stoch = st.columns(2)
+    # ════════════════════════════════════════════════════════════
+    # ⚡ MOMENTUM INDICATORS (LEADING-ISH)
+    # ════════════════════════════════════════════════════════════
+    st.subheader("⚡ Momentum Indicators (Leading-ish)")
+    st.caption("Measure the rate of change. Useful for spotting exhaustion and early reversals before price confirms.")
+
+    # ── RSI + Stochastic side by side ──────────────────────
+    col_rsi, col_stoch = st.columns(2)
+    with col_rsi:
+        st.markdown("##### RSI (14)")
+        st.caption("Relative Strength Index. >70 = overbought, <30 = oversold. Centerline (50) separates bull/bear momentum regime.")
+        f_rsi = fig_rsi(a)
+        st.pyplot(f_rsi, use_container_width=True)
+        plt.close(f_rsi)
+    with col_stoch:
+        st.markdown("##### Stochastic Oscillator (14, 3)")
+        st.caption("**%K** vs **%D** crossovers in the overbought (>80) or oversold (<20) zones are the primary signals.")
+        f_st = fig_stoch_expanded(a)
+        st.pyplot(f_st, use_container_width=True)
+        plt.close(f_st)
+
+    # ── Accelerator Oscillator (full width) ────────────────
+    st.markdown("##### Accelerator Oscillator (AC / AO)")
+    st.caption("**AC** = AO − SMA5(AO). Catches momentum **acceleration** before price moves. Histogram colour flips before AO crosses zero.")
+    f_ac = fig_ac_expanded(a)
+    st.pyplot(f_ac, use_container_width=True)
+    plt.close(f_ac)
+
+    st.divider()
+
+    # ════════════════════════════════════════════════════════════
+    # 🌊 VOLATILITY INDICATORS
+    # ════════════════════════════════════════════════════════════
+    st.subheader("🌊 Volatility Indicators")
+    st.caption("Quantify how much price is moving. Squeeze conditions often precede breakouts; expansion confirms ongoing trends.")
+
+    col_bb, col_atr = st.columns(2)
     with col_bb:
         st.markdown("##### Bollinger Bands — %B & Bandwidth")
         st.caption("**%B** shows where price sits within the band. **Bandwidth** detects squeezes — low bandwidth often precedes a sharp breakout.")
@@ -9270,27 +10508,70 @@ with tab5:
                 _bw_msg = f"➡️ **Bandwidth normal** ({bw_v:.1f}%) — no squeeze or expansion signal."
             st.markdown(_pos_msg)
             st.markdown(_bw_msg)
-    with col_stoch:
-        st.markdown("##### Stochastic Oscillator (14, 3)")
-        st.caption("**%K** vs **%D** crossovers in the overbought (>80) or oversold (<20) zones are the primary signals.")
-        f_st = fig_stoch_expanded(a)
-        st.pyplot(f_st, use_container_width=True)
-        plt.close(f_st)
+    with col_atr:
+        st.markdown("##### Average True Range (ATR)")
+        st.caption("Quantifies daily volatility in dollar terms. Rising ATR = expanding moves; shaded zones mark periods >1.3× the long-run mean.")
+        f_atr = fig_atr_expanded(a)
+        st.pyplot(f_atr, use_container_width=True)
+        plt.close(f_atr)
 
     st.divider()
 
-    # ── Fibonacci + AC/ATR side by side ───────────────────
-    col_fib, col_ac = st.columns([3, 2])
-    with col_fib:
-        st.markdown("##### Fibonacci Retracement")
-        st.caption("Auto-detected swing high/low over the last 6 months. Key levels: **38.2%**, **50%**, **61.8%** act as strongest S/R zones.")
-        f_fib = fig_fib_expanded(a)
-        st.pyplot(f_fib, use_container_width=True)
-        plt.close(f_fib)
-    with col_ac:
-        st.markdown("##### Accelerator Osc. + ATR")
-        st.caption("**AC** catches momentum shifts before price moves. **ATR** quantifies daily volatility — rising ATR = expanding moves.")
-        f_ac = fig_ac_atr_expanded(a)
-        st.pyplot(f_ac, use_container_width=True)
-        plt.close(f_ac)
+    # ════════════════════════════════════════════════════════════
+    # 📐 PRICE STRUCTURE & LEVELS
+    # ════════════════════════════════════════════════════════════
+    st.subheader("📐 Price Structure & Levels")
+    st.caption("Where statistical support and resistance sit — useful for sizing entries, stops, and profit targets.")
+
+    st.markdown("##### Fibonacci Retracement")
+    st.caption("Auto-detected swing high/low over the last 6 months. Key levels: **38.2%**, **50%**, **61.8%** act as strongest S/R zones.")
+    f_fib = fig_fib_expanded(a)
+    st.pyplot(f_fib, use_container_width=True)
+    plt.close(f_fib)
+
+    st.divider()
+
+    # ════════════════════════════════════════════════════════════
+    # 📦 VOLUME INDICATORS
+    # ════════════════════════════════════════════════════════════
+    st.subheader("📦 Volume Indicators")
+    st.caption("Track conviction behind price moves. Volume confirming a trend = strong signal; volume diverging = warning.")
+
+    col_obv, col_vol = st.columns(2)
+    with col_obv:
+        st.markdown("##### On-Balance Volume (OBV)")
+        st.caption("Cumulative volume signed by close direction. **OBV rising while price flat** = accumulation; **OBV falling while price rising** = bearish divergence.")
+        f_obv = fig_obv_expanded(a)
+        st.pyplot(f_obv, use_container_width=True)
+        plt.close(f_obv)
+    with col_vol:
+        st.markdown("##### Volume + 20-day Mean")
+        st.caption("Daily volume coloured by candle direction. Bars >1.5× the 20-day mean signal strong conviction; bars <0.6× signal weak participation.")
+        f_vol = fig_volume_expanded(a)
+        st.pyplot(f_vol, use_container_width=True)
+        plt.close(f_vol)
+
+    st.caption("ℹ️ For institutional money flow (BTC spot ETF composite), see the **Macro & Sentiment** tab.")
+
+    st.divider()
+
+    # ════════════════════════════════════════════════════════════
+    # 🎭 SENTIMENT INDICATORS
+    # ════════════════════════════════════════════════════════════
+    st.subheader("🎭 Sentiment Indicators")
+    st.caption("Crowd positioning and emotional state — contrarian signals when crowds are at extremes.")
+
+    col_fg, col_fr = st.columns(2)
+    with col_fg:
+        st.markdown("##### Fear & Greed Index")
+        st.caption("Alternative.me composite (volatility, momentum, social, dominance). **<25 Extreme Fear** = contrarian BUY; **>75 Extreme Greed** = contrarian SELL.")
+        f_fg = fig_fg_expanded(a)
+        st.pyplot(f_fg, use_container_width=True)
+        plt.close(f_fg)
+    with col_fr:
+        st.markdown("##### Funding Rate (BTC Perp)")
+        st.caption("Binance perpetual funding paid every 8h. **Positive sustained** = longs overpaying (overcrowded); **negative sustained** = shorts overpaying.")
+        f_fr = fig_funding_expanded(a)
+        st.pyplot(f_fr, use_container_width=True)
+        plt.close(f_fr)
 
