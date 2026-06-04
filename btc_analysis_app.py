@@ -8202,7 +8202,10 @@ def fig_stoch_expanded(a: dict) -> plt.Figure:
              color=_st_col, bbox=dict(boxstyle="round,pad=0.3", fc="#0d1117", ec=_st_col, alpha=0.9, lw=0.7))
     ax1.set_ylim(-5, 105)
     ax1.set_ylabel("Stochastic", color="#8b949e", fontsize=8)
-    ax1.legend(fontsize=7, facecolor="#161b22", labelcolor="#c9d1d9", loc="lower right", ncol=2, framealpha=0.85)
+    # Legend above the axes (right side) so it doesn't sit on top of crosses at extremes.
+    ax1.legend(fontsize=7, facecolor="#161b22", labelcolor="#c9d1d9",
+               loc="lower right", bbox_to_anchor=(1.0, 1.01), ncol=4, framealpha=0.85,
+               borderpad=0.3, columnspacing=1.0, handletextpad=0.4)
     ax1.set_title("Stochastic Oscillator (14,3)  ·  %K/%D crossovers", color="#8b949e", fontsize=9, loc="left", pad=5)
     # Price
     _add_price_panel(axp, plot_df, price)
@@ -8954,32 +8957,21 @@ _4h_stale_note = (f" · ⚠ 4h data {_4h_age_min}min old — EMA Structure may l
 # Signal breakdown inside expander — 2 rows of 6 (dynamic)
 with st.expander(f"📊 72h Bias — Signal Breakdown ({len(_b12_sigs)} signals){_4h_stale_note}", expanded=False):
     _sig_items = list(_b12_sigs.items())
-    # Row 1: first 6 signals
-    _row1_cols = st.columns(6)
-    for _ci, (_sn, (_sv, _se)) in enumerate(_sig_items[:6]):
-        _wt      = _b12_wts[_sn]
-        _contrib = _sv * _wt * 100
-        _pcol    = "#3fb950" if _sv > 0.05 else ("#f85149" if _sv < -0.05 else "#8b949e")
-        _sign    = "+" if _contrib >= 0 else ""
-        with _row1_cols[_ci]:
-            st.markdown(f"""
-<div class="info-box" style="text-align:center;">
-  <div style="font-size:10px; color:#8b949e; margin-bottom:4px;">{_sn}</div>
-  <div style="font-size:16px; font-weight:700; color:{_pcol};">{_sign}{_contrib:.1f}%</div>
-  <div style="font-size:9px; color:#484f58; margin-top:2px;">wt {int(_wt*100)}%</div>
-  <div style="font-size:9px; color:#8b949e; margin-top:5px; line-height:1.3;">{_se}</div>
-</div>
-""", unsafe_allow_html=True)
-    # Row 2: remaining signals (up to 6)
-    _row2_items = _sig_items[6:]
-    _row2_cols = st.columns(len(_row2_items))
-    for _ci, (_sn, (_sv, _se)) in enumerate(_row2_items):
-        _wt      = _b12_wts[_sn]
-        _contrib = _sv * _wt * 100
-        _pcol    = "#3fb950" if _sv > 0.05 else ("#f85149" if _sv < -0.05 else "#8b949e")
-        _sign    = "+" if _contrib >= 0 else ""
-        with _row2_cols[_ci]:
-            st.markdown(f"""
+    # Chunk all signals into rows of 6 — past ~7 per row the cards squash and
+    # text wraps character-by-character, which is what made the earlier UI unreadable.
+    _PER_ROW = 6
+    for _r0 in range(0, len(_sig_items), _PER_ROW):
+        _chunk = _sig_items[_r0:_r0 + _PER_ROW]
+        # Always allocate 6 slots so partial rows keep card width consistent
+        # (the trailing slots are left empty rather than stretched).
+        _cols = st.columns(_PER_ROW)
+        for _ci, (_sn, (_sv, _se)) in enumerate(_chunk):
+            _wt      = _b12_wts[_sn]
+            _contrib = _sv * _wt * 100
+            _pcol    = "#3fb950" if _sv > 0.05 else ("#f85149" if _sv < -0.05 else "#8b949e")
+            _sign    = "+" if _contrib >= 0 else ""
+            with _cols[_ci]:
+                st.markdown(f"""
 <div class="info-box" style="text-align:center;">
   <div style="font-size:10px; color:#8b949e; margin-bottom:4px;">{_sn}</div>
   <div style="font-size:16px; font-weight:700; color:{_pcol};">{_sign}{_contrib:.1f}%</div>
