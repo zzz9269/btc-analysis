@@ -9614,11 +9614,42 @@ with st.expander(_opt_title, expanded=False):
 
         # Plain-English guide for readers new to options. Nested st.expander is
         # not allowed by Streamlit, so use a native HTML <details> block.
-        st.markdown("""
+        # The guide is live-aware: bullets whose state matches the current
+        # readings get a blue border + "← matches current reading" tag so a
+        # newbie can see at a glance which interpretation is firing now.
+        # Thresholds mirror the card-color thresholds above so the guide
+        # highlight and the card border agree.
+        _sk_pos = ((_sk30 is not None and _sk30 >  1.5) or
+                   (_sk7  is not None and _sk7  >  1.5))
+        _sk_neg = ((_sk30 is not None and _sk30 < -1.5) or
+                   (_sk7  is not None and _sk7  < -1.5))
+        _dv_hi  = _dvz is not None and _dvz >  1.0
+        _dv_lo  = _dvz is not None and _dvz < -1.0
+        _pc_hi  = _pc  is not None and _pc  >  1.10
+        _pc_lo  = _pc  is not None and _pc  <  0.85
+        _ts_pos = _ts  is not None and _ts  >  0.0
+        _ts_neg = _ts  is not None and _ts  <  0.0
+        _combo_fear   = _sk_pos and _dv_hi and _ts_neg
+        _combo_greed  = _sk_neg and _dv_lo and _pc_lo
+        _combo_jitter = _sk_pos and (_pc is not None and _pc < 1.0)
+
+        def _li(body_html: str, active: bool) -> str:
+            if active:
+                return (
+                    '<div style="background:#1f6feb1a; border-left:3px solid #58a6ff;'
+                    ' padding:5px 10px; margin:4px 0; border-radius:4px;">'
+                    f'&bull; {body_html} '
+                    '<span style="color:#58a6ff; font-weight:700; font-size:10.5px;'
+                    ' margin-left:6px; white-space:nowrap;">← matches current reading</span>'
+                    '</div>'
+                )
+            return f'<div style="padding:5px 10px; margin:4px 0;">&bull; {body_html}</div>'
+
+        _guide_html = f"""
 <details style="margin-top:14px; background:#0d1117; border:1px solid #30363d;
                 border-radius:8px; padding:8px 14px;">
   <summary style="cursor:pointer; color:#58a6ff; font-size:13px; font-weight:600; padding:4px 0;">
-    📖 New to options? Click here for a plain-English guide
+    📖 New to options? Click here for a plain-English guide — bullets matching your live data are highlighted
   </summary>
   <div style="font-size:12px; color:#c9d1d9; line-height:1.7; padding-top:10px;">
 
@@ -9628,47 +9659,30 @@ with st.expander(_opt_title, expanded=False):
   By reading how options are priced and how many contracts are open, we can see what
   the derivatives crowd is positioned for and what they are afraid of.</p>
 
-  <p><strong>Skew (put IV − call IV, in % points)</strong> — How much more expensive
-  are puts than calls?
-  <br>&bull; <span style="color:#f85149">Positive (red)</span>: puts cost more → market is paying up for crash
-  protection → <strong>fear / bearish positioning</strong>.
-  <br>&bull; <span style="color:#3fb950">Negative (green)</span>: calls cost more → market chasing upside →
-  <strong>greed / bullish positioning</strong>.
-  <br>&bull; 7d skew = immediate fear; 30d skew = structural fear. Normal range ±3pp;
-  ±10pp+ is meaningful.</p>
+  <p style="margin-bottom:2px; margin-top:14px;"><strong>Skew (put IV − call IV, in % points)</strong> — How much more expensive are puts than calls?</p>
+  {_li('<span style="color:#f85149">Positive (red)</span>: puts cost more → market is paying up for crash protection → <strong>fear / bearish positioning</strong>.', _sk_pos)}
+  {_li('<span style="color:#3fb950">Negative (green)</span>: calls cost more → market chasing upside → <strong>greed / bullish positioning</strong>.', _sk_neg)}
+  <div style="padding:5px 10px; margin:4px 0; color:#8b949e;">&bull; 7d skew = immediate fear; 30d skew = structural fear. Normal range ±3pp; ±10pp+ is meaningful.</div>
 
-  <p><strong>DVOL</strong> — Deribit's BTC volatility index. Think of it as the "BTC VIX."
-  The number is expected annualized volatility over the next 30 days.
-  <br>&bull; The <em>z-score</em> compares today's DVOL to its last 7 days.
-  <br>&bull; <span style="color:#f85149">High z (red)</span>: vol spiking → traders bracing for a bigger move
-  → <strong>often bearish for BTC</strong> (vol clusters with selloffs).
-  <br>&bull; <span style="color:#3fb950">Low z (green)</span>: complacency → market calm.</p>
+  <p style="margin-bottom:2px; margin-top:14px;"><strong>DVOL</strong> — Deribit's BTC volatility index. Think of it as the "BTC VIX." The number is expected annualized volatility over the next 30 days.</p>
+  <div style="padding:5px 10px; margin:4px 0; color:#8b949e;">&bull; The <em>z-score</em> compares today's DVOL to its last 7 days.</div>
+  {_li('<span style="color:#f85149">High z (red)</span>: vol spiking → traders bracing for a bigger move → <strong>often bearish for BTC</strong> (vol clusters with selloffs).', _dv_hi)}
+  {_li('<span style="color:#3fb950">Low z (green)</span>: complacency → market calm.', _dv_lo)}
 
-  <p><strong>Put/Call OI</strong> — Ratio of open put contracts to call contracts. 1.0 = balanced.
-  <br>&bull; <span style="color:#f85149">Above 1.10 (red)</span>: put-heavy → hedge-heavy positioning, often bearish
-  (or contrarian-bullish at extremes).
-  <br>&bull; <span style="color:#3fb950">Below 0.85 (green)</span>: call-heavy → speculators piling into upside bets.</p>
+  <p style="margin-bottom:2px; margin-top:14px;"><strong>Put/Call OI</strong> — Ratio of open put contracts to call contracts. 1.0 = balanced.</p>
+  {_li('<span style="color:#f85149">Above 1.10 (red)</span>: put-heavy → hedge-heavy positioning, often bearish (or contrarian-bullish at extremes).', _pc_hi)}
+  {_li('<span style="color:#3fb950">Below 0.85 (green)</span>: call-heavy → speculators piling into upside bets.', _pc_lo)}
 
-  <p><strong>Term Slope = (30d IV − 7d IV) / 30d IV</strong> — Are near-dated or
-  far-dated options more expensive in IV terms?
-  <br>&bull; <span style="color:#3fb950">Positive (green)</span>: contango (normal) → longer-dated IV is higher →
-  no near-term panic.
-  <br>&bull; <span style="color:#f85149">Negative (red)</span>: backwardation → front-month IV elevated →
-  <strong>near-term stress</strong>. Traders want protection right now, not 30 days from now.</p>
+  <p style="margin-bottom:2px; margin-top:14px;"><strong>Term Slope = (30d IV − 7d IV) / 30d IV</strong> — Are near-dated or far-dated options more expensive in IV terms?</p>
+  {_li('<span style="color:#3fb950">Positive (green)</span>: contango (normal) → longer-dated IV is higher → no near-term panic.', _ts_pos)}
+  {_li('<span style="color:#f85149">Negative (red)</span>: backwardation → front-month IV elevated → <strong>near-term stress</strong>. Traders want protection right now, not 30 days from now.', _ts_neg)}
 
-  <p><strong>Total OI</strong> — Just the size of the options market in BTC contracts.
-  ~400k BTC means a healthy, mature market. No directional info — pure context.</p>
+  <p style="margin-top:14px;"><strong>Total OI</strong> — Just the size of the options market in BTC contracts. ~400k BTC means a healthy, mature market. No directional info — pure context.</p>
 
-  <p><strong>Combinations to watch</strong> (more than one signal agreeing is stronger
-  than any single one):
-  <br>&bull; <strong>Skew ↑ + DVOL ↑ + backwardation</strong> → coordinated <em>fear</em>.
-  Crash hedges getting bid across the board. Common before / during selloffs, but also
-  at capitulation lows (contrarian).
-  <br>&bull; <strong>Skew ↓ + DVOL low + P/C OI low</strong> → <em>greed / complacency</em>.
-  Often precedes shake-outs.
-  <br>&bull; <strong>Skew ↑ but P/C OI &lt; 1</strong> → "long but jittery." Speculators
-  hold lots of calls but are paying up for puts as insurance. Common at local tops;
-  ambiguous as a directional forecast.</p>
+  <p style="margin-bottom:2px; margin-top:14px;"><strong>Combinations to watch</strong> (more than one signal agreeing is stronger than any single one):</p>
+  {_li('<strong>Skew ↑ + DVOL ↑ + backwardation</strong> → coordinated <em>fear</em>. Crash hedges getting bid across the board. Common before / during selloffs, but also at capitulation lows (contrarian).', _combo_fear)}
+  {_li('<strong>Skew ↓ + DVOL low + P/C OI low</strong> → <em>greed / complacency</em>. Often precedes shake-outs.', _combo_greed)}
+  {_li('<strong>Skew ↑ but P/C OI &lt; 1</strong> → "long but jittery." Speculators hold lots of calls but are paying up for puts as insurance. Common at local tops; ambiguous as a directional forecast.', _combo_jitter)}
 
   <p style="color:#8b949e; font-size:11px; margin-top:14px; border-top:1px solid #30363d; padding-top:10px;">
   <strong>Honest disclaimer.</strong> These are textbook interpretations. We have not
@@ -9680,7 +9694,8 @@ with st.expander(_opt_title, expanded=False):
 
   </div>
 </details>
-""", unsafe_allow_html=True)
+"""
+        st.markdown(_guide_html, unsafe_allow_html=True)
 
 # Polymarket 72h thesis scoring panel
 _pm_mkts      = poly_sentiment.get("markets", [])
