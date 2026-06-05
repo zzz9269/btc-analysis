@@ -3754,7 +3754,8 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
                      poly: "dict | None" = None,
                      oi_data: "dict | None" = None,
                      df_4h: "pd.DataFrame | None" = None,
-                     crypto_sig: "dict | None" = None) -> dict:
+                     crypto_sig: "dict | None" = None,
+                     options_data: "dict | None" = None) -> dict:
     """
     Weighted 72-hour directional bias score from −100 (strong bear) to +100 (strong bull).
 
@@ -4808,6 +4809,68 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
     signals["TF Coherence"] = (raw, note)
     weighted_sum += raw * WEIGHTS.get("TF Coherence", 0.0)
 
+    # ── Options Microstructure (Phase A — observation only, weight = 0) ──────
+    # Signals computed + logged but NOT in WEIGHTS, so they contribute 0 to the
+    # score. Once we have ~30–60 days of logged history we'll measure IC vs
+    # realized 72h returns and assign weight via Bayesian shrinkage.
+    # Sign convention: raw > 0 = bullish.
+    opt = options_data or {}
+
+    # 1. 30d risk-reversal proxy (OTM put IV − OTM call IV, % points).
+    #    Positive = puts more expensive = bearish positioning → invert sign.
+    try:
+        sk = opt.get("skew_30d")
+        if sk is None:
+            raw, note = 0.0, "Options Skew (30d) N/A"
+        else:
+            raw  = float(np.clip(-float(sk) / 5.0, -1.0, 1.0))
+            tag  = "put-skew (bearish)" if sk > 0 else "call-skew (bullish)"
+            note = f"30d skew {sk:+.1f}pp — {tag}"
+    except Exception:
+        raw, note = 0.0, "Options Skew (30d) N/A"
+    signals["Options Skew 30d"] = (raw, note)
+
+    # 2. DVOL 7d z-score. Elevated BTC IV typically coincides with fear/selloff.
+    try:
+        z = opt.get("dvol_z")
+        if z is None:
+            raw, note = 0.0, "DVOL z-score N/A"
+        else:
+            raw  = float(np.clip(-float(z) / 2.0, -1.0, 1.0))
+            dv   = float(opt.get("dvol", 0.0) or 0.0)
+            note = f"DVOL {dv:.1f} (z {float(z):+.2f}σ)"
+    except Exception:
+        raw, note = 0.0, "DVOL z-score N/A"
+    signals["Options DVOL Z"] = (raw, note)
+
+    # 3. Put/call OI ratio. >1 = put-heavy positioning. Mildly bearish in
+    #    trend, contrarian-bullish at extremes — conservative linear mapping
+    #    until Phase B; the regime conditioning happens via IC measurement.
+    try:
+        r = opt.get("pc_oi_ratio")
+        if r is None:
+            raw, note = 0.0, "P/C OI N/A"
+        else:
+            raw  = float(np.clip((1.0 - float(r)) * 0.5, -1.0, 1.0))
+            tag  = "put-heavy" if r > 1.0 else "call-heavy"
+            note = f"P/C OI {float(r):.2f} ({tag})"
+    except Exception:
+        raw, note = 0.0, "P/C OI N/A"
+    signals["Options PC OI"] = (raw, note)
+
+    # 4. Term-structure slope. Negative = front IV > back = backwardation = stress.
+    try:
+        ts = opt.get("term_slope")
+        if ts is None:
+            raw, note = 0.0, "Term slope N/A"
+        else:
+            raw  = float(np.clip(float(ts) * 5.0, -1.0, 1.0))
+            tag  = "contango" if ts > 0 else "backwardation"
+            note = f"Term slope {float(ts):+.3f} ({tag})"
+    except Exception:
+        raw, note = 0.0, "Term slope N/A"
+    signals["Options Term"] = (raw, note)
+
     # ── Signal family normalization — cap each family before summing ──────────
     # Prevents correlated signals from compounding false confidence.
     # Each family is capped at ±1 effective unit; the individual weights still apply.
@@ -4862,7 +4925,9 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
     # ⑫ Signal dispersion — std of raw signal values measures genuine consensus.
     # Low std = all signals agree → real conviction.
     # High std = half at +1, half at -1 → misleading average → flag as weak.
-    _sig_vals   = [v[0] for v in signals.values()]
+    # Restricted to weighted signals — Phase-A observation signals (e.g. Options*)
+    # are logged but mustn't sway the conviction calc until they earn weight.
+    _sig_vals   = [v[0] for k, v in signals.items() if k in WEIGHTS]
     _sig_std    = float(np.std(_sig_vals)) if _sig_vals else 0.5
     # Normalize: std=0 → conviction=1.0, std=0.7 (max for ±1 distribution) → conviction≈0
     _conviction = round(max(0.0, 1.0 - _sig_std / 0.70), 2)
@@ -5614,6 +5679,160 @@ def fetch_oi_funding() -> dict:
                 result["funding_rate_avg8h"] = float(np.mean(rates))
     except Exception:
         pass
+    return result
+
+
+def fetch_deribit_options() -> dict:
+    """Fetch BTC options market data from Deribit (public API, no auth).
+
+    Phase A: data is computed, logged, and displayed but carries weight=0
+    in compute_72h_bias. Assign weight after IC measured on logged history.
+
+    Returned keys (all best-effort; downstream must use .get() with defaults):
+      spot                  — underlying index price returned by Deribit
+      total_oi_btc          — aggregate open interest across all BTC options
+      pc_oi_ratio           — put OI / call OI; >1.0 = put-heavy positioning
+      atm_iv_7d, atm_iv_30d — ATM implied vol (%) at the chosen tenors
+      skew_7d, skew_30d     — OTM put IV minus OTM call IV (% points).
+                              Positive = put-skew = bearish positioning.
+                              Proxy uses strikes ~±10% from spot since the
+                              book_summary endpoint doesn't return per-strike
+                              delta. Captures the same signal as true 25Δ RR.
+      term_slope            — (atm_iv_30d - atm_iv_7d) / atm_iv_30d.
+                              Negative = front IV higher = backwardation = stress.
+      dvol                  — Deribit BTC implied-vol index (latest close)
+      dvol_z                — 7d hourly z-score of DVOL (needs >=24 hist pts)
+    """
+    result: dict = {}
+
+    try:
+        raw = _get_raw(
+            "https://www.deribit.com/api/v2/public/get_book_summary_by_currency"
+            "?currency=BTC&kind=option"
+        )
+        contracts = (raw or {}).get("result") or []
+    except Exception:
+        contracts = []
+
+    if not contracts:
+        return result
+
+    _now = _dt.now(_tz.utc)
+    parsed = []   # (days_to_exp, strike, is_call, mark_iv, open_interest)
+    spot = None
+    oi_call = 0.0
+    oi_put  = 0.0
+    total_oi = 0.0
+
+    for c in contracts:
+        try:
+            name = c.get("instrument_name", "")
+            parts = name.split("-")
+            if len(parts) != 4 or parts[0] != "BTC":
+                continue
+            date_str, strike_str, cp = parts[1], parts[2], parts[3]
+            try:
+                # Deribit options expire at 08:00 UTC
+                exp_dt = _dt.strptime(date_str, "%d%b%y").replace(
+                    tzinfo=_tz.utc, hour=8
+                )
+            except Exception:
+                continue
+            dte = (exp_dt - _now).total_seconds() / 86400.0
+            if dte <= 0:
+                continue
+            strike = float(strike_str)
+            is_call = (cp == "C")
+            iv_val = c.get("mark_iv")
+            iv = float(iv_val) if iv_val is not None else None
+            oi = float(c.get("open_interest") or 0.0)
+            und = c.get("underlying_price")
+            if und is not None and spot is None:
+                spot = float(und)
+            parsed.append((dte, strike, is_call, iv, oi))
+            total_oi += oi
+            if is_call:
+                oi_call += oi
+            else:
+                oi_put += oi
+        except Exception:
+            continue
+
+    if spot is not None:
+        result["spot"] = spot
+    result["total_oi_btc"] = total_oi
+    if oi_call > 0:
+        result["pc_oi_ratio"] = oi_put / oi_call
+
+    if not parsed or spot is None:
+        return result
+
+    unique_dtes = sorted(set(p[0] for p in parsed))
+
+    def _pick(target_days: float, max_off: float):
+        if not unique_dtes:
+            return None
+        best = min(unique_dtes, key=lambda d: abs(d - target_days))
+        return best if abs(best - target_days) <= max_off else None
+
+    dte_7  = _pick(7.0,  6.0)    # accept 1-13d
+    dte_30 = _pick(30.0, 15.0)   # accept 15-45d
+
+    def _tenor_metrics(dte):
+        if dte is None:
+            return None
+        rows = [p for p in parsed if abs(p[0] - dte) < 1e-6 and p[3] is not None]
+        calls = [p for p in rows if p[2]]
+        puts  = [p for p in rows if not p[2]]
+        if not calls or not puts:
+            return None
+        atm_call = min(calls, key=lambda p: abs(p[1] - spot))
+        atm_put  = min(puts,  key=lambda p: abs(p[1] - spot))
+        atm_iv   = (atm_call[3] + atm_put[3]) / 2.0
+        out = {"atm_iv": atm_iv}
+        otm_calls = [p for p in calls if p[1] > spot]
+        otm_puts  = [p for p in puts  if p[1] < spot]
+        if otm_calls and otm_puts:
+            tgt_c = spot * 1.10
+            tgt_p = spot * 0.90
+            sk_c = min(otm_calls, key=lambda p: abs(p[1] - tgt_c))
+            sk_p = min(otm_puts,  key=lambda p: abs(p[1] - tgt_p))
+            out["skew"] = sk_p[3] - sk_c[3]   # +ve = put-skew = bearish
+        return out
+
+    m7  = _tenor_metrics(dte_7)
+    m30 = _tenor_metrics(dte_30)
+    if m7:
+        result["atm_iv_7d"] = m7["atm_iv"]
+        if "skew" in m7:
+            result["skew_7d"] = m7["skew"]
+    if m30:
+        result["atm_iv_30d"] = m30["atm_iv"]
+        if "skew" in m30:
+            result["skew_30d"] = m30["skew"]
+    if m7 and m30 and m30["atm_iv"] > 0:
+        result["term_slope"] = (m30["atm_iv"] - m7["atm_iv"]) / m30["atm_iv"]
+
+    try:
+        end_ms   = int(_now.timestamp() * 1000)
+        start_ms = end_ms - 7 * 86400 * 1000
+        dv = _get_raw(
+            "https://www.deribit.com/api/v2/public/get_volatility_index_data"
+            f"?currency=BTC&start_timestamp={start_ms}&end_timestamp={end_ms}"
+            "&resolution=3600"
+        )
+        rows = ((dv or {}).get("result") or {}).get("data") or []
+        closes = [float(r[4]) for r in rows if len(r) >= 5]
+        if closes:
+            result["dvol"] = closes[-1]
+            if len(closes) >= 24:
+                mean_ = float(np.mean(closes))
+                std_  = float(np.std(closes))
+                if std_ > 1e-6:
+                    result["dvol_z"] = (closes[-1] - mean_) / std_
+    except Exception:
+        pass
+
     return result
 
 
@@ -7036,6 +7255,8 @@ def run_analysis(ticker: str = "BTC-USD") -> dict:
     has_liq    = bool(btc_liq and btc_liq.get("liq_bid_clusters"))
     # Fetched here (instead of after) so cycle detector can use funding rate.
     oi_funding = fetch_oi_funding()
+    # Phase-A options-market data — observation-only signals fed to compute_72h_bias.
+    options_data = fetch_deribit_options()
     # Polymarket fetched here too so cycle detector can use long-horizon thesis.
     poly_sentiment = fetch_polymarket_btc_sentiment(price)
     cycle      = detect_btc_cycle_phase(
@@ -7055,7 +7276,8 @@ def run_analysis(ticker: str = "BTC-USD") -> dict:
         st.session_state["_4h_cached_len"] = _4h_cur_len
     prediction    = predict_direction(df, btc_liq)
     bias_72h      = compute_72h_bias(df, btc_liq, short_df=short_df, poly=poly_sentiment,
-                                     oi_data=oi_funding, df_4h=df_4h, crypto_sig=crypto_sig)
+                                     oi_data=oi_funding, df_4h=df_4h, crypto_sig=crypto_sig,
+                                     options_data=options_data)
     bias_24h      = compute_24h_bias(df, btc_liq, short_df=short_df,
                                      oi_data=oi_funding, crypto_sig=crypto_sig,
                                      poly=poly_sentiment, cycle=cycle)
@@ -7095,6 +7317,7 @@ def run_analysis(ticker: str = "BTC-USD") -> dict:
         chg_24h=chg_24h, ticker=ticker,
         fg_history=fg_history, funding_history=funding_history,
         oi_funding=oi_funding,
+        options_data=options_data,
     )
 
 
@@ -9292,6 +9515,102 @@ with st.expander(f"📊 72h Bias — Signal Breakdown ({len(_b12_sigs)} signals)
   <div style="font-size:9px; color:#8b949e; margin-top:5px; line-height:1.3;">{_se}</div>
 </div>
 """, unsafe_allow_html=True)
+
+# ── Options Microstructure (Phase A — observation only) ──────────────────
+_opt = a.get("options_data") or {}
+_opt_have = any(k in _opt for k in
+                ("skew_30d", "skew_7d", "dvol", "pc_oi_ratio", "term_slope"))
+_opt_title = "🎲 Options Microstructure (Deribit) — Phase A: observation only"
+with st.expander(_opt_title, expanded=False):
+    if not _opt_have:
+        st.caption("Deribit options data unavailable (API failure or no qualifying contracts).")
+    else:
+        def _opt_card(label: str, value_str: str, color: str, sub: str) -> str:
+            return (
+                f'<div class="info-box" style="text-align:center;">'
+                f'  <div style="font-size:10px; color:#8b949e; margin-bottom:4px;">{label}</div>'
+                f'  <div style="font-size:16px; font-weight:700; color:{color};">{value_str}</div>'
+                f'  <div style="font-size:9px; color:#8b949e; margin-top:5px; line-height:1.3;">{sub}</div>'
+                f'</div>'
+            )
+
+        _cards = []
+
+        _sk30 = _opt.get("skew_30d")
+        if _sk30 is not None:
+            _c = "#f85149" if _sk30 > 1.5 else ("#3fb950" if _sk30 < -1.5 else "#8b949e")
+            _cards.append(_opt_card(
+                "30d Skew (put−call IV)",
+                f"{_sk30:+.1f}pp",
+                _c,
+                "+ve = put-skew (bearish) · −ve = call-skew (bullish)",
+            ))
+
+        _sk7 = _opt.get("skew_7d")
+        if _sk7 is not None:
+            _c = "#f85149" if _sk7 > 1.5 else ("#3fb950" if _sk7 < -1.5 else "#8b949e")
+            _cards.append(_opt_card(
+                "7d Skew",
+                f"{_sk7:+.1f}pp",
+                _c,
+                "near-term put/call IV asymmetry",
+            ))
+
+        _dv  = _opt.get("dvol")
+        _dvz = _opt.get("dvol_z")
+        if _dv is not None:
+            _c = "#f85149" if (_dvz or 0) > 1.0 else ("#3fb950" if (_dvz or 0) < -1.0 else "#8b949e")
+            _zs  = f"z {_dvz:+.2f}σ" if _dvz is not None else "z N/A"
+            _cards.append(_opt_card(
+                "DVOL (BTC IV index)",
+                f"{_dv:.1f}",
+                _c,
+                f"7d {_zs} · elevated = fear",
+            ))
+
+        _pc = _opt.get("pc_oi_ratio")
+        if _pc is not None:
+            _c = "#f85149" if _pc > 1.10 else ("#3fb950" if _pc < 0.85 else "#8b949e")
+            _cards.append(_opt_card(
+                "Put/Call OI",
+                f"{_pc:.2f}",
+                _c,
+                ">1 = put-heavy positioning",
+            ))
+
+        _ts = _opt.get("term_slope")
+        if _ts is not None:
+            _c = "#f85149" if _ts < -0.02 else ("#3fb950" if _ts > 0.05 else "#8b949e")
+            _label = "contango" if _ts > 0 else "backwardation"
+            _cards.append(_opt_card(
+                "Term Slope (30d−7d)/30d",
+                f"{_ts:+.3f}",
+                _c,
+                f"{_label} · backwardation = stress",
+            ))
+
+        _oi_btc = _opt.get("total_oi_btc")
+        if _oi_btc:
+            _cards.append(_opt_card(
+                "Total Options OI",
+                f"{_oi_btc:,.0f} BTC",
+                "#8b949e",
+                "aggregate open interest across all expiries",
+            ))
+
+        _PER_ROW = min(6, max(1, len(_cards)))
+        for _r0 in range(0, len(_cards), _PER_ROW):
+            _chunk = _cards[_r0:_r0 + _PER_ROW]
+            _cols  = st.columns(_PER_ROW)
+            for _ci, _html in enumerate(_chunk):
+                with _cols[_ci]:
+                    st.markdown(_html, unsafe_allow_html=True)
+
+        st.caption(
+            "Phase A: these signals are logged for IC measurement but carry "
+            "**weight = 0** in the 72h score until ~30–60 days of history accumulates. "
+            "They appear above with wt 0% in the bias breakdown."
+        )
 
 # Polymarket 72h thesis scoring panel
 _pm_mkts      = poly_sentiment.get("markets", [])
