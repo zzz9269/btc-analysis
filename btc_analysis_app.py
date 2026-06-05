@@ -3853,6 +3853,12 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
         "ADX Roll":             0.04,  # ADX peaked & declining = trend exhausting
         "BB Compression":       0.03,  # post-expansion vol crush = blowoff complete
         "TF Coherence":         0.04,  # 1h+4h+daily EMA alignment = real conviction (or disagreement = no)
+        # OPTIONS (Phase A small prior — theory-based, ~2.7% effective combined).
+        # IC audit due 2026-08-05; reweight then via measured predictive power.
+        "Options Skew 30d":     0.015, # 30d put-call IV skew; most studied options signal
+        "Options DVOL Z":       0.010, # BTC VIX z-score (overlaps Realized Vol)
+        "Options PC OI":        0.005, # noisiest — OI ratios drift with hedging flow
+        "Options Term":         0.010, # backwardation = stress (well-documented)
     }
     # TREND: EMA dominant; mean-reversion signals suppressed; volume/momentum confirm
     _W_TREND = {
@@ -3888,6 +3894,11 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
         "ADX Roll":             0.03,
         "BB Compression":       0.02,
         "TF Coherence":         0.05,
+        # OPTIONS Phase A — same priors across regimes (no regime-specific evidence yet).
+        "Options Skew 30d":     0.015,
+        "Options DVOL Z":       0.010,
+        "Options PC OI":        0.005,
+        "Options Term":         0.010,
     }
     # RANGE: 4h RSI + RSI Div lead; EMA suppressed; CVD and traps confirm reversal zones
     _W_RANGE = {
@@ -3924,6 +3935,11 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
         "ADX Roll":             0.04,
         "BB Compression":       0.05,
         "TF Coherence":         0.03,
+        # OPTIONS Phase A — same priors across regimes (no regime-specific evidence yet).
+        "Options Skew 30d":     0.015,
+        "Options DVOL Z":       0.010,
+        "Options PC OI":        0.005,
+        "Options Term":         0.010,
     }
     WEIGHTS = {"trend": _W_TREND, "range": _W_RANGE, "transition": _W_BASE}[regime]
 
@@ -4809,11 +4825,12 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
     signals["TF Coherence"] = (raw, note)
     weighted_sum += raw * WEIGHTS.get("TF Coherence", 0.0)
 
-    # ── Options Microstructure (Phase A — observation only, weight = 0) ──────
-    # Signals computed + logged but NOT in WEIGHTS, so they contribute 0 to the
-    # score. Once we have ~30–60 days of logged history we'll measure IC vs
-    # realized 72h returns and assign weight via Bayesian shrinkage.
-    # Sign convention: raw > 0 = bullish.
+    # ── Options Microstructure (Phase A — small theory-based prior) ──────────
+    # Signals computed + logged, with SMALL non-zero weights in WEIGHTS so they
+    # nudge the score at extremes without being able to dominate. Effective
+    # combined share ≈ 2.7% after the engine's normalization. IC audit due
+    # 2026-08-05 — at that point we measure realized predictive power on the
+    # logged history and reweight (Phase B). Sign convention: raw > 0 = bullish.
     opt = options_data or {}
 
     # 1. 30d risk-reversal proxy (OTM put IV − OTM call IV, % points).
@@ -5685,8 +5702,10 @@ def fetch_oi_funding() -> dict:
 def fetch_deribit_options() -> dict:
     """Fetch BTC options market data from Deribit (public API, no auth).
 
-    Phase A: data is computed, logged, and displayed but carries weight=0
-    in compute_72h_bias. Assign weight after IC measured on logged history.
+    Phase A: data is computed, logged, displayed, and carries a small
+    theory-based prior weight in compute_72h_bias (~2.7% combined effective
+    share). IC audit due 2026-08-05 — reweight then via measured predictive
+    power against realized 72h returns.
 
     Returned keys (all best-effort; downstream must use .get() with defaults):
       spot                  — underlying index price returned by Deribit
@@ -9516,11 +9535,11 @@ with st.expander(f"📊 72h Bias — Signal Breakdown ({len(_b12_sigs)} signals)
 </div>
 """, unsafe_allow_html=True)
 
-# ── Options Microstructure (Phase A — observation only) ──────────────────
+# ── Options Microstructure (Phase A — small prior, IC audit pending) ──────
 _opt = a.get("options_data") or {}
 _opt_have = any(k in _opt for k in
                 ("skew_30d", "skew_7d", "dvol", "pc_oi_ratio", "term_slope"))
-_opt_title = "🎲 Options Microstructure (Deribit) — Phase A: observation only"
+_opt_title = "🎲 Options Microstructure (Deribit) — Phase A: small prior · IC audit due 2026-08-05"
 with st.expander(_opt_title, expanded=False):
     if not _opt_have:
         st.caption("Deribit options data unavailable (API failure or no qualifying contracts).")
@@ -9606,10 +9625,17 @@ with st.expander(_opt_title, expanded=False):
                 with _cols[_ci]:
                     st.markdown(_html, unsafe_allow_html=True)
 
-        st.caption(
-            "Phase A: these signals are logged for IC measurement but carry "
-            "**weight = 0** in the 72h score until ~30–60 days of history accumulates. "
-            "They appear above with wt 0% in the bias breakdown."
+        st.markdown(
+            '<div style="background:#1f6feb1a; border-left:3px solid #58a6ff;'
+            ' padding:8px 12px; margin-top:8px; border-radius:4px; font-size:12px;">'
+            '<strong style="color:#58a6ff;">Phase A — small prior in effect.</strong> '
+            'These signals now carry a small theory-based weight in the 72h score '
+            '(~2.7% combined effective share). They can nudge the gauge at extremes '
+            'but cannot dominate. <strong>IC audit due 2026-08-05</strong> — at that '
+            'point we measure realized predictive power on logged history and '
+            'reweight via Bayesian shrinkage (Phase B).'
+            '</div>',
+            unsafe_allow_html=True,
         )
 
         # Plain-English guide for readers new to options. Nested st.expander is
@@ -9686,10 +9712,11 @@ with st.expander(_opt_title, expanded=False):
 
   <p style="color:#8b949e; font-size:11px; margin-top:14px; border-top:1px solid #30363d; padding-top:10px;">
   <strong>Honest disclaimer.</strong> These are textbook interpretations. We have not
-  verified that they actually predict <em>this engine's</em> 72h moves. That is why
-  weight = 0 in the score during Phase A. After ~30–60 days of logged history we will
-  measure the Information Coefficient against realized returns and assign honest weights
-  in Phase B. Do not trade off these signals alone today.
+  yet verified that they predict <em>this engine's</em> 72h moves. Phase A carries
+  a <strong>small theory-based prior</strong> (~2.7% combined effective weight) so the
+  signals can nudge the gauge at extremes without dominating. After ~30–60 days of
+  logged history (IC audit due 2026-08-05) we will measure the Information Coefficient
+  against realized returns and reweight in Phase B. Do not trade off these signals alone.
   </p>
 
   </div>
