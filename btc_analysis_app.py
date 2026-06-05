@@ -9612,6 +9612,76 @@ with st.expander(_opt_title, expanded=False):
             "They appear above with wt 0% in the bias breakdown."
         )
 
+        # Plain-English guide for readers new to options. Nested st.expander is
+        # not allowed by Streamlit, so use a native HTML <details> block.
+        st.markdown("""
+<details style="margin-top:14px; background:#0d1117; border:1px solid #30363d;
+                border-radius:8px; padding:8px 14px;">
+  <summary style="cursor:pointer; color:#58a6ff; font-size:13px; font-weight:600; padding:4px 0;">
+    📖 New to options? Click here for a plain-English guide
+  </summary>
+  <div style="font-size:12px; color:#c9d1d9; line-height:1.7; padding-top:10px;">
+
+  <p><strong>Options basics in 30 seconds.</strong> A <em>call</em> pays out if BTC goes
+  up; a <em>put</em> pays out if BTC goes down. Each option has a price, and that price
+  implies how much volatility traders expect — called <em>implied volatility</em> or IV.
+  By reading how options are priced and how many contracts are open, we can see what
+  the derivatives crowd is positioned for and what they are afraid of.</p>
+
+  <p><strong>Skew (put IV − call IV, in % points)</strong> — How much more expensive
+  are puts than calls?
+  <br>&bull; <span style="color:#f85149">Positive (red)</span>: puts cost more → market is paying up for crash
+  protection → <strong>fear / bearish positioning</strong>.
+  <br>&bull; <span style="color:#3fb950">Negative (green)</span>: calls cost more → market chasing upside →
+  <strong>greed / bullish positioning</strong>.
+  <br>&bull; 7d skew = immediate fear; 30d skew = structural fear. Normal range ±3pp;
+  ±10pp+ is meaningful.</p>
+
+  <p><strong>DVOL</strong> — Deribit's BTC volatility index. Think of it as the "BTC VIX."
+  The number is expected annualized volatility over the next 30 days.
+  <br>&bull; The <em>z-score</em> compares today's DVOL to its last 7 days.
+  <br>&bull; <span style="color:#f85149">High z (red)</span>: vol spiking → traders bracing for a bigger move
+  → <strong>often bearish for BTC</strong> (vol clusters with selloffs).
+  <br>&bull; <span style="color:#3fb950">Low z (green)</span>: complacency → market calm.</p>
+
+  <p><strong>Put/Call OI</strong> — Ratio of open put contracts to call contracts. 1.0 = balanced.
+  <br>&bull; <span style="color:#f85149">Above 1.10 (red)</span>: put-heavy → hedge-heavy positioning, often bearish
+  (or contrarian-bullish at extremes).
+  <br>&bull; <span style="color:#3fb950">Below 0.85 (green)</span>: call-heavy → speculators piling into upside bets.</p>
+
+  <p><strong>Term Slope = (30d IV − 7d IV) / 30d IV</strong> — Are near-dated or
+  far-dated options more expensive in IV terms?
+  <br>&bull; <span style="color:#3fb950">Positive (green)</span>: contango (normal) → longer-dated IV is higher →
+  no near-term panic.
+  <br>&bull; <span style="color:#f85149">Negative (red)</span>: backwardation → front-month IV elevated →
+  <strong>near-term stress</strong>. Traders want protection right now, not 30 days from now.</p>
+
+  <p><strong>Total OI</strong> — Just the size of the options market in BTC contracts.
+  ~400k BTC means a healthy, mature market. No directional info — pure context.</p>
+
+  <p><strong>Combinations to watch</strong> (more than one signal agreeing is stronger
+  than any single one):
+  <br>&bull; <strong>Skew ↑ + DVOL ↑ + backwardation</strong> → coordinated <em>fear</em>.
+  Crash hedges getting bid across the board. Common before / during selloffs, but also
+  at capitulation lows (contrarian).
+  <br>&bull; <strong>Skew ↓ + DVOL low + P/C OI low</strong> → <em>greed / complacency</em>.
+  Often precedes shake-outs.
+  <br>&bull; <strong>Skew ↑ but P/C OI &lt; 1</strong> → "long but jittery." Speculators
+  hold lots of calls but are paying up for puts as insurance. Common at local tops;
+  ambiguous as a directional forecast.</p>
+
+  <p style="color:#8b949e; font-size:11px; margin-top:14px; border-top:1px solid #30363d; padding-top:10px;">
+  <strong>Honest disclaimer.</strong> These are textbook interpretations. We have not
+  verified that they actually predict <em>this engine's</em> 72h moves. That is why
+  weight = 0 in the score during Phase A. After ~30–60 days of logged history we will
+  measure the Information Coefficient against realized returns and assign honest weights
+  in Phase B. Do not trade off these signals alone today.
+  </p>
+
+  </div>
+</details>
+""", unsafe_allow_html=True)
+
 # Polymarket 72h thesis scoring panel
 _pm_mkts      = poly_sentiment.get("markets", [])
 _pm_n         = poly_sentiment.get("markets_used", 0)
