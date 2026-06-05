@@ -1007,7 +1007,7 @@ If RSI < 32 or Stoch < 22 → SHORT carries reversal risk; name invalidation lev
 ## SCORE THRESHOLDS
 ≥55 STRONG · 30–54 BULL/BEAR · 15–29 MILD · ±14 NEUTRAL. Actionable trade only at |score| ≥ 30.
 
-## POSITION SIZING — CONFIDENCE × VERDICT MATRIX (size MUST follow this; do not freelance)
+## POSITION SIZING — confidence × verdict matrix (UPPER BOUND only; Kelly check below sets the floor)
 - STRONG + HIGH conf:      90–100%
 - STRONG + MEDIUM conf:    60–75%
 - BUY/SELL + HIGH conf:    60–75%
@@ -1016,6 +1016,7 @@ If RSI < 32 or Stoch < 22 → SHORT carries reversal risk; name invalidation lev
 - ANY + LOW conf:          10–20%  (cap)
 - NEUTRAL:                 0%
 Reduce one band if `liq_map_source` = orderbook_proxy AND liq-cluster signals are dominant drivers.
+**Final size = min(matrix-allowed%, half-Kelly%)** — see Kelly check in OUTPUT FORMAT.
 
 ## TRADE SETUP RULES (these failures repeat — follow strictly)
 1. **Pick ONE entry mechanism**, never both:
@@ -1030,27 +1031,55 @@ Reduce one band if `liq_map_source` = orderbook_proxy AND liq-cluster signals ar
    Don't write "next structural level" without naming what makes it structural.
 4. **Stop must cite invalidation.** What signal flip kills the thesis (EMA cross, VWAP reclaim, level retake).
 
-## OUTPUT FORMAT — EXACTLY this structure:
+## REASONING DISCIPLINE — these prevent the anchoring failure mode where a VERDICT-first format becomes a self-justifying summary
+1. **Verdict comes LAST, not first.** Reason in this order: evidence → bull steelman → bear steelman → which is more defensible → win-rate estimate → Kelly check → invalidation → override audit → THEN verdict + trade setup. Do not state your conclusion until you have written both cases at full strength.
+2. **Steelman both sides.** The bull and bear sections must present the STRONGEST argument from the data, **no rebuttals inside the case**, no "but X overrides this." Save rebuttals for the comparison step.
+3. **Explicit win-rate estimate.** State your probability (0–100%) that the proposed direction closes profitable over 72h. This is the trade's win-rate, not your confidence in the analysis. Counter-trend buys at F&G <15 + RSI <25 typically resolve >55%; trend-continuation shorts into multi-signal oversold typically <45%. Be honest — sandbagged or inflated win rates poison the Kelly check.
+4. **Half-Kelly sizing check.** Compute it explicitly:
+   `Kelly% = max(0, (W − (1−W)/R)) × 100`  where W = win-rate decimal, R = R:R ratio.
+   `Half-Kelly% = Kelly% / 2`
+   `Final size = min(matrix-allowed%, half-Kelly%)`
+   If Kelly ≤ 0, final size = 0% and the verdict downgrades to NEUTRAL regardless of |score|.
+5. **Invalidation beyond stop.** Name 3 signal changes other than price reaching the stop that would kill the thesis. If only "price moves against me" comes to mind, the thesis isn't falsifiable — downgrade confidence one band.
+6. **Override audit.** If you discount any input by >20% from its published weight, cite a specific measurable reason in one sentence per input. Without a cited reason, use the published weight.
 
-**VERDICT: [STRONG BUY / BUY / LEAN BUY / NEUTRAL / LEAN SELL / SELL / STRONG SELL]** · Confidence: [LOW / MEDIUM / HIGH] · Size: [X%]
-[One sentence: the single clearest reason for the verdict.]
+## OUTPUT FORMAT — EXACTLY this structure (verdict LAST):
 
-**72h read:** [2 sentences. Lead with 2 highest-weight signals (name + value + weight%). Note the regime.]
+**Evidence:** [Top-3 72h signals ranked by |weight × value| with regime label. Dominant 24h signal. Cycle phase + score. Facts only, ~2 sentences.]
 
-**24h read:** [1–2 sentences. Lead with the dominant 24h signal. Does it confirm or contradict the 72h direction?]
+**Bull case (steelman):**
+- [Bullet 1 — strongest bullish argument from the data, stated at full strength]
+- [Bullet 2]
+- [Bullet 3]
 
-**Cycle / far-term:** [1–2 sentences on cycle phase, dominance, momentum.]
+**Bear case (steelman):**
+- [Bullet 1 — strongest bearish argument from the data, stated at full strength]
+- [Bullet 2]
+- [Bullet 3]
 
-**Key conflict or alignment:** [One sentence. Name the two signals most opposed — or confirm conviction.]
+**Which is more defensible & why:** [2 sentences. Name the evidence that tips the scale and the strongest piece of counter-evidence that still gives you pause.]
 
-**Trade setup:** Direction · entry ($X via LIMIT or TRIGGER) · stop $Y (invalidation: <named signal flip>) · target $Z (citing: <named input>) · R:R = |Z−X|÷|Y−X| = 1:N.N · structural reason. If |score| < 30, state the exact level/signal change that would validate a trade instead.
+**Win rate (72h, proposed direction):** W%
+**Kelly check:** Kelly% = (W − (1−W)/R) × 100 = X%. Half-Kelly = X/2 = Y%. Matrix-allowed = Z%. **Final size = min(Y, Z) = N%.**
 
-**Confidence:**
-- HIGH: Tier 1 signals agree + 24h confirms + no major counter-signal
-- MEDIUM: 1 Tier 1 signal clear with momentum support, or strong signal offset by meaningful counter
-- LOW: Tier 1 split, 24h contradicts 72h, or dominant signal opposes daily trend
+**Invalidation beyond stop:**
+- [Signal change 1]
+- [Signal change 2]
+- [Signal change 3]
 
-Under 300 words total."""
+**Override audit:** [List any input discounted >20% with cited reason, or "None — used published weights."]
+
+**VERDICT:** [STRONG BUY / BUY / LEAN BUY / NEUTRAL / LEAN SELL / SELL / STRONG SELL] · Confidence: [LOW / MEDIUM / HIGH] · Size: N%
+[One sentence: the single tipping-point reason from the comparison above.]
+
+**Trade setup:** Direction · entry ($X via LIMIT or TRIGGER) · stop $Y (invalidation: <named signal flip>) · target $Z (citing: <named input>) · R:R = |Z−X|÷|Y−X| = 1:N.N · structural reason. If |score| < 30 OR Kelly ≤ 0, state instead the exact level/signal change that would validate a trade.
+
+**Confidence definitions** (apply AFTER the case comparison, not before):
+- HIGH: bull and bear steelmans clearly asymmetric, Tier 1 signals aligned, 24h confirms, win-rate ≥60%
+- MEDIUM: defensible lean, one Tier 1 clear with offsetting counter-signal, win-rate 50–60%
+- LOW: steelmans roughly symmetric, Tier 1 split, 24h contradicts 72h, or win-rate <50% — likely route to NEUTRAL
+
+Under 500 words total."""
 
 
 def _call_claude_interpretation(
@@ -7129,7 +7158,8 @@ def fig_price_chart(a: dict) -> plt.Figure:
     for label, lvl in fib["levels"].items():
         if abs(lvl - price) / price < 0.25:
             col = fib_colors.get(label, "#8b949e")
-            ax.axhline(lvl, color=col, alpha=0.45, lw=0.85, ls=(0, (5, 4)))
+            ax.axhline(lvl, color=col, alpha=0.45, lw=0.85, ls=(0, (5, 4)),
+                       label=f"Fib {label} ${lvl:,.0f}")
             ax.text(plot_df.index[1], lvl * 1.001, f"Fib {label}",
                     fontsize=6.5, color=col, alpha=0.75, va="bottom")
 
@@ -8440,11 +8470,22 @@ def fig_fg_expanded(a: dict) -> plt.Figure:
 
 
 def fig_funding_expanded(a: dict) -> plt.Figure:
-    """BTC perp funding rate history (Binance, 8h periods) with bias bands + price panel."""
+    """BTC perp funding rate history (Binance, 8h periods) with bias bands + price panel.
+
+    Layout notes:
+    - sharex=False so the funding panel can clip to its own (shorter) time
+      window. Binance's premiumIndex API typically returns a few months of
+      history, and sharing the x-axis with the 1y price panel was squashing
+      every bar into a thin strip on the right.
+    - Five zone bands are drawn (capitulation / mild short / neutral / mild
+      long / euphoric) so the y-position carries meaning without a key.
+    - A small legend in the bottom-left explains the bands; the headline
+      label in the top-left names the current zone + what to do with it.
+    """
     plot_df = a["plot_df"]; price = a["price"]
     fh = a.get("funding_history")
-    fig, (ax1, axp) = plt.subplots(2, 1, figsize=(13, 5.5), sharex=True,
-                                    gridspec_kw={"height_ratios": [1.5, 1], "hspace": 0.08})
+    fig, (ax1, axp) = plt.subplots(2, 1, figsize=(13, 5.5),
+                                    gridspec_kw={"height_ratios": [1.7, 1], "hspace": 0.30})
     fig.patch.set_facecolor("#0d1117")
     for ax in (ax1, axp): _ax_style(ax)
     if fh is None or fh.empty:
@@ -8454,28 +8495,170 @@ def fig_funding_expanded(a: dict) -> plt.Figure:
         _add_price_panel(axp, plot_df, price)
         plt.tight_layout(pad=0.5)
         return fig
-    rates = fh["rate_pct"].values
+
+    rates    = fh["rate_pct"].values
+    times    = fh["time"]
+    fr_now   = float(rates[-1])
+    fr_avg   = float(np.mean(rates[-8:])) if len(rates) >= 1 else fr_now
+    fr_max   = float(np.max(np.abs(rates)))
+    # Coverage window — used both to clip the axes and to surface in the title.
+    t_start, t_end = times.iloc[0], times.iloc[-1]
+    cov_days = max(1, int((t_end - t_start).total_seconds() / 86400))
+
+    # Symmetric y-limit so zone bands look balanced. Floor at ±0.015% so a
+    # quiet market doesn't produce a microscopic chart.
+    y_lim = max(0.015, fr_max * 1.15)
+
+    # ── Zone bands — y-position carries meaning at a glance ─────────
+    # Above +0.05%: longs paying premium, crowded → contrarian bearish bias.
+    # +0.02 to +0.05%: mild long lean. -0.02 to +0.02%: neutral.
+    # -0.05 to -0.02%: mild short lean. Below -0.05%: shorts paying, capitulation
+    # → contrarian bullish bias.
+    ax1.axhspan( 0.05,  y_lim,  color="#f85149", alpha=0.08, zorder=0)
+    ax1.axhspan( 0.02,  0.05,   color="#f0883e", alpha=0.06, zorder=0)
+    ax1.axhspan(-0.02,  0.02,   color="#8b949e", alpha=0.05, zorder=0)
+    ax1.axhspan(-0.05, -0.02,   color="#58a6ff", alpha=0.06, zorder=0)
+    ax1.axhspan(-y_lim,-0.05,   color="#3fb950", alpha=0.08, zorder=0)
+    for lvl, col in [( 0.05, "#f85149"), ( 0.02, "#f0883e"),
+                     (-0.02, "#58a6ff"), (-0.05, "#3fb950")]:
+        ax1.axhline(lvl, color=col, ls=":", lw=0.6, alpha=0.55)
+    ax1.axhline(0.0, color="#484f58", lw=0.8)
+
+    # Inline labels on the right edge of each band so the user can read
+    # "what does +0.03% mean" without leaving the chart.
+    for y, txt, col in [
+        ( (0.05 + y_lim)/2, "OVER-LONG → bearish",   "#f85149"),
+        ( 0.035,            "long-biased",            "#f0883e"),
+        ( 0.0,              "neutral",                "#8b949e"),
+        (-0.035,            "short-biased",           "#58a6ff"),
+        (-(0.05 + y_lim)/2, "OVER-SHORT → bullish",  "#3fb950"),
+    ]:
+        if abs(y) <= y_lim:
+            ax1.text(1.002, y, f" {txt}", transform=ax1.get_yaxis_transform(),
+                     fontsize=7, color=col, va="center", ha="left",
+                     alpha=0.85, clip_on=False)
+
+    # ── Bars ────────────────────────────────────────────────────────
     bar_col = np.where(rates >= 0, "#3fb950", "#f85149")
-    ax1.bar(fh["time"], rates, color=bar_col, alpha=0.65, width=0.28)
-    ax1.axhline(0.0,  color="#484f58", lw=0.7)
-    ax1.axhline(0.01, color="#f0883e", ls="--", lw=0.7, alpha=0.5)   # neutral upper
-    ax1.axhline(-0.01,color="#58a6ff", ls="--", lw=0.7, alpha=0.5)
-    fr_now = float(rates[-1])
-    fr_avg = float(np.mean(rates[-8:])) if len(rates) >= 1 else fr_now
-    # Funding rate is in % per 8h; >0.05% sustained = euphoric, <-0.05% = capitulation
-    if   fr_avg >  0.05: _fr_msg, _fr_col = f"Funding {fr_now:+.3f}% (avg8 {fr_avg:+.3f}%) — Longs overcrowded, bearish setup",  "#f85149"
-    elif fr_avg >  0.02: _fr_msg, _fr_col = f"Funding {fr_now:+.3f}% (avg8 {fr_avg:+.3f}%) — Mildly long-biased",                 "#f0883e"
-    elif fr_avg < -0.05: _fr_msg, _fr_col = f"Funding {fr_now:+.3f}% (avg8 {fr_avg:+.3f}%) — Shorts overcrowded, bullish setup",  "#3fb950"
-    elif fr_avg < -0.02: _fr_msg, _fr_col = f"Funding {fr_now:+.3f}% (avg8 {fr_avg:+.3f}%) — Mildly short-biased",                "#58a6ff"
-    else:                 _fr_msg, _fr_col = f"Funding {fr_now:+.3f}% (avg8 {fr_avg:+.3f}%) — Neutral positioning",                "#8b949e"
-    ax1.text(0.005, 0.95, _fr_msg, transform=ax1.transAxes, fontsize=8, va="top", ha="left",
-             color=_fr_col, bbox=dict(boxstyle="round,pad=0.3", fc="#0d1117", ec=_fr_col, alpha=0.9, lw=0.7))
-    ax1.text(0.995, 0.95, f"Latest {fr_now:+.3f}% / 8h",
-             transform=ax1.transAxes, fontsize=8, va="top", ha="right", color="#8b949e")
-    ax1.set_title("Funding Rate  ·  BTC Perp (Binance, 8h periods)", color="#8b949e", fontsize=9, loc="left", pad=4)
+    # Width in days — derived from the median sampling interval so we don't
+    # over- or under-fill the chart no matter how many points the API returned.
+    if len(times) >= 2:
+        dt_days = float(np.median(np.diff(times.values).astype("timedelta64[s]").astype(float)) / 86400.0)
+    else:
+        dt_days = 8.0 / 24.0
+    ax1.bar(times, rates, color=bar_col, alpha=0.85, width=dt_days * 0.85, zorder=2)
+
+    # ── Headline label ──────────────────────────────────────────────
+    # Two layers: (1) current zone (overcrowded vs mild vs neutral), and
+    # (2) regime trend — recent 21-period avg vs the prior 21-period avg.
+    # A regime flip from negative→positive while still near neutral is the
+    # textbook "late-cycle, longs taking over" setup that pure-magnitude
+    # zone logic would miss and call "no signal".
+    _n = len(rates)
+    _recent = float(np.mean(rates[-21:]))   if _n >= 21 else fr_avg
+    _prior  = float(np.mean(rates[-42:-21])) if _n >= 42 else _recent
+    _shift  = _recent - _prior
+    if   _shift >  0.004 and _recent > 0 and _prior < 0:
+        _trend = " · regime flipped NEG→POS (shorts squeezed, longs rebuilding — late-cycle bearish)"
+    elif _shift < -0.004 and _recent < 0 and _prior > 0:
+        _trend = " · regime flipped POS→NEG (longs flushed, shorts building — late-cycle bullish)"
+    elif _shift >  0.003:
+        _trend = " · trending more positive (long premium rising)"
+    elif _shift < -0.003:
+        _trend = " · trending more negative (short premium rising)"
+    else:
+        _trend = ""
+
+    if   fr_avg >  0.05:
+        _fr_msg = f"Funding {fr_now:+.3f}% (8-period avg {fr_avg:+.3f}%) — Longs overcrowded → fade rallies"
+        _fr_col = "#f85149"
+    elif fr_avg >  0.02:
+        _fr_msg = f"Funding {fr_now:+.3f}% (8-period avg {fr_avg:+.3f}%) — Mildly long-biased{_trend}"
+        _fr_col = "#f0883e"
+    elif fr_avg < -0.05:
+        _fr_msg = f"Funding {fr_now:+.3f}% (8-period avg {fr_avg:+.3f}%) — Shorts overcrowded → buy dips"
+        _fr_col = "#3fb950"
+    elif fr_avg < -0.02:
+        _fr_msg = f"Funding {fr_now:+.3f}% (8-period avg {fr_avg:+.3f}%) — Mildly short-biased{_trend}"
+        _fr_col = "#58a6ff"
+    else:
+        # Even "neutral" magnitude can carry a regime-flip signal. Re-colour
+        # by trend direction so the headline tracks what changed, not just where it sits.
+        if _shift > 0.004 and _recent > 0 and _prior < 0:
+            _fr_col = "#f0883e"
+        elif _shift < -0.004 and _recent < 0 and _prior > 0:
+            _fr_col = "#58a6ff"
+        else:
+            _fr_col = "#8b949e"
+        _suffix = _trend if _trend else " — Neutral positioning, no signal"
+        _fr_msg = f"Funding {fr_now:+.3f}% (8-period avg {fr_avg:+.3f}%){_suffix}"
+    ax1.text(0.005, 0.97, _fr_msg, transform=ax1.transAxes, fontsize=8.5, va="top", ha="left",
+             color=_fr_col, fontweight="bold",
+             bbox=dict(boxstyle="round,pad=0.35", fc="#0d1117", ec=_fr_col, alpha=0.95, lw=0.8))
+
+    # How-to-read footnote — tiny, bottom-left of the funding panel.
+    # Spell out the contrarian flip: green ≠ bullish, it just means longs are
+    # paying. This is the most-misread part of the chart.
+    ax1.text(0.005, 0.04,
+             "Read: green = longs paying (long-positioned, not bullish). "
+             "Red = shorts paying. Extremes flip contrarian — extreme red → bullish, extreme green → bearish.",
+             transform=ax1.transAxes, fontsize=7, va="bottom", ha="left",
+             color="#6e7681", style="italic")
+
+    # ── Axis cosmetics ──────────────────────────────────────────────
+    ax1.set_ylim(-y_lim, y_lim)
+    ax1.set_xlim(t_start, t_end)
+    ax1.set_title(f"Funding Rate  ·  BTC Perp (Binance, 8h periods)  ·  last {cov_days}d",
+                  color="#8b949e", fontsize=9, loc="left", pad=4)
     ax1.set_ylabel("Rate %/8h", color="#8b949e", fontsize=8)
     ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:+.3f}%"))
-    _add_price_panel(axp, plot_df, price)
+
+    # ── Price panel: clip to the funding window so the two panels line up
+    # and the y-axis auto-fits the *visible* range (not the full 365d).
+    # Previous attempt called _add_price_panel() then tried to override
+    # ylim — the override died silently on tz mismatch (funding API is
+    # UTC tz-aware, plot_df.index is tz-naive), leaving y stuck at the
+    # full year's $60k–$120k+ scale. Plotting only the in-window subset
+    # lets matplotlib auto-fit naturally.
+    try:
+        import pandas as _pd
+        _idx = plot_df.index
+        _ts_start = _pd.to_datetime(t_start)
+        _ts_end   = _pd.to_datetime(t_end)
+        # Align tz: strip tz from both sides so the comparison works
+        # regardless of which side carries one.
+        if getattr(_idx, "tz", None) is not None:
+            _idx_cmp = _idx.tz_localize(None)
+        else:
+            _idx_cmp = _idx
+        if getattr(_ts_start, "tz", None) is not None:
+            _ts_start = _ts_start.tz_localize(None)
+            _ts_end   = _ts_end.tz_localize(None)
+        _mask = (_idx_cmp >= _ts_start) & (_idx_cmp <= _ts_end)
+        _sub  = plot_df.loc[_mask]
+    except Exception:
+        _sub = plot_df  # last-resort fallback — show full data
+
+    if len(_sub) >= 2:
+        _closes = _sub["Close"]
+        axp.plot(_sub.index, _closes, color="#58a6ff", lw=1.4)
+        axp.fill_between(_sub.index, _closes, float(_closes.min()),
+                         color="#58a6ff", alpha=0.08)
+        axp.axhline(price, color="#ffffff", lw=0.8, ls="--", alpha=0.5)
+        axp.text(0.995, 0.92, f"BTC/USD  ${price:,.0f}", transform=axp.transAxes,
+                 fontsize=8, va="top", ha="right", color="#c9d1d9")
+        axp.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"${v/1000:.1f}k"))
+        # Tight y-axis around the actual range with 8% padding.
+        _lo, _hi = float(_closes.min()), float(_closes.max())
+        _pad = (_hi - _lo) * 0.08 if _hi > _lo else _hi * 0.01
+        axp.set_ylim(_lo - _pad, _hi + _pad)
+        axp.set_xlim(_sub.index[0], _sub.index[-1])
+    else:
+        # Fallback — funding window didn't intersect daily price data
+        _add_price_panel(axp, plot_df, price)
+    axp.set_title("BTC/USD — Close Price (same window as funding)",
+                  color="#8b949e", fontsize=9, loc="left", pad=4)
+
     plt.tight_layout(pad=0.5)
     return fig
 
@@ -8803,73 +8986,203 @@ _revp_sign    = "+" if _b12_revp >= 0 else ""
 _revp_tag     = ("opposing trend" if not _revp_aligned and abs(_b12_revp) >= 5
                  else "confirming" if abs(_b12_revp) >= 5
                  else "neutral")
+# ── Mini scales row: Bull Prob · Conviction · ADX · Vol Percentile ──
+# Replaces the old pill row with visual scales for at-a-glance reading. Each
+# scale is a ~6px gradient track with a circular pointer. Regime + ADX numeric
+# header sits above; expected-move text sits below.
+_bprob_pct = max(0.0, min(100.0, float(_b12_bprob)))
+_conv_pos  = max(0.0, min(100.0, float(_conv_pct)))
+# ADX axis: 0..80 → 0..100% (anything >80 saturates). Thresholds: 20 weak / 40 strong / 60 extreme.
+_adx_val   = float(_b12_adx1h) if _b12_adx1h is not None else 0.0
+_adx_pos   = max(0.0, min(100.0, _adx_val / 80.0 * 100.0))
+_adx_lbl   = ("EXTREME" if _adx_val >= 60 else "STRONG" if _adx_val >= 40
+              else "TRENDING" if _adx_val >= 25 else "DEVELOPING" if _adx_val >= 15 else "WEAK")
+_adx_col   = ("#f85149" if _adx_val >= 60 else "#ffd700" if _adx_val >= 40
+              else "#3fb950" if _adx_val >= 25 else "#58a6ff" if _adx_val >= 15 else "#8b949e")
+# Vol percentile 0..100 already.
+_vol_val   = float(_b12_atrpct) if _b12_atrpct is not None else 50.0
+_vol_pos   = max(0.0, min(100.0, _vol_val))
+_vol_lbl   = "HIGH" if _vol_val > 70 else "LOW" if _vol_val < 30 else "NORMAL"
+_vol_col   = "#f0883e" if _vol_val > 70 else "#58a6ff" if _vol_val < 30 else "#8b949e"
+
+def _mini_scale(title, val_str, val_color, pos_pct, gradient, title_tip=""):
+    # NOTE: every HTML line must start at column 0. Streamlit runs markdown
+    # before the HTML pass, and 4+ leading spaces would turn this into a
+    # <pre><code> block (the bug that printed raw tags on the page).
+    # Kept intentionally small + dim — these are secondary context to the
+    # 72h bias gauge, not equal-weight peers.
+    tip = f' title="{title_tip}"' if title_tip else ""
+    return (
+f'<div style="flex:1 1 0; min-width:120px;"{tip}>'
+f'<div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:2px;">'
+f'<span style="font-size:8px; color:#6e7681; letter-spacing:.08em; font-weight:600;">{title}</span>'
+f'<span style="font-size:10px; color:{val_color}cc; font-weight:600;">{val_str}</span>'
+f'</div>'
+f'<div style="position:relative; height:4px; border-radius:2px;'
+f' background:{gradient}; opacity:.7;'
+f' box-shadow:inset 0 1px 1px rgba(0,0,0,.4);">'
+f'<div style="position:absolute; top:50%; left:{pos_pct:.1f}%;'
+f' transform:translate(-50%,-50%);'
+f' width:7px; height:7px; border-radius:50%;'
+f' background:#0d1117; border:1.5px solid {val_color};"></div>'
+f'</div>'
+f'</div>'
+    )
+
+_grad_bprob = "linear-gradient(to right, #f85149 0%, #8b949e 50%, #3fb950 100%)"
+_grad_conv  = "linear-gradient(to right, #f85149 0%, #ffd700 50%, #3fb950 100%)"
+_grad_adx   = "linear-gradient(to right, #8b949e 0%, #58a6ff 19%, #3fb950 31%, #ffd700 50%, #f85149 75%)"
+_grad_vol   = "linear-gradient(to right, #58a6ff 0%, #8b949e 50%, #f0883e 100%)"
+
+# Build flush-left so markdown doesn't see 4-space indents and emit code blocks.
+_scale_bp = _mini_scale("BULL PROB", f"{_b12_bprob:.0f}%", _bprob_color, _bprob_pct, _grad_bprob,
+                        "Probability the next 72h closes above current price, based on signal consensus.")
+_scale_cv = _mini_scale("CONVICTION", f"{_conv_label} · {_conv_pct}%", _conv_color, _conv_pos, _grad_conv,
+                        "Conviction = 1 − signal std. High = all signals agree. Low = signals disagree and the score is noise.")
+_scale_ax = _mini_scale("ADX (1H)", f"{_adx_lbl} · {_adx_val:.0f}", _adx_col, _adx_pos, _grad_adx,
+                        "Average Directional Index on the 1h chart. <20 weak / 25+ trending / 40+ strong / 60+ extreme.")
+_scale_vp = _mini_scale("VOL PCTILE", f"{_vol_lbl} · {_vol_val:.0f}", _vol_col, _vol_pos, _grad_vol,
+                        "Where current realized volatility sits in its 90-day distribution. 0=quietest, 100=most volatile.")
+
+# ─────────────────────────────────────────────────────────────────
+# PRIMARY: 72H DIRECTIONAL BIAS — the focal point. Rendered in a
+# highlighted card with a left accent bar matching the bias colour,
+# so the eye lands on it before any context.
+# Streamlit markdown is fed flush-left to avoid the code-block trap.
+# ─────────────────────────────────────────────────────────────────
+_gauge_html = (
+f'<div style="margin: 4px 0 14px 0; padding: 14px 18px 12px 18px;'
+f' background: linear-gradient(180deg, #161b22 0%, #0d1117 100%);'
+f' border: 1px solid #30363d; border-left: 4px solid {_b12_color};'
+f' border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,.35);">'
+f'<div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:10px;">'
+f'<span style="font-size:11px; font-weight:700; color:#8b949e; letter-spacing:.14em;">'
+f'72H DIRECTIONAL BIAS</span>'
+f'<span style="font-size:28px; font-weight:800; color:{_b12_color}; letter-spacing:-.5px;'
+f' text-shadow:0 0 18px {_b12_color}55;">'
+f'{_b12_sign}{_b12_score:.0f}%'
+f'&nbsp;<span style="font-size:14px; font-weight:700; color:{_b12_color}cc;">{_b12_label}</span>'
+f'</span>'
+f'</div>'
+# Track
+f'<div style="position:relative; height:18px; border-radius:9px;'
+f' background: linear-gradient(to right, #f85149 0%, #f0883e 20%, #8b949e 45%, #8b949e 55%, #58a6ff 80%, #3fb950 100%);'
+f' box-shadow: inset 0 1px 3px rgba(0,0,0,.4);">'
+# Fade overlay from centre toward the inactive side
+f'<div style="position:absolute; top:0; left:0; right:0; bottom:0; border-radius:9px;'
+f' background: linear-gradient(to right,'
+f' rgba(13,17,23,.7) 0%,'
+f' rgba(13,17,23,.0) {_b12_pct:.1f}%,'
+f' rgba(13,17,23,.0) {_b12_pct:.1f}%,'
+f' rgba(13,17,23,.7) 100%);"></div>'
+# Pointer
+f'<div style="position:absolute; top:50%; left:{_b12_pct:.1f}%;'
+f' transform:translate(-50%,-50%);'
+f' width:22px; height:22px; border-radius:50%;'
+f' background:#0d1117; border:3px solid {_b12_color};'
+f' box-shadow:0 0 12px {_b12_color}cc;"></div>'
+f'</div>'
+# Trade-zone tick marks
+f'<div style="position:relative; height:6px; margin-top:2px;">'
+f'<div style="position:absolute; left:30%; width:2px; height:6px; background:#3fb95055;"></div>'
+f'<div style="position:absolute; left:70%; width:2px; height:6px; background:#f8514955;"></div>'
+f'</div>'
+f'<div style="display:flex; justify-content:space-between;'
+f' font-size:10px; color:#484f58; margin-top:1px; font-family:monospace;">'
+f'<span>−100</span>'
+f'<span style="color:#f8514988;">−40 ← trade zone</span>'
+f'<span style="color:#555;">0</span>'
+f'<span style="color:#3fb95088;">+40 trade zone →</span>'
+f'<span>+100</span>'
+f'</div>'
+f'</div>'
+)
+st.markdown(_gauge_html, unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────
+# SECONDARY: market-context scales. Smaller, dimmer, grouped under
+# a tiny "MARKET CONTEXT" label so they read as supporting info.
+# ─────────────────────────────────────────────────────────────────
+_scales_html = (
+f'<div style="margin: 0 0 10px 0; padding: 0 4px;">'
+f'<div style="display:flex; align-items:center; gap:10px; margin-bottom:6px; font-size:10px;">'
+f'<span style="color:#6e7681; letter-spacing:.14em; font-weight:600;">MARKET CONTEXT</span>'
+f'<span style="background:{_regime_color}18; border:1px solid {_regime_color}44;'
+f' color:{_regime_color}cc; border-radius:4px; padding:1px 7px; font-weight:600;'
+f' font-size:9px; letter-spacing:.08em;">{_regime_label}</span>'
+f'<span style="color:#6e7681; font-size:10px;">{_emove_str}</span>'
+f'</div>'
+f'<div style="display:flex; gap:14px; flex-wrap:wrap;">'
+f'{_scale_bp}{_scale_cv}{_scale_ax}{_scale_vp}'
+f'</div>'
+f'</div>'
+)
+st.markdown(_scales_html, unsafe_allow_html=True)
+
+# ── Reversal Accumulation Scale ───────────────────────────────
+# Visualizes how strong the reversal/exhaustion subscore is and whether it's
+# pointing against the current trend (which is when accumulation gets
+# interesting). Magnitude is mapped 0..50 → 0..100% of the bar. Zone bands:
+#   <10  noise · 10–20 building · 20–30 real bid · 30+ strong setup
+# Bar uses the live colour gradient when opposing trend (accumulation interp
+# applies) and a muted grey when confirming (no fade signal).
+_revp_mag       = abs(_b12_revp)
+_revp_scale_pct = min(_revp_mag / 50.0, 1.0) * 100
+if not _revp_aligned and _revp_mag >= 30:
+    _revp_zone, _revp_zone_col = "STRONG SETUP — ACCUMULATE",  "#3fb950"
+elif not _revp_aligned and _revp_mag >= 20:
+    _revp_zone, _revp_zone_col = "REAL BID — SCALE IN",        "#58a6ff"
+elif not _revp_aligned and _revp_mag >= 10:
+    _revp_zone, _revp_zone_col = "BUILDING — WATCH",           "#ffd700"
+elif _revp_aligned and _revp_mag >= 10:
+    _revp_zone, _revp_zone_col = "CONFIRMING TREND",           "#8b949e"
+else:
+    _revp_zone, _revp_zone_col = "WEAK / NOISE",               "#484f58"
+_revp_track_grad = (
+    "linear-gradient(to right, #30363d 0%, #484f58 18%, #ffd700 40%, #58a6ff 60%, #3fb950 100%)"
+    if not _revp_aligned
+    else "linear-gradient(to right, #30363d 0%, #484f58 100%)"
+)
+_revp_intent = ("opposing trend — fade setup" if not _revp_aligned and _revp_mag >= 5
+                else "confirming trend — no fade" if _revp_aligned and _revp_mag >= 5
+                else "neutral")
 st.markdown(f"""
-<div style="display:flex; gap:10px; align-items:center; margin-bottom:10px; flex-wrap:wrap;">
-  <span style="background:{_regime_color}22; border:1px solid {_regime_color}66;
-        color:{_regime_color}; border-radius:6px; padding:3px 10px; font-size:11px; font-weight:700;
-        letter-spacing:.08em;">{_regime_label}{_adx_str} {_vol_str}</span>
-  <span style="background:#161b22; border:1px solid #30363d; border-radius:6px;
-        padding:3px 10px; font-size:11px; color:{_bprob_color}; font-weight:700;">
-    Bull prob: {_b12_bprob:.0f}%</span>
-  <span style="background:{_conv_color}18; border:1px solid {_conv_color}55; border-radius:6px;
-        padding:3px 10px; font-size:11px; color:{_conv_color}; font-weight:700;"
-        title="Conviction = 1 − signal std. High = all signals agree. Low = half bullish, half bearish averaging to noise.">
-    Conviction: {_conv_label} ({_conv_pct}%)</span>
-  <span style="background:{_revp_color}18; border:1px solid {_revp_color}55; border-radius:6px;
-        padding:3px 10px; font-size:11px; color:{_revp_color}; font-weight:700;"
-        title="Reversal pressure = weighted sum of mean-reversion, divergence, exhaustion, and capitulation signals on the same -100..+100 scale as the main score. Opposite sign to score = reversal building. Same sign = continuation confirmed.">
-    Reversal: {_revp_sign}{_b12_revp:.0f} ({_revp_tag})</span>
-  {"<span style='font-size:11px; color:#6e7681;'>" + _emove_str + "</span>" if _emove_str else ""}
-</div>""", unsafe_allow_html=True)
-
-# Gradient track: red → grey → green, pointer dot at the right position
-_gauge_html = f"""
-<div style="margin: 4px 0 18px 0;">
-  <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:6px;">
-    <span style="font-size:13px; font-weight:600; color:#8b949e; letter-spacing:.05em;">
-      72H DIRECTIONAL BIAS
+<div style="margin: 0 0 16px 0;">
+  <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:4px;">
+    <span style="font-size:12px; font-weight:600; color:#8b949e; letter-spacing:.05em;">
+      REVERSAL ACCUMULATION SETUP
+      <span style="font-size:10px; color:#6e7681; font-weight:400; letter-spacing:0;">
+        · |rev pressure| {_revp_mag:.0f} · {_revp_intent}
+      </span>
     </span>
-    <span style="font-size:22px; font-weight:800; color:{_b12_color}; letter-spacing:-.5px;">
-      {_b12_sign}{_b12_score:.0f}%
-      &nbsp;<span style="font-size:14px; font-weight:600;">{_b12_label}</span>
+    <span style="font-size:13px; font-weight:700; color:{_revp_zone_col}; letter-spacing:.03em;">
+      {_revp_zone}
     </span>
   </div>
-
-  <!-- Track -->
-  <div style="position:relative; height:16px; border-radius:8px;
-       background: linear-gradient(to right, #f85149 0%, #f0883e 20%, #8b949e 45%, #8b949e 55%, #58a6ff 80%, #3fb950 100%);
-       box-shadow: inset 0 1px 3px rgba(0,0,0,.4);">
-    <!-- Filled overlay that fades from centre toward the active side -->
-    <div style="position:absolute; top:0; left:0; right:0; bottom:0; border-radius:8px;
-         background: linear-gradient(to right,
-           rgba(13,17,23,.7) 0%,
-           rgba(13,17,23,.0) {_b12_pct:.1f}%,
-           rgba(13,17,23,.0) {_b12_pct:.1f}%,
-           rgba(13,17,23,.7) 100%);"></div>
+  <div style="position:relative; height:10px; border-radius:5px;
+       background: {_revp_track_grad};
+       box-shadow: inset 0 1px 2px rgba(0,0,0,.4);">
+    <!-- Zone tick marks at 10, 20, 30 (i.e. 20%, 40%, 60% of the 0-50 scale) -->
+    <div style="position:absolute; left:20%; top:0; width:1px; height:10px; background:rgba(255,255,255,.18);"></div>
+    <div style="position:absolute; left:40%; top:0; width:1px; height:10px; background:rgba(255,255,255,.18);"></div>
+    <div style="position:absolute; left:60%; top:0; width:1px; height:10px; background:rgba(255,255,255,.18);"></div>
     <!-- Pointer -->
-    <div style="position:absolute; top:50%; left:{_b12_pct:.1f}%;
+    <div style="position:absolute; top:50%; left:{_revp_scale_pct:.1f}%;
          transform:translate(-50%,-50%);
-         width:20px; height:20px; border-radius:50%;
-         background:#0d1117; border:3px solid {_b12_color};
-         box-shadow:0 0 8px {_b12_color}88;"></div>
-  </div>
-
-  <!-- Scale labels with ±40 action-zone markers -->
-  <div style="position:relative; height:6px; margin-top:2px;">
-    <div style="position:absolute; left:30%; width:2px; height:6px; background:#3fb95055;"></div>
-    <div style="position:absolute; left:70%; width:2px; height:6px; background:#f8514955;"></div>
+         width:14px; height:14px; border-radius:50%;
+         background:#0d1117; border:2px solid {_revp_zone_col};
+         box-shadow:0 0 6px {_revp_zone_col}88;"></div>
   </div>
   <div style="display:flex; justify-content:space-between;
-       font-size:10px; color:#484f58; margin-top:1px; font-family:monospace;">
-    <span>−100</span>
-    <span style="color:#f8514988;">−40 ← trade zone</span>
-    <span style="color:#555;">0</span>
-    <span style="color:#3fb95088;">+40 trade zone →</span>
-    <span>+100</span>
+       font-size:9px; color:#484f58; margin-top:2px; font-family:monospace;">
+    <span>0</span>
+    <span style="color:#ffd70088;">10 building</span>
+    <span style="color:#58a6ff88;">20 real bid</span>
+    <span style="color:#3fb95088;">30 strong</span>
+    <span>50+</span>
   </div>
 </div>
-"""
-st.markdown(_gauge_html, unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
 # ── ETF Action Recommendation ─────────────────────────────────
 # Backtest shows ±25–39 is near-random (44–55%). Only call trades at ±40+
@@ -8966,7 +9279,7 @@ with st.expander(f"📊 72h Bias — Signal Breakdown ({len(_b12_sigs)} signals)
         # (the trailing slots are left empty rather than stretched).
         _cols = st.columns(_PER_ROW)
         for _ci, (_sn, (_sv, _se)) in enumerate(_chunk):
-            _wt      = _b12_wts[_sn]
+            _wt      = _b12_wts.get(_sn, 0.0)
             _contrib = _sv * _wt * 100
             _pcol    = "#3fb950" if _sv > 0.05 else ("#f85149" if _sv < -0.05 else "#8b949e")
             _sign    = "+" if _contrib >= 0 else ""
@@ -9298,9 +9611,18 @@ if _ai_interp_key:
             st.session_state["_claude_interp"] = _interp_text
         _interp_text = st.session_state.get("_claude_interp", "")
         if _interp_text:
-            _interp_color = ("#3fb950" if "LONG" in _interp_text.upper()[:60]
-                             else "#f85149" if "SHORT" in _interp_text.upper()[:60]
-                             else "#8b949e")
+            # Border colour from the VERDICT line. New format puts VERDICT
+            # near the end (after steelman + Kelly check), so we search the
+            # full text rather than the first 60 chars.
+            _upper = _interp_text.upper()
+            _vidx  = _upper.find("VERDICT")
+            _vwin  = _upper[_vidx:_vidx + 80] if _vidx >= 0 else _upper
+            if "BUY" in _vwin or "LONG" in _vwin:
+                _interp_color = "#3fb950"
+            elif "SELL" in _vwin or "SHORT" in _vwin:
+                _interp_color = "#f85149"
+            else:
+                _interp_color = "#8b949e"
             # Render as native markdown so bold/bullets display correctly.
             # Escape $ signs first — Streamlit treats $...$ as LaTeX math,
             # which swallows price levels like $80,500 ... $82,000.
