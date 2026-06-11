@@ -147,7 +147,82 @@ def _supa(method: str, path: str, body=None, retries: int = 3) -> "list | dict |
 
 
 # ─────────────────────────────────────────────────────────────────
-# 1. Compute current 72h bias + price
+# 1. Resolve outcomes FIRST — before the expensive bias computation.
+#    Root cause of the 3–8 Jun resolution outage: this section used to run
+#    LAST, after run_analysis() + detail POSTs, and the workflow's
+#    timeout-minutes kept killing the job before resolution was reached
+#    (inserts kept landing, resolution made zero progress for days).
+#    Resolution only needs a cheap spot price as fallback, so it runs first.
+#    Graded against the BTC price at exactly entry+72h (core.price_history).
+# ─────────────────────────────────────────────────────────────────
+try:
+    from core import price_history as _price_hist
+except Exception:
+    _price_hist = None
+
+spot_price = _price_hist.btc_spot() if _price_hist else None
+print(f"Spot (resolution fallback): {spot_price}")
+
+cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=OUTCOME_HRS)).isoformat()
+query = f"/{TABLE}?correct=is.null&ts=lt.{urllib.parse.quote(cutoff_iso)}" \
+        "&select=id,ts,direction,entry_price&order=ts.asc&limit=200"
+
+unresolved = _supa("GET", query) or []
+print(f"Resolving {len(unresolved)} signals older than 72h…")
+
+# Bulk-fetch exact-horizon exit prices: {row ts: price at ts+72h}
+exact_exit = {}
+if _price_hist is not None and unresolved:
+    targets = {}
+    for r in unresolved:
+        ts = r.get("ts")
+        if ts:
+            try:
+                targets[ts] = datetime.fromisoformat(ts) + timedelta(hours=OUTCOME_HRS)
+            except Exception:
+                pass
+    if targets:
+        try:
+            bulk = _price_hist.btc_prices_at_bulk(list(targets.values()))
+            exact_exit = {ts: bulk.get(tgt) for ts, tgt in targets.items()}
+            n_hit = sum(1 for v in exact_exit.values() if v)
+            print(f"  exact-horizon prices: {n_hit}/{len(targets)} found")
+        except Exception as e:
+            print(f"  ⚠ exact-horizon fetch failed ({type(e).__name__}: {e}) — using spot")
+
+for r in unresolved:
+    ep = r.get("entry_price")
+    d  = r.get("direction")
+    rid = r.get("id")
+    if not ep or not d or not rid:
+        continue
+    xp = exact_exit.get(r.get("ts")) or spot_price
+    if not xp:
+        continue   # no exact candle AND no spot — leave unresolved, retry next run
+    pct = (xp - float(ep)) / float(ep) * 100
+    dir_right = (d == "LONG" and pct > 0) or (d == "SHORT" and pct < 0)
+    if d == "HOLD":
+        correct = "N/A"
+    elif dir_right and abs(pct) >= 3.0:
+        correct = "2"
+    elif dir_right:
+        correct = "1"
+    else:
+        correct = "0"
+    patch = {
+        "exit_price": round(xp, 2),
+        "pct_move":   round(pct, 2),
+        "correct":    correct,
+    }
+    res = _supa("PATCH", f"/{TABLE}?id=eq.{rid}", body=patch)
+    if res is not None:
+        print(f"  ✓ resolved id={rid} pct={pct:+.2f}% correct={correct}")
+    else:
+        print(f"  ✗ patch failed for id={rid}")
+
+
+# ─────────────────────────────────────────────────────────────────
+# 2. Compute current 72h bias + price
 # ─────────────────────────────────────────────────────────────────
 print("Computing 72h bias…")
 result = run_analysis("BTC-USD")
@@ -168,6 +243,14 @@ print(f"  price=${price:,.2f}  score={score:+.1f}  label={label}  direction={dir
 # 2. Log every tick (matches the local app — chart needs continuity;
 #    calibration buckets filter to |score|>=25 themselves).
 # ─────────────────────────────────────────────────────────────────
+def _rnd(v, n):
+    try:
+        return round(float(v), n) if v is not None else None
+    except Exception:
+        return None
+
+bias_24h = result.get("bias_24h") or {}
+_regime  = bias_72h.get("regime")
 row = {
     "ts":          datetime.now(timezone.utc).isoformat(),
     "score":       round(score, 1),
@@ -177,8 +260,25 @@ row = {
     "exit_price":  None,
     "pct_move":    None,
     "correct":     None,
+    # Phase-B fields — previously only the local app wrote these, so cron rows
+    # were unusable for meta-model training / calibration. Now logged here too.
+    "bull_prob":      _rnd(bias_72h.get("bull_prob"), 2),
+    "conviction":     _rnd(bias_72h.get("conviction"), 4),
+    "regime":         str(_regime) if _regime is not None else None,
+    "score_24h":      _rnd(bias_24h.get("score"), 1),
+    # 2-signal audit baseline (EMA Structure + OI Funding) on the same scale.
+    "score_baseline": _rnd(bias_72h.get("score_baseline"), 1),
 }
 inserted = _supa("POST", f"/{TABLE}", body=row)
+if inserted is None:
+    # Schema lag (e.g. score_baseline migration not run yet) → 4xx on the
+    # extended row. Retry with the original core fields so no tick is lost.
+    core_fields = ["ts", "score", "label", "direction",
+                   "entry_price", "exit_price", "pct_move", "correct"]
+    inserted = _supa("POST", f"/{TABLE}", body={k: row[k] for k in core_fields})
+    if inserted:
+        print("  ⚠ extended insert failed — core-fields fallback succeeded "
+              "(run supabase_migrations.sql to add new columns)")
 if inserted:
     print(f"  ✓ logged signal id={inserted[0].get('id') if isinstance(inserted, list) else '?'}")
 else:
@@ -264,40 +364,45 @@ except Exception as e:
 
 
 # ─────────────────────────────────────────────────────────────────
-# 3. Resolve outcomes for any rows older than 72h with correct=null
+# 2d. liq_heatmap_log — top synthetic-liq-map bins, every ~15 min.
+#     Powers the time×price heatmap panel (Coinglass-style) so the time
+#     axis is populated even when the local app was closed. Best-effort.
 # ─────────────────────────────────────────────────────────────────
-cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=OUTCOME_HRS)).isoformat()
-query = f"/{TABLE}?correct=is.null&ts=lt.{urllib.parse.quote(cutoff_iso)}" \
-        "&select=id,ts,direction,entry_price&limit=200"
+try:
+    if datetime.now(timezone.utc).minute % 15 < 5:
+        _lm = (result.get("btc_liq") or {}).get("liq_map") or {}
+        hm_rows = []
+        for _side in ("long", "short"):
+            for _p, _u in (_lm.get(_side) or [])[:25]:
+                hm_rows.append({"ts": _ts, "side": _side,
+                                "price": round(float(_p), 2),
+                                "usd":   round(float(_u), 2)})
+        if hm_rows:
+            # One 'px' row per snapshot carries spot for the price-line overlay.
+            hm_rows.append({"ts": _ts, "side": "px",
+                            "price": round(price, 2), "usd": 0})
+            res_hm = _supa("POST", "/liq_heatmap_log", body=hm_rows)
+            if res_hm is not None:
+                print(f"  ✓ logged {len(hm_rows)} liq_heatmap_log rows")
+            else:
+                print("  ⚠ liq_heatmap_log insert failed (table missing? run migration) — continuing")
+except Exception as e:
+    print(f"  ⚠ liq_heatmap_log error: {type(e).__name__}: {e} — continuing")
 
-unresolved = _supa("GET", query) or []
-print(f"Resolving {len(unresolved)} signals older than 72h…")
 
-for r in unresolved:
-    ep = r.get("entry_price")
-    d  = r.get("direction")
-    rid = r.get("id")
-    if not ep or not d or not rid:
-        continue
-    pct = (price - float(ep)) / float(ep) * 100
-    dir_right = (d == "LONG" and pct > 0) or (d == "SHORT" and pct < 0)
-    if d == "HOLD":
-        correct = "N/A"
-    elif dir_right and abs(pct) >= 3.0:
-        correct = "2"
-    elif dir_right:
-        correct = "1"
-    else:
-        correct = "0"
-    patch = {
-        "exit_price": round(price, 2),
-        "pct_move":   round(pct, 2),
-        "correct":    correct,
-    }
-    res = _supa("PATCH", f"/{TABLE}?id=eq.{rid}", body=patch)
-    if res is not None:
-        print(f"  ✓ resolved id={rid} pct={pct:+.2f}% correct={correct}")
-    else:
-        print(f"  ✗ patch failed for id={rid}")
+# ─────────────────────────────────────────────────────────────────
+# 3. Dead-man's switch — ping a healthcheck URL on successful completion.
+#    Set HEALTHCHECK_URL (e.g. a healthchecks.io check) as a repo secret;
+#    if the cron silently dies, the service alerts instead of nobody noticing
+#    (resolution was dead 3–8 Jun and was only found by manual audit).
+#    Best-effort: a ping failure never fails the run.
+# ─────────────────────────────────────────────────────────────────
+_hc_url = os.environ.get("HEALTHCHECK_URL", "").strip()
+if _hc_url:
+    try:
+        with urllib.request.urlopen(_hc_url, timeout=10) as _r:
+            print(f"  ✓ healthcheck ping ({_r.status})")
+    except Exception as e:
+        print(f"  ⚠ healthcheck ping failed: {type(e).__name__}: {e}")
 
 print("Done.")

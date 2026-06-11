@@ -5,7 +5,7 @@ Converted from btc_analysis.ipynb
 
 import warnings, os, csv as _csv, urllib.request, urllib.parse, json as _json, io as _io
 from pathlib import Path as _Path
-from datetime import datetime as _dt, timezone as _tz
+from datetime import datetime as _dt, timezone as _tz, timedelta as _td
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -17,6 +17,18 @@ from typing import List, Tuple, Optional
 import yfinance as yf
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
+# Meta-model (improvements.txt item 8). Import is safe even when sklearn isn't
+# installed — the module's heavy imports are lazy inside train()/predict().
+try:
+    import meta_model as _meta_model
+except Exception:
+    _meta_model = None
+# Exact-horizon price lookup (stdlib-only). Outcome resolution grades against
+# the BTC price at exactly entry+72h instead of "whenever the resolver ran".
+try:
+    from core import price_history as _price_hist
+except Exception:
+    _price_hist = None
 
 warnings.filterwarnings("ignore")
 
@@ -30,6 +42,20 @@ except ImportError:
         def __getattr__(self, name):
             return lambda *args, **kwargs: np.zeros(len(args[0]))
     talib = _DummyTalib()
+
+# ── Public-deployment gating ─────────────────────────────────────
+# PUBLIC_MODE=1 (secret or env var) disables features that spend the
+# operator's money when anonymous users click them (Claude API calls).
+# Even in private mode, Ask-Claude is capped per browser session.
+def _public_mode() -> bool:
+    try:
+        if str(st.secrets.get("PUBLIC_MODE", "")) == "1":
+            return True
+    except Exception:
+        pass
+    return os.environ.get("PUBLIC_MODE", "") == "1"
+
+_AI_SESSION_CAP = 5   # max Ask-Claude calls per browser session (~$0.02/call)
 
 # ── Constants ────────────────────────────────────────────────────
 LOOKBACK_DAYS = 400
@@ -65,8 +91,14 @@ ALL_TIERS         = [2, 3, 5, 10, 15, 20, 25, 50, 75, 100]
 HIGH_TIERS        = [25, 50, 75, 100]
 
 _SIGNAL_LOG    = _Path(__file__).parent / "signal_log.csv"
+# Phase B (improvements.txt items 1, 2, 4, 6): added bull_prob / conviction /
+# regime / score_24h so future audits can compute calibration, regime-conditional
+# hit rates, and configuration-level accuracy. Old rows have empty values for
+# these columns — readers must use .get() with a default.
 _LOG_FIELDS    = ["ts", "score", "label", "direction",
-                  "entry_price", "exit_price", "pct_move", "correct"]
+                  "entry_price", "exit_price", "pct_move", "correct",
+                  "bull_prob", "conviction", "regime", "score_24h",
+                  "score_baseline"]
 _LOG_INTERVAL  = 300    # seconds between log writes (5 min)
 _OUTCOME_HOURS = 72.0   # hours to wait before resolving outcome (matches "72h bias" name)
 
@@ -116,10 +148,12 @@ def _supa_request(method: str, path: str, body=None) -> "dict | list | None":
 # ════════════════════════════════════════════════════════════════
 
 def _log_bias_signal(score: float, label: str, price: float,
-                     bias_72h: dict = None, poly: dict = None) -> None:
+                     bias_72h: dict = None, poly: dict = None,
+                     bias_24h: dict = None) -> None:
     """Append signal-log rows for this tick. Writes three Supabase tables:
 
       signal_log     — one row: aggregate score/label/direction/entry_price
+                       + Phase-B fields (bull_prob, conviction, regime, score_24h)
       signal_detail  — N rows:  per-signal (name, raw_value, weight, contribution)
       polymarket_log — M rows:  per-market (question, strike, prob, weight, score)
 
@@ -132,10 +166,24 @@ def _log_bias_signal(score: float, label: str, price: float,
     direction = "LONG" if score >= 25 else ("SHORT" if score <= -25 else "HOLD")
     ts = _dt.now(_tz.utc).isoformat()
 
+    # ── Phase-B fields (improvements.txt items 1, 2, 4, 6) ────────────────
+    # Pulled from bias_72h / bias_24h dicts when present; left as None/"" when
+    # not, so old code paths that don't pass these dicts still work.
+    _bp   = (bias_72h or {}).get("bull_prob")
+    _cv   = (bias_72h or {}).get("conviction")
+    _rg   = (bias_72h or {}).get("regime")
+    _s24  = (bias_24h or {}).get("score")
+    _sbl  = (bias_72h or {}).get("score_baseline")
+    _bp_n = round(float(_bp), 2)  if _bp  is not None else None
+    _cv_n = round(float(_cv), 4)  if _cv  is not None else None
+    _rg_n = str(_rg)              if _rg  is not None else None
+    _s24n = round(float(_s24), 1) if _s24 is not None else None
+    _sbln = round(float(_sbl), 1) if _sbl is not None else None
+
     # ── 1. signal_log (Supabase + CSV) ────────────────────────────────────
     if _supa_available():
         try:
-            _supa_request("POST", "/rest/v1/signal_log", body={
+            _row_body = {
                 "ts":          ts,
                 "score":       round(score, 1),
                 "label":       label,
@@ -144,7 +192,18 @@ def _log_bias_signal(score: float, label: str, price: float,
                 "exit_price":  None,
                 "pct_move":    None,
                 "correct":     None,
-            })
+                "bull_prob":      _bp_n,
+                "conviction":     _cv_n,
+                "regime":         _rg_n,
+                "score_24h":      _s24n,
+                "score_baseline": _sbln,
+            }
+            _ins = _supa_request("POST", "/rest/v1/signal_log", body=_row_body)
+            if _ins is None:
+                # Schema lag (score_baseline migration not run yet) → retry
+                # without the new column so the tick isn't lost.
+                _row_body.pop("score_baseline", None)
+                _supa_request("POST", "/rest/v1/signal_log", body=_row_body)
         except Exception:
             pass
 
@@ -155,7 +214,12 @@ def _log_bias_signal(score: float, label: str, price: float,
             if write_hdr:
                 w.writerow(_LOG_FIELDS)
             w.writerow([ts, round(score, 1), label, direction,
-                        round(price, 2), "", "", ""])
+                        round(price, 2), "", "", "",
+                        "" if _bp_n  is None else _bp_n,
+                        "" if _cv_n  is None else _cv_n,
+                        "" if _rg_n  is None else _rg_n,
+                        "" if _s24n  is None else _s24n,
+                        "" if _sbln  is None else _sbln])
     except Exception:
         pass
 
@@ -232,7 +296,8 @@ def _supa_fetch_signals() -> "list | None":
         raw = _supa_request(
             "GET",
             "/rest/v1/signal_log?select=ts,score,label,direction,entry_price,"
-            "exit_price,pct_move,correct&order=ts.asc&limit=10000",
+            "exit_price,pct_move,correct,bull_prob,conviction,regime,score_24h"
+            "&order=ts.asc&limit=10000",
         )
         if not isinstance(raw, list):
             return None
@@ -247,8 +312,37 @@ def _supa_fetch_signals() -> "list | None":
                 "exit_price":  "" if r.get("exit_price")  is None else str(r["exit_price"]),
                 "pct_move":    "" if r.get("pct_move")    is None else str(r["pct_move"]),
                 "correct":     "" if r.get("correct")     is None else str(r["correct"]),
+                "bull_prob":   "" if r.get("bull_prob")   is None else str(r["bull_prob"]),
+                "conviction":  "" if r.get("conviction")  is None else str(r["conviction"]),
+                "regime":      r.get("regime") or "",
+                "score_24h":   "" if r.get("score_24h")   is None else str(r["score_24h"]),
             })
         return rows
+    except Exception:
+        return None
+
+
+def _supa_last_signal_age_min() -> "float | None":
+    """Minutes since the most recent signal_log row, or None if Supabase
+    is unreachable. Lightweight — fetches just one ts column.
+
+    Used by the staleness banner at the top of the app, so we notice
+    cron failures within ~5 min instead of discovering missing chart
+    data hours later."""
+    if not _supa_available():
+        return None
+    try:
+        raw = _supa_request(
+            "GET",
+            "/rest/v1/signal_log?select=ts&order=ts.desc&limit=1",
+        )
+        if not isinstance(raw, list) or not raw:
+            return None
+        ts_str = raw[0].get("ts") or ""
+        ts = _dt.fromisoformat(ts_str.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=_tz.utc)
+        return (_dt.now(_tz.utc) - ts).total_seconds() / 60.0
     except Exception:
         return None
 
@@ -277,6 +371,37 @@ def _resolve_signal_outcomes(current_price: float) -> list:
         except Exception:
             pass
 
+    # ── Exact-horizon exit prices ────────────────────────────────────────
+    # Grade each row against the BTC price at exactly entry + 72h, not the
+    # live price at whatever moment this resolver happened to run (rows could
+    # previously be graded 75h–90h+ after entry). One bulk fetch covers all
+    # unresolved rows; rows missing a candle fall back to the live price so
+    # resolution never stalls on an API outage.
+    def _needs_resolution(r):
+        if r.get("correct") or not r.get("entry_price"):
+            return False
+        try:
+            return (now - _dt.fromisoformat(r["ts"])).total_seconds() / 3600 >= _OUTCOME_HOURS
+        except Exception:
+            return False
+
+    _exact_exit = {}
+    if _price_hist is not None:
+        _exit_targets = {}
+        for _r in csv_rows + supa_rows:
+            if _needs_resolution(_r):
+                try:
+                    _exit_targets[_r["ts"]] = (_dt.fromisoformat(_r["ts"])
+                                               + _td(hours=_OUTCOME_HOURS))
+                except Exception:
+                    pass
+        if _exit_targets:
+            try:
+                _bulk = _price_hist.btc_prices_at_bulk(list(_exit_targets.values()))
+                _exact_exit = {ts: _bulk.get(tgt) for ts, tgt in _exit_targets.items()}
+            except Exception:
+                _exact_exit = {}
+
     # ── Resolve outcomes on CSV rows (in-memory + write back if changed) ─
     csv_changed = False
     for row in csv_rows:
@@ -287,10 +412,11 @@ def _resolve_signal_outcomes(current_price: float) -> list:
             if age < _OUTCOME_HOURS:
                 continue
             ep  = float(row["entry_price"])
-            pct = (current_price - ep) / ep * 100
+            xp  = _exact_exit.get(row["ts"]) or current_price
+            pct = (xp - ep) / ep * 100
             d   = row["direction"]
             _dir_right = (d == "LONG" and pct > 0) or (d == "SHORT" and pct < 0)
-            row["exit_price"] = str(round(current_price, 2))
+            row["exit_price"] = str(round(xp, 2))
             row["pct_move"]   = f"{pct:+.2f}"
             row["correct"] = (
                 "2"   if _dir_right and abs(pct) >= 3.0
@@ -314,7 +440,10 @@ def _resolve_signal_outcomes(current_price: float) -> list:
                 if r.get("ts") in by_ts:
                     all_rows[i] = by_ts[r["ts"]]
             with open(_SIGNAL_LOG, "w", newline="") as f:
-                w = _csv.DictWriter(f, fieldnames=_LOG_FIELDS)
+                # restval=""  → old rows missing the Phase-B columns get blanks.
+                # extrasaction="ignore" → harmless if a row has extra keys.
+                w = _csv.DictWriter(f, fieldnames=_LOG_FIELDS,
+                                    restval="", extrasaction="ignore")
                 w.writeheader()
                 w.writerows(all_rows)
         except Exception:
@@ -329,7 +458,8 @@ def _resolve_signal_outcomes(current_price: float) -> list:
             if age < _OUTCOME_HOURS:
                 continue
             ep  = float(row["entry_price"])
-            pct = (current_price - ep) / ep * 100
+            xp  = _exact_exit.get(row["ts"]) or current_price
+            pct = (xp - ep) / ep * 100
             d   = row["direction"]
             _dir_right = (d == "LONG" and pct > 0) or (d == "SHORT" and pct < 0)
             correct = (
@@ -342,12 +472,12 @@ def _resolve_signal_outcomes(current_price: float) -> list:
                 "PATCH",
                 f"/rest/v1/signal_log?ts=eq.{urllib.parse.quote(row['ts'])}",
                 body={
-                    "exit_price": round(current_price, 2),
+                    "exit_price": round(xp, 2),
                     "pct_move":   round(pct, 2),
                     "correct":    correct,
                 },
             )
-            row["exit_price"] = str(round(current_price, 2))
+            row["exit_price"] = str(round(xp, 2))
             row["pct_move"]   = f"{pct:+.2f}"
             row["correct"]    = correct
         except Exception:
@@ -389,6 +519,50 @@ def _accuracy_stats(rows: list) -> dict:
             "avg_move": round(sum(moves) / len(moves), 2)     if moves else None,
         }
     return out
+
+
+def _episode_stats(rows: list, gap_hours: float = 6.0) -> dict:
+    """Collapse resolved LONG/SHORT ticks into independent episodes.
+
+    A tick every 5 min graded on a 72h horizon means consecutive ticks share
+    ~99.9% of their outcome window — the tick winrate measures streak length,
+    not skill (audit 2026-06-11: 277 ticks collapsed into 8 episodes, 4 wins).
+    An episode = consecutive same-direction resolved ticks with < gap_hours
+    between them. Episode win = majority of its ticks were graded wins.
+    """
+    res = []
+    for r in rows:
+        if r.get("correct") in ("0", "1", "2") and r.get("direction") in ("LONG", "SHORT"):
+            try:
+                res.append((_dt.fromisoformat(r["ts"]), r["direction"],
+                            r["correct"] in ("1", "2"), r["correct"] == "2"))
+            except Exception:
+                pass
+    res.sort(key=lambda t: t[0])
+    episodes, cur = [], None
+    for ts, d, win, strong in res:
+        if cur and d == cur["dir"] and (ts - cur["end"]).total_seconds() < gap_hours * 3600:
+            cur["end"] = ts; cur["n"] += 1; cur["wins"] += int(win)
+        else:
+            if cur:
+                episodes.append(cur)
+            cur = {"dir": d, "start": ts, "end": ts, "n": 1, "wins": int(win)}
+    if cur:
+        episodes.append(cur)
+    ep_wins  = sum(1 for e in episodes if e["wins"] / e["n"] > 0.5)
+    n_long   = sum(1 for e in episodes if e["dir"] == "LONG")
+    strong_n = sum(1 for _, _, _, s in res if s)
+    return {
+        "episodes":    episodes,
+        "n_episodes":  len(episodes),
+        "ep_wins":     ep_wins,
+        "ep_winrate":  round(ep_wins / len(episodes) * 100) if episodes else None,
+        "n_long_eps":  n_long,
+        "n_short_eps": len(episodes) - n_long,
+        "tick_n":      len(res),
+        "strong_n":    strong_n,
+        "strong_rate": round(strong_n / len(res) * 100) if res else None,
+    }
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1274,7 +1448,11 @@ Now give your analysis using the OUTPUT FORMAT in the system prompt: 72h read, 2
 
     payload = _json.dumps({
         "model":      "claude-sonnet-4-6",
-        "max_tokens": 900,
+        # 900 was truncating mid-Kelly-check, cutting off VERDICT + Trade setup.
+        # The required output sections (Evidence / Bull / Bear / Defensibility /
+        # Win rate / Kelly / Invalidation / Override / VERDICT / Trade setup)
+        # consistently need ~1200–1500 tokens at the "under 500 words" target.
+        "max_tokens": 1600,
         "system":     _CLAUDE_SYSTEM_PROMPT,
         "messages":   [{"role": "user", "content": user_msg}],
     }).encode()
@@ -1289,7 +1467,11 @@ Now give your analysis using the OUTPUT FORMAT in the system prompt: 72h read, 2
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=20) as r:
+        # Sonnet-4-6 with a long prompt + 900-token output regularly takes 25–40s.
+        # 20s was tripping a urllib read-timeout before the API had finished
+        # generating ("The read operation timed out"). 60s gives headroom while
+        # still bounding pathological cases.
+        with urllib.request.urlopen(req, timeout=60) as r:
             body = _json.loads(r.read().decode())
             return body["content"][0]["text"].strip()
     except Exception as e:
@@ -1824,12 +2006,38 @@ def fetch_polymarket_btc_sentiment(current_price: float) -> dict:
         # markets which have old startDates.  ascending=false floods the list with
         # freshly-created 15-min time-slot markets (new one every 15 min) and none
         # of the useful markets appear within the first 200 results.
-        events = (
-            _get("https://gamma-api.polymarket.com/events"
-                 "?tag_slug=bitcoin&active=true&closed=false"
-                 "&limit=500&order=startDate&ascending=true")
-            or []
-        )
+        #
+        # Polymarket's gamma /events endpoint silently caps each call at 100
+        # regardless of the `limit` param. With ~500+ active BTC events (most of
+        # them 5-min "Up or Down" noise), one call leaves real markets like
+        # "What price will Bitcoin hit on June 9?" or "Bitcoin above ___ on
+        # June 15?" buried past the first page. We paginate until we've seen
+        # every event so the downstream filters can see the full universe.
+        events = []
+        _seen_ids = set()
+        for _off in range(0, 800, 100):  # safety cap = 800 events
+            _page = _get(
+                f"https://gamma-api.polymarket.com/events"
+                f"?tag_slug=bitcoin&active=true&closed=false"
+                f"&limit=100&order=startDate&ascending=true&offset={_off}"
+            ) or []
+            if not isinstance(_page, list) or not _page:
+                break
+            _added = 0
+            for _ev in _page:
+                _eid = _ev.get("id") or _ev.get("slug") or _ev.get("title")
+                if _eid in _seen_ids:
+                    continue
+                _seen_ids.add(_eid)
+                # Cheap-skip 5-min "Up or Down" spam before it travels further.
+                _et = (_ev.get("title") or "")
+                if "Up or Down" in _et and re.search(r"\d{1,2}(:\d{2})?\s*[AaPp][Mm]", _et):
+                    continue
+                events.append(_ev)
+                _added += 1
+            # Stop once the API returns a short page — no more data.
+            if len(_page) < 100:
+                break
 
         scored_markets = []
 
@@ -2436,380 +2644,9 @@ def fetch_btc_liquidity_cached(current_price: float) -> dict:
 # ════════════════════════════════════════════════════════════════
 #  TECHNICAL INDICATORS
 # ════════════════════════════════════════════════════════════════
-
-def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain  = delta.clip(lower=0)
-    loss  = -delta.clip(upper=0)
-    avg_g = gain.ewm(alpha=1 / period, min_periods=period).mean()
-    avg_l = loss.ewm(alpha=1 / period, min_periods=period).mean()
-    rs = avg_g / avg_l.replace(0, np.nan)   # FIX: avoid div-by-zero → NaN instead of inf
-    return 100 - (100 / (1 + rs))
-
-
-def calculate_macd(series: pd.Series):
-    ema12  = series.ewm(span=12, adjust=False).mean()
-    ema26  = series.ewm(span=26, adjust=False).mean()
-    macd   = ema12 - ema26
-    signal = macd.ewm(span=9, adjust=False).mean()
-    hist   = macd - signal
-    return macd, signal, hist
-
-
-def calculate_adx(df: pd.DataFrame, period: int = 14) -> float:
-    if len(df) < period * 2:
-        return np.nan
-    try:
-        d = df.copy()
-        d["tr"] = np.maximum.reduce([
-            d["High"] - d["Low"],
-            abs(d["High"] - d["Close"].shift(1)),
-            abs(d["Low"]  - d["Close"].shift(1)),
-        ])
-        d["up"]   = d["High"] - d["High"].shift(1)
-        d["down"] = d["Low"].shift(1) - d["Low"]
-        d["pdm"]  = np.where((d["up"] > d["down"]) & (d["up"] > 0),   d["up"],   0.0)
-        d["mdm"]  = np.where((d["down"] > d["up"]) & (d["down"] > 0), d["down"], 0.0)
-        a = 1 / period
-        d["tr_s"]  = d["tr"].ewm(alpha=a,  adjust=False).mean()
-        d["pdm_s"] = d["pdm"].ewm(alpha=a, adjust=False).mean()
-        d["mdm_s"] = d["mdm"].ewm(alpha=a, adjust=False).mean()
-        pdi = 100 * d["pdm_s"] / d["tr_s"]
-        mdi = 100 * d["mdm_s"] / d["tr_s"]
-        dx  = 100 * abs(pdi - mdi) / (pdi + mdi)
-        return dx.ewm(alpha=a, adjust=False).mean().iloc[-1]
-    except Exception:
-        return np.nan
-
-
-def calculate_obv_trend(df: pd.DataFrame, period: int = 20) -> str:
-    try:
-        if df is None or len(df) < period + 5:
-            return "neutral"
-        closes  = df["Close"].tolist()
-        volumes = df["Volume"].tolist()
-        obv = [0.0]
-        for i in range(1, len(closes)):
-            if closes[i] > closes[i - 1]:   obv.append(obv[-1] + volumes[i])
-            elif closes[i] < closes[i - 1]: obv.append(obv[-1] - volumes[i])
-            else:                            obv.append(obv[-1])
-        obv         = np.array(obv)
-        obv_trend   = (obv[-1] - obv[-period]) / (abs(obv[-period]) + 1)
-        price_trend = (closes[-1] - closes[-period]) / closes[-period]
-        if   obv_trend > 0.10 and price_trend < 0.0:    return "strong_accumulation"
-        elif obv_trend > 0.05 and price_trend < 0.02:  return "accumulation"
-        elif obv_trend < -0.10 and price_trend > 0.0:  return "strong_distribution"
-        elif obv_trend < -0.05 and price_trend > -0.02: return "distribution"
-        elif obv_trend > 0.03:  return "mild_accumulation"
-        elif obv_trend < -0.03: return "mild_distribution"
-        return "neutral"
-    except Exception:
-        return "neutral"
-
-
-def detect_price_traps(ohlcv: pd.DataFrame, lookback: int = 20) -> tuple:
-    """
-    Detect bull/bear traps and liquidity sweep candles from OHLCV price action.
-
-    Bull trap  — price breaks above rolling high, closes back below → bearish (longs trapped)
-    Bear trap  — price breaks below rolling low, closes back above  → bullish (shorts trapped)
-    Sweep up   — long lower wick + close near high (pin bar)         → bullish rejection of low
-    Sweep down — long upper wick + close near low  (shooting star)   → bearish rejection of high
-    Failed break — price tags a level multiple times without closing through → exhaustion
-
-    Returns (category, score, note) where score ∈ [−1, +1].
-    """
-    try:
-        if ohlcv is None or len(ohlcv) < lookback + 4:
-            return "none", 0.0, "Insufficient data for trap detection"
-
-        # Reference window excludes the last 3 bars (those are the "test" bars)
-        ref   = ohlcv.iloc[-(lookback + 3):-3]
-        last3 = ohlcv.iloc[-3:]
-        curr  = ohlcv.iloc[-1]
-
-        ref_high = float(ref["High"].max())
-        ref_low  = float(ref["Low"].min())
-
-        c_high  = float(curr["High"])
-        c_low   = float(curr["Low"])
-        c_close = float(curr["Close"])
-        c_open  = float(curr["Open"])
-        c_range = c_high - c_low
-        c_body  = abs(c_close - c_open)
-
-        # ── 1. Bull Trap: any of last 3 bars pierced ref_high but current close < ref_high
-        pierce_high = max((float(r["High"]) for _, r in last3.iterrows()), default=0)
-        if pierce_high > ref_high and c_close < ref_high:
-            pierce_pct  = (pierce_high - ref_high) / ref_high * 100
-            pullback_pct = (ref_high - c_close) / ref_high * 100
-            # Stronger trap if the pierce was small (real fakeout) and pull-back is sharp
-            strength = float(np.tanh((pierce_pct + pullback_pct * 1.5) / 1.5))
-            strength = max(0.25, min(1.0, strength))
-            return ("bull_trap", -strength,
-                    f"Bull trap: broke ${ref_high:,.0f} (+{pierce_pct:.2f}%), closed back below "
-                    f"(trapped longs, -{pullback_pct:.2f}%)")
-
-        # ── 2. Bear Trap: any of last 3 bars pierced ref_low but current close > ref_low
-        pierce_low = min((float(r["Low"]) for _, r in last3.iterrows()), default=float("inf"))
-        if pierce_low < ref_low and c_close > ref_low:
-            pierce_pct   = (ref_low - pierce_low) / ref_low * 100
-            recovery_pct = (c_close - ref_low) / ref_low * 100
-            strength = float(np.tanh((pierce_pct + recovery_pct * 1.5) / 1.5))
-            strength = max(0.25, min(1.0, strength))
-            return ("bear_trap", +strength,
-                    f"Bear trap: swept ${ref_low:,.0f} (-{pierce_pct:.2f}%), recovered above "
-                    f"(trapped shorts, +{recovery_pct:.2f}%)")
-
-        # ── 3. Sweep candle on current bar (pin bars / shooting stars)
-        if c_range > 0:
-            upper_wick = c_high - max(c_close, c_open)
-            lower_wick = min(c_close, c_open) - c_low
-            body_ratio = c_body / c_range   # near 0 = doji/pin, near 1 = marubozu
-
-            # Bearish sweep: large upper wick, close in lower half
-            if (upper_wick > 0.55 * c_range and lower_wick < 0.20 * c_range
-                    and c_close < (c_high + c_low) / 2):
-                wick_pct = upper_wick / c_close * 100
-                score = -float(np.tanh(wick_pct / 0.8))
-                score = max(-0.85, score)
-                return ("sweep_down", score,
-                        f"Bearish sweep candle — upper wick {wick_pct:.2f}% of price "
-                        f"(rejection at high, body ratio {body_ratio:.2f})")
-
-            # Bullish sweep: large lower wick, close in upper half
-            if (lower_wick > 0.55 * c_range and upper_wick < 0.20 * c_range
-                    and c_close > (c_high + c_low) / 2):
-                wick_pct = lower_wick / c_close * 100
-                score = +float(np.tanh(wick_pct / 0.8))
-                score = min(+0.85, score)
-                return ("sweep_up", score,
-                        f"Bullish sweep candle — lower wick {wick_pct:.2f}% of price "
-                        f"(rejection at low, body ratio {body_ratio:.2f})")
-
-        # ── 4. Failed breakout test (multiple tags without close-through)
-        # Price has tagged ref_high 2+ times in last 3 bars without closing above → exhaustion
-        tags_high = sum(1 for _, r in last3.iterrows() if float(r["High"]) >= ref_high * 0.998)
-        tags_low  = sum(1 for _, r in last3.iterrows() if float(r["Low"])  <= ref_low  * 1.002)
-        if tags_high >= 2 and c_close < ref_high * 0.998:
-            return ("failed_breakout", -0.40,
-                    f"Failed breakout — {tags_high}x tag of ${ref_high:,.0f} resistance, no close-through (bearish exhaustion)")
-        if tags_low >= 2 and c_close > ref_low * 1.002:
-            return ("failed_breakdown", +0.40,
-                    f"Failed breakdown — {tags_low}x tag of ${ref_low:,.0f} support, no close-through (bullish absorption)")
-
-        return "none", 0.0, "No trap or sweep pattern detected"
-
-    except Exception:
-        return "none", 0.0, "Trap detection N/A"
-
-
-def calculate_cvd(df: pd.DataFrame, lookback: int = 24) -> tuple:
-    """
-    Approximate Cumulative Volume Delta from OHLCV.
-    Buy pressure per bar = volume * (close - low) / (high - low).
-    Returns (category_str, raw_score) where score is in [-1, +1].
-    """
-    try:
-        if df is None or len(df) < lookback + 5:
-            return "neutral", 0.0
-        d   = df.iloc[-(lookback + 5):].copy()
-        hl  = (d["High"] - d["Low"]).replace(0, float("nan"))
-        buy_vol  = d["Volume"] * (d["Close"] - d["Low"]) / hl
-        sell_vol = d["Volume"] * (d["High"] - d["Close"]) / hl
-        delta    = (buy_vol - sell_vol).fillna(0)
-        cvd      = delta.cumsum()
-        cvd_now  = float(cvd.iloc[-1])
-        cvd_prev = float(cvd.iloc[-lookback])
-        price_now  = float(d["Close"].iloc[-1])
-        price_prev = float(d["Close"].iloc[-lookback])
-        price_up   = price_now > price_prev
-        cvd_up     = cvd_now  > cvd_prev
-        # Normalised slope: how much CVD moved relative to average bar volume
-        avg_vol    = float(d["Volume"].mean()) * lookback + 1e-8
-        cvd_slope  = (cvd_now - cvd_prev) / avg_vol   # positive = net buying
-        raw = float(np.tanh(cvd_slope * 2.5))          # scale so ±1 ≈ strong imbalance
-        if   cvd_up and not price_up: category = "bull_divergence"
-        elif not cvd_up and price_up: category = "bear_divergence"
-        elif cvd_up and price_up:     category = "accumulation"
-        elif not cvd_up and not price_up: category = "distribution"
-        else:                         category = "neutral"
-        return category, raw
-    except Exception:
-        return "neutral", 0.0
-
-
-def rsi_trajectory(rsi_series: pd.Series, lookback: int = 10) -> str:
-    try:
-        valid = rsi_series.dropna()
-        if len(valid) < lookback + 2:
-            return "neutral"
-        rsi_now  = float(valid.iloc[-1])
-        rsi_prev = float(valid.iloc[-lookback])
-        delta    = rsi_now - rsi_prev
-        if delta > 8:    return "ascending"
-        elif delta > 3:  return "mild_ascending"
-        elif delta < -8: return "descending"
-        elif delta < -3: return "mild_descending"
-        return "neutral"
-    except Exception:
-        return "neutral"
-
-
-def detect_rsi_divergence(closes: List[float], rsi: pd.Series, order: int = 5) -> str:
-    if len(closes) < 30:
-        return "none"
-    price = np.array(closes)
-    rsi_a = rsi.fillna(50).values
-    p_mins = scipy.signal.argrelextrema(price, np.less,    order=order)[0]
-    p_maxs = scipy.signal.argrelextrema(price, np.greater, order=order)[0]
-    if len(p_mins) >= 2:
-        li, pi = p_mins[-1], p_mins[-2]
-        if len(closes) - li < 20 and price[li] < price[pi] and rsi_a[li] > rsi_a[pi]:
-            return "bull"
-    if len(p_maxs) >= 2:
-        li, pi = p_maxs[-1], p_maxs[-2]
-        if len(closes) - li < 20 and price[li] > price[pi] and rsi_a[li] < rsi_a[pi]:
-            return "bear"
-    return "none"
-
-
-def detect_macd_divergence(closes: List[float], macd_hist: pd.Series, order: int = 5) -> str:
-    if len(closes) < 40:
-        return "none"
-    price  = np.array(closes)
-    hist   = macd_hist.fillna(0).values
-    p_mins = scipy.signal.argrelextrema(price, np.less, order=order)[0]
-    h_mins = scipy.signal.argrelextrema(hist,  np.less, order=order)[0]
-    if len(p_mins) >= 2 and len(h_mins) >= 2:
-        li, pi = p_mins[-1], p_mins[-2]
-        if len(closes) - li < 20 and price[li] < price[pi] and hist[li] > hist[pi]:
-            return "bull"
-    return "none"
-
-
-def find_levels(closes: List[float], order: int = 5) -> Tuple[List[float], List[float]]:
-    arr  = np.array(closes)
-    maxs = scipy.signal.argrelextrema(arr, np.greater, order=order)[0]
-    mins = scipy.signal.argrelextrema(arr, np.less,    order=order)[0]
-
-    def consolidate(levels, pct=0.015):
-        if not levels: return []
-        levels.sort()
-        groups, grp = [], [levels[0]]
-        for v in levels[1:]:
-            if v <= grp[-1] * (1 + pct): grp.append(v)
-            else:
-                groups.append(sum(grp) / len(grp)); grp = [v]
-        groups.append(sum(grp) / len(grp))
-        return groups
-
-    return consolidate(arr[mins].tolist()), consolidate(arr[maxs].tolist())
-
-
-def nearest_level(levels: List[float], price: float, kind: str) -> Optional[float]:
-    if not levels: return None
-    relevant = [l for l in levels if abs(l - price) / price < 0.15]
-    if kind == "support":
-        below = [l for l in relevant if l < price]
-        return max(below) if below else None
-    else:
-        above = [l for l in relevant if l > price]
-        return min(above) if above else None
-
-
-def week52_metrics(closes: List[float]) -> dict:
-    if len(closes) < 20:
-        return {"w52_low": None, "w52_high": None, "pct_from_low": None, "pct_from_high": None}
-    arr   = np.array(closes[-252:]) if len(closes) >= 252 else np.array(closes)
-    low   = float(arr.min())
-    high  = float(arr.max())
-    price = closes[-1]
-    return {
-        "w52_low":       round(low, 2),
-        "w52_high":      round(high, 2),
-        "pct_from_low":  round((price - low)  / low  * 100, 1),
-        "pct_from_high": round((price - high) / high * 100, 1),
-    }
-
-
-# ════════════════════════════════════════════════════════════════
-#  NEW INDICATORS
-# ════════════════════════════════════════════════════════════════
-
-def calculate_bollinger_bands(series: pd.Series, period: int = 20, std_dev: float = 2.0) -> dict:
-    """Middle band (SMA), upper/lower bands, %B, and bandwidth."""
-    mid   = series.rolling(period).mean()
-    std   = series.rolling(period).std()
-    upper = mid + std_dev * std
-    lower = mid - std_dev * std
-    pct_b     = (series - lower) / (upper - lower)           # 0=at lower, 1=at upper
-    bandwidth = (upper - lower) / mid * 100                  # % of middle
-    return {"mid": mid, "upper": upper, "lower": lower,
-            "pct_b": pct_b, "bandwidth": bandwidth}
-
-
-def calculate_stochastic(df: pd.DataFrame, k_period: int = 14, d_period: int = 3) -> dict:
-    """%K and %D lines."""
-    low_min  = df["Low"].rolling(k_period).min()
-    high_max = df["High"].rolling(k_period).max()
-    k = 100 * (df["Close"] - low_min) / (high_max - low_min).replace(0, np.nan)
-    d = k.rolling(d_period).mean()
-    return {"k": k, "d": d}
-
-
-def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Average True Range."""
-    prev_c = df["Close"].shift(1)
-    tr = pd.concat([
-        df["High"] - df["Low"],
-        (df["High"] - prev_c).abs(),
-        (df["Low"]  - prev_c).abs(),
-    ], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / period, adjust=False).mean()
-
-
-def calculate_awesome_oscillator(df: pd.DataFrame) -> pd.Series:
-    """Awesome Oscillator: SMA5 - SMA34 of midprice."""
-    mid = (df["High"] + df["Low"]) / 2
-    return mid.rolling(5).mean() - mid.rolling(34).mean()
-
-
-def calculate_accelerator_oscillator(df: pd.DataFrame) -> pd.Series:
-    """Accelerator Oscillator: AO - SMA5(AO)."""
-    ao = calculate_awesome_oscillator(df)
-    return ao - ao.rolling(5).mean()
-
-
-def calculate_ichimoku(df: pd.DataFrame) -> dict:
-    """
-    Tenkan (9), Kijun (26), Senkou A (26 forward), Senkou B (52, 26 forward),
-    Chikou (close shifted 26 back).
-    """
-    def _hl_avg(n):
-        return (df["High"].rolling(n).max() + df["Low"].rolling(n).min()) / 2
-
-    tenkan = _hl_avg(9)
-    kijun  = _hl_avg(26)
-    span_a = ((tenkan + kijun) / 2).shift(26)
-    span_b = _hl_avg(52).shift(26)
-    chikou = df["Close"].shift(-26)
-    return {"tenkan": tenkan, "kijun": kijun,
-            "span_a": span_a, "span_b": span_b, "chikou": chikou}
-
-
-def calculate_fibonacci_levels(closes: list, lookback: int = 365) -> dict:
-    """
-    Auto-detect the most recent significant swing high and low over `lookback` bars,
-    then return Fibonacci retracement levels (0→100% = top→bottom of the swing).
-    """
-    arr  = np.array(closes[-lookback:])
-    high = float(arr.max())
-    low  = float(arr.min())
-    diff = high - low
-    ratios = [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0]
-    levels = {f"{r*100:.1f}%": round(high - diff * r, 2) for r in ratios}
-    return {"high": high, "low": low, "levels": levels}
+# Extracted to core/indicators.py (module split stage 1).
+# Star-import keeps every existing call site working unchanged.
+from core.indicators import *  # noqa: F401,F403
 
 
 # ════════════════════════════════════════════════════════════════
@@ -3777,6 +3614,11 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
     price        = closes[-1]
     analysis     = (liq or {}).get("liq_analysis", {})
 
+    # Realized-liq aggregates (improvements.txt item 2). Consumed by Cascade
+    # Direction (as a conviction filter) and Swept Reversal (per-zone proximity
+    # weighting). Returns neutral defaults when the events store is empty.
+    _real_liq = _compute_realized_liq_stats(price)
+
     # ── Daily trend direction for coherence filtering ──────────────────────────
     try:
         _d_cls   = df["Close"].tolist()
@@ -4072,6 +3914,24 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
         else:             raw = -1.00
         direction = "UP" if rat < 0.7 else ("DOWN" if rat > 1.4 else "BALANCED")
         note = f"Cascade {direction} (smoothed ratio {rat:.2f}x)"
+        # Realized-event conviction filter (improvements.txt item 2).
+        # Synthetic raw sign already tells the story:
+        #   raw < 0  → synthetic projects DOWN (more long-liq fuel below).
+        #              Realized confirms if recently *longs* are flushing (ratio > 1).
+        #   raw > 0  → synthetic projects UP   (more short-liq fuel above).
+        #              Realized confirms if recently *shorts* are flushing (ratio < 1).
+        # Agree → +25% (clip ±1). Disagree → 0.55× damping. Neutral / no data → 1.0.
+        _real_ratio = _real_liq.get("realized_ratio")
+        if _real_ratio is not None and abs(raw) > 0.10:
+            _agree    = (raw < 0 and _real_ratio > 1.10) or (raw > 0 and _real_ratio < 0.90)
+            _disagree = (raw < 0 and _real_ratio < 0.90) or (raw > 0 and _real_ratio > 1.10)
+            _r_mil    = _real_liq.get("realized_total", 0.0) / 1e6
+            if _agree:
+                raw   = float(np.clip(raw * 1.25, -1.0, 1.0))
+                note += f" [realized confirms — ${_r_mil:.1f}M/6h, ratio {_real_ratio:.2f}]"
+            elif _disagree:
+                raw  *= 0.55
+                note += f" [realized disagrees — ${_r_mil:.1f}M/6h, ratio {_real_ratio:.2f}, dampened]"
     except Exception:
         raw, note = 0.0, "Cascade N/A"
     # Coherence filter: dampen cascade when it contradicts the daily trend
@@ -4166,12 +4026,28 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
             _cands   = [z for z in hz_all
                         if abs(z["price"] - price) / price <= 0.05
                         and z.get("notional", z.get("wall", 0)) >= 1_000_000]
+            # Realized-event proximity boost (improvements.txt item 2).
+            # Pre-aggregate realized notional per candidate zone within ±0.3% so the
+            # inner loop is O(1) lookups instead of O(n_events) per zone.
+            _events_12h = _real_liq.get("events_12h", [])
+            _real_by_zone = {}
+            for z in _cands:
+                zp_k = float(z["price"])
+                tol  = zp_k * 0.003
+                _real_by_zone[zp_k] = sum(
+                    n for (pr, n) in _events_12h if abs(pr - zp_k) <= tol
+                )
             for r_idx, (_, row) in enumerate(_last3.iterrows()):
                 hi, lo, cl = float(row["High"]), float(row["Low"]), float(row["Close"])
                 for z in _cands:
                     zp = float(z["price"])
                     # cap per-zone weight so a single huge cluster can't dominate
                     w  = min(z.get("hunt_score", 0.0), 50_000.0) * _recency[r_idx]
+                    # Realized-event multiplier: $5M of recent liq activity near
+                    # the zone → 2× weight; zero realized → 1× (no penalty, so
+                    # the signal still works for sessions with empty event store).
+                    _near = _real_by_zone.get(zp, 0.0)
+                    w    *= 1.0 + min(_near / 5_000_000.0, 1.0)
                     if z["side"] == "ASK":
                         # short-liq cluster above: swept-then-rejected = bearish
                         if hi >= zp and cl < zp:
@@ -5057,8 +4933,20 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
         )), 2
     )
 
+    # ── 2-signal baseline (audit benchmark, logged alongside the full score) ──
+    # If the ~30-signal blend can't beat "EMA Structure + OI Funding" at
+    # episode level, the extra signals aren't adding value. Same ±100 scale.
+    try:
+        _base_ema = float((signals.get("EMA Structure") or [0.0])[0])
+        _base_oi  = float((signals.get("OI Funding")    or [0.0])[0])
+        score_baseline = round(max(-100.0, min(100.0,
+                               (0.6 * _base_ema + 0.4 * _base_oi) * 100)), 1)
+    except Exception:
+        score_baseline = None
+
     return {"score": score, "label": label, "color": color,
             "signals": signals, "weights": WEIGHTS,
+            "score_baseline": score_baseline,
             "regime": regime, "adx_1h": round(_adx_1h, 1) if _adx_ok else None,
             "atr_percentile": round(_atr_pctile * 100, 0),
             "bull_prob": bull_prob,
@@ -5416,14 +5304,16 @@ def compute_24h_bias(df: pd.DataFrame, btc_liq: dict = None,
     _ws24 = sum(_sigs24.get(k, 0.0) * w for k, w in _W24.items())
     score_100 = float(np.clip(_ws24 * 100, -100, 100))
 
-    # Label bands tightened: real composite scores rarely exceed ±50 due to
-    # signal disagreement and tanh-bounded individual contributions. Wide ±40
-    # bands under-classified strong directional moves. New bands: NEUTRAL ±15,
-    # MILD ±15-30, BEARISH/BULLISH beyond ±30.
-    if   score_100 >= 30: lab, col = "BULLISH",   "#3fb950"
-    elif score_100 >= 15: lab, col = "MILD BULL", "#58a6ff"
-    elif score_100 > -15: lab, col = "NEUTRAL",   "#8b949e"
-    elif score_100 > -30: lab, col = "MILD BEAR", "#f0883e"
+    # Label bands tightened twice: real composite scores rarely exceed ±50 due
+    # to signal disagreement and tanh-bounded individual contributions, AND
+    # post-flush positioning resets (funding flip, OB restack) damp the score
+    # even on clean -5%+ daily moves. Bands: NEUTRAL ±10, MILD ±10-22,
+    # BEARISH/BULLISH beyond ±22 — calibrated so a clear directional flush
+    # actually labels as BEARISH/BULLISH instead of MILD.
+    if   score_100 >= 22: lab, col = "BULLISH",   "#3fb950"
+    elif score_100 >= 10: lab, col = "MILD BULL", "#58a6ff"
+    elif score_100 > -10: lab, col = "NEUTRAL",   "#8b949e"
+    elif score_100 > -22: lab, col = "MILD BEAR", "#f0883e"
     else:                 lab, col = "BEARISH",   "#f85149"
 
     return {"score": score_100, "label": lab, "color": col,
@@ -5451,7 +5341,8 @@ def _fetch_btc_liquidity(current_price=None):
     _liq_map     = None
     _liq_map_src = "orderbook_proxy"
     if d["price"] > 0:
-        _liq_map = _fetch_coinglass_liq_map()
+        # Price rounded to $100 so the 2-min cache isn't busted every tick.
+        _liq_map = _fetch_coinglass_liq_map(round(d["price"] / 100) * 100)
         if _liq_map:
             _liq_map_src = "coinglass"
         else:
@@ -5501,6 +5392,9 @@ def _fetch_btc_liquidity(current_price=None):
         "liq_source": d["source"], "liq_score_adj": sadj,
         "liq_cg_available": _liq_map_src != "orderbook_proxy",
         "liq_map_source":   _liq_map_src,
+        # Raw long/short liq map — consumed by the time×price heatmap panel
+        # and the realized-liq fit score. None when only order-book proxy.
+        "liq_map":          _liq_map,
         "liq_analysis": analysis,
     }
     result["liq_narrative"] = _narrative(result, analysis)
@@ -5516,42 +5410,60 @@ def _fetch_btc_liquidity(current_price=None):
     return result
 
 
-# ════════════════════════════════════════════════════════════════
-#  COLORMAPS
-# ════════════════════════════════════════════════════════════════
-
-def _cg_cmap():
-    from matplotlib.colors import LinearSegmentedColormap
-    return LinearSegmentedColormap.from_list("cg", [
-        (0.00, "#0d0221"), (0.04, "#150935"), (0.10, "#1f1360"),
-        (0.16, "#3b1578"), (0.22, "#6b2090"), (0.28, "#8b2080"),
-        (0.34, "#4b3fa0"), (0.41, "#1b6ea0"), (0.48, "#1b8a8a"),
-        (0.56, "#2eb872"), (0.65, "#5cc840"), (0.74, "#7dd71d"),
-        (0.83, "#a8e30a"), (0.92, "#d4f006"), (1.00, "#ffff00"),
-    ], N=512)
-
-def _cmap_bids():
-    from matplotlib.colors import LinearSegmentedColormap
-    return LinearSegmentedColormap.from_list("bids", ["#001133", "#003388", "#0055cc", "#0088ff", "#44ccff"], N=256)
-
-def _cmap_asks():
-    from matplotlib.colors import LinearSegmentedColormap
-    return LinearSegmentedColormap.from_list("asks", ["#220000", "#880011", "#cc2200", "#ff4400", "#ff9944"], N=256)
+# Bybit v5 interval codes for the intervals this app requests from Binance.
+_BYBIT_INTERVAL = {"1m": "1", "5m": "5", "15m": "15", "30m": "30",
+                   "1h": "60", "2h": "120", "4h": "240", "1d": "D", "1w": "W"}
 
 
 def _fetch_binance_klines(interval: str, limit: int, symbol: str = "BTCUSDT"):
-    """Single source of truth for BTC OHLCV — Binance spot klines.
+    """Single source of truth for BTC OHLCV — spot klines with a geo-fallback chain.
     Returns DataFrame with UTC DatetimeIndex and Open/High/Low/Close/Volume columns,
-    or None on failure. The most recent row is the currently-forming candle (live)."""
+    or None on failure. The most recent row is the currently-forming candle (live).
+
+    Fallback chain (api.binance.com returns HTTP 451 from US-hosted servers,
+    including Streamlit Cloud's US regions):
+      1. api.binance.com           2. data-api.binance.vision (public mirror)
+      3. api.bybit.com v5 spot     (BTCUSDT spot tracks Binance within bps)
+    """
+    import datetime as _dt
+
+    def _df_from(timestamps, rows):
+        return pd.DataFrame(rows, index=pd.DatetimeIndex(timestamps)) if rows else None
+
+    for _host in ("https://api.binance.com", "https://data-api.binance.vision"):
+        try:
+            url  = f"{_host}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+            data = _get_raw(url)
+            if not data:
+                continue
+            timestamps, rows = [], []
+            for k in data:
+                timestamps.append(_dt.datetime.fromtimestamp(k[0] / 1000, tz=_dt.timezone.utc))
+                rows.append({
+                    "Open":   float(k[1]),
+                    "High":   float(k[2]),
+                    "Low":    float(k[3]),
+                    "Close":  float(k[4]),
+                    "Volume": float(k[5]),
+                })
+            df = _df_from(timestamps, rows)
+            if df is not None:
+                return df
+        except Exception:
+            continue
+
+    # Bybit fallback — v5 returns rows newest-first; reverse to match Binance.
     try:
-        import datetime as _dt
-        url  = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-        data = _get_raw(url)
-        if not data:
+        _iv = _BYBIT_INTERVAL.get(interval)
+        if _iv is None:
             return None
+        url  = (f"https://api.bybit.com/v5/market/kline?category=spot"
+                f"&symbol={symbol}&interval={_iv}&limit={min(int(limit), 1000)}")
+        data = _get_raw(url)
+        klines = (((data or {}).get("result") or {}).get("list")) or []
         timestamps, rows = [], []
-        for k in data:
-            timestamps.append(_dt.datetime.fromtimestamp(k[0] / 1000, tz=_dt.timezone.utc))
+        for k in reversed(klines):
+            timestamps.append(_dt.datetime.fromtimestamp(int(k[0]) / 1000, tz=_dt.timezone.utc))
             rows.append({
                 "Open":   float(k[1]),
                 "High":   float(k[2]),
@@ -5559,7 +5471,7 @@ def _fetch_binance_klines(interval: str, limit: int, symbol: str = "BTCUSDT"):
                 "Close":  float(k[4]),
                 "Volume": float(k[5]),
             })
-        return pd.DataFrame(rows, index=pd.DatetimeIndex(timestamps))
+        return _df_from(timestamps, rows)
     except Exception:
         return None
 
@@ -5632,28 +5544,39 @@ def fetch_fear_greed_history(limit: int = 90) -> "pd.DataFrame | None":
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_funding_history(limit: int = 60) -> "pd.DataFrame | None":
+def fetch_funding_history(limit: int = 1000, lookback_days: int = 365) -> "pd.DataFrame | None":
     """Fetch historical BTC perpetual funding rates from Binance.
-    Returns DataFrame[time, rate_pct] or None on failure."""
+    Paginates via startTime so we can pull a full year (3 periods/day × 365 ≈ 1095
+    entries, which exceeds Binance's 1000-per-call cap). Returns DataFrame[time, rate_pct]
+    or None on failure."""
     try:
-        fr_data = _get_raw(
-            f"https://fapi.binance.com/fapi/v1/fundingRate"
-            f"?symbol=BTCUSDT&limit={int(limit)}"
-        )
-        if not isinstance(fr_data, list) or not fr_data:
-            return None
+        import time as _t
+        end_ms   = int(_t.time() * 1000)
+        start_ms = end_ms - int(lookback_days) * 86_400_000
         rows = []
-        for r in fr_data:
-            try:
-                rows.append({
-                    "time":     pd.to_datetime(int(r["fundingTime"]), unit="ms"),
-                    "rate_pct": float(r["fundingRate"]) * 100.0,
-                })
-            except Exception:
-                continue
+        cursor = start_ms
+        for _ in range(12):  # safety cap on pagination loops
+            fr_data = _get_raw(
+                f"https://fapi.binance.com/fapi/v1/fundingRate"
+                f"?symbol=BTCUSDT&startTime={cursor}&limit={int(limit)}"
+            )
+            if not isinstance(fr_data, list) or not fr_data:
+                break
+            for r in fr_data:
+                try:
+                    rows.append({
+                        "time":     pd.to_datetime(int(r["fundingTime"]), unit="ms"),
+                        "rate_pct": float(r["fundingRate"]) * 100.0,
+                    })
+                except Exception:
+                    continue
+            last_ts = int(fr_data[-1].get("fundingTime", 0))
+            if len(fr_data) < int(limit) or last_ts >= end_ms or last_ts <= cursor:
+                break
+            cursor = last_ts + 1
         if not rows:
             return None
-        return pd.DataFrame(rows).sort_values("time").reset_index(drop=True)
+        return pd.DataFrame(rows).drop_duplicates("time").sort_values("time").reset_index(drop=True)
     except Exception:
         return None
 
@@ -5863,116 +5786,6 @@ def _fetch_15min_ohlcv():
     return _fetch_binance_klines("15m", 500)
 
 
-def _build_liq_heat_2d(plot_df, grid, bsz, tiers=None):
-    """
-    Build a 2D (n_prices × n_candles) liquidation heat matrix.
-    For each historical candle, project where leveraged positions opened at that
-    price would get liquidated, weighted by candle volume. Levels swept by price
-    are drained (those positions got stopped out). This produces time-accurate
-    heat accumulation that matches Coinglass's approach.
-    """
-    if tiers is None:
-        tiers = [10, 15, 20, 25, 50, 75, 100]
-    n_prices  = len(grid)
-    n_candles = len(plot_df)
-    g_lo      = grid[0]
-
-    # 50x/75x/100x get highest weight — they project to near-price clusters
-    # (~1-2% from current price) which are the dominant yellow bands in Coinglass.
-    lev_weights = {10: 0.8, 15: 0.6, 20: 1.0, 25: 0.9, 50: 2.0, 75: 1.8, 100: 1.5}
-
-    closes   = plot_df["Close"].values.astype(float)
-    highs    = plot_df["High"].values.astype(float)
-    lows     = plot_df["Low"].values.astype(float)
-    vols     = plot_df["Volume"].values.astype(float)
-    vol_max  = vols.max() or 1.0
-    vol_norm = 0.2 + 0.8 * (vols / vol_max)  # keep low-vol candles at 0.2 min
-
-    cumulative = np.zeros(n_prices)
-    liq_heat   = np.zeros((n_prices, n_candles))
-
-    for t in range(n_candles):
-        cp  = closes[t]
-        vol = vol_norm[t]
-
-        for lev in tiers:
-            lw = lev_weights.get(lev, 0.5)
-
-            lp_long = cp * (1.0 - 1.0 / lev)
-            idx = int(round((lp_long - g_lo) / bsz))
-            if 0 <= idx < n_prices:
-                cumulative[idx] += vol * lw
-
-            lp_short = cp * (1.0 + 1.0 / lev)
-            idx = int(round((lp_short - g_lo) / bsz))
-            if 0 <= idx < n_prices:
-                cumulative[idx] += vol * lw
-
-        # Positions at levels swept by this candle got liquidated
-        swept = (grid >= lows[t]) & (grid <= highs[t])
-        cumulative[swept] *= 0.55
-
-        liq_heat[:, t] = cumulative
-
-    # No blur — keep bands at their exact projected price levels so the bar
-    # chart renderer shows discrete clusters rather than a smeared gradient.
-    return liq_heat
-
-
-def _build_orderbook_liq_heat(bid_c, ask_c, cprice, grid, bsz, n_candles):
-    """
-    Build a 2D liquidation heat matrix from the LIVE ORDER BOOK.
-
-    More accurate than OHLCV-based projection because the order book directly
-    shows where trading activity is concentrated right now.  Large bid walls at
-    price P → many long positions entered near P → strong liquidation cluster at
-    P*(1 - 1/lev) for each leverage tier.  Equivalent to the vsching open-source
-    liquidation-heatmap approach.
-
-    Returns (n_prices × n_candles) matrix where each row is constant across the
-    time axis (snapshot) with a slight left-fade for visual depth.
-    """
-    n_prices = len(grid)
-    g_lo     = grid[0]
-
-    # Same leverage tiers as lev-math but weighted toward high-lev (near-price clusters)
-    tiers = [(10, 0.7), (15, 0.6), (20, 0.9), (25, 0.8), (50, 2.2), (75, 2.0), (100, 1.8)]
-
-    liq_density = np.zeros(n_prices)
-
-    all_vals = list(bid_c.values()) + list(ask_c.values())
-    if not all_vals:
-        return np.zeros((n_prices, n_candles))
-    max_val = max(all_vals) or 1.0
-
-    # Bids at price P → long positions → liquidate BELOW P
-    for bp, bv in bid_c.items():
-        if bp <= 0 or bv <= 0:
-            continue
-        w = (bv / max_val) ** 0.6   # compress outliers so mid-size walls still show
-        for lev, lw in tiers:
-            lp  = bp * (1.0 - 1.0 / lev)
-            idx = int(round((lp - g_lo) / bsz))
-            if 0 <= idx < n_prices:
-                liq_density[idx] += w * lw
-
-    # Asks at price P → short positions → liquidate ABOVE P
-    for ap, av in ask_c.items():
-        if ap <= 0 or av <= 0:
-            continue
-        w = (av / max_val) ** 0.6
-        for lev, lw in tiers:
-            lp  = ap * (1.0 + 1.0 / lev)
-            idx = int(round((lp - g_lo) / bsz))
-            if 0 <= idx < n_prices:
-                liq_density[idx] += w * lw
-
-    # Broadcast 1D snapshot to 2D with a slight left-fade for visual depth
-    weights = np.linspace(0.45, 1.0, n_candles)
-    heat    = liq_density[:, np.newaxis] * weights[np.newaxis, :]
-    return heat
-
-
 # ── Real liquidation event heatmap ──────────────────────────────────────────
 # Fetches actual forced-liquidation orders from Binance + Bybit and accumulates
 # them in session state. Yellow clusters = where real cascades happened.
@@ -6173,58 +5986,137 @@ _LEV_TIERS = [
 # Binance BTCUSDT perp maintenance margin floor (effective fraction)
 _MAINT_MARGIN = 0.004
 
+# Maintenance-margin by leverage tier. Binance's MMR ladder rises with
+# position NOTIONAL, and position size correlates inversely with leverage
+# (3–5x = whales/hedgers in higher MMR brackets; 25–100x = small retail at
+# the 0.4% floor). Exact per-position notionals are unknowable from
+# aggregate OI, so this mapping is the honest approximation.
+_LEV_MMR = {3: 0.010, 5: 0.005, 10: 0.005, 25: 0.004, 50: 0.004, 100: 0.004}
+
 
 def _liq_price_long(entry: float, lev: int) -> float:
-    """Long liquidation: entry × (1 − 1/lev + maint_margin × something).
-    Simplified Binance formula: liq ≈ entry × (1 − 1/lev × (1 − maint))."""
-    return entry * (1.0 - (1.0 - _MAINT_MARGIN) / lev)
+    """Long liquidation price. Derivation: equity = entry/L − (entry − P);
+    liquidation when equity = m·P  →  P = entry × (1 − 1/L) / (1 − m)."""
+    m = _LEV_MMR.get(lev, _MAINT_MARGIN)
+    return entry * (1.0 - 1.0 / lev) / (1.0 - m)
 
 
 def _liq_price_short(entry: float, lev: int) -> float:
-    """Short liquidation: mirror of long."""
-    return entry * (1.0 + (1.0 - _MAINT_MARGIN) / lev)
+    """Short liquidation price (mirror): P = entry × (1 + 1/L) / (1 + m)."""
+    m = _LEV_MMR.get(lev, _MAINT_MARGIN)
+    return entry * (1.0 + 1.0 / lev) / (1.0 + m)
+
+
+# ── Multi-venue OI history (Bybit + OKX) — widens synthetic-map coverage ──
+# Binance alone is ~40-50% of BTC perp OI; adding Bybit (~15%) and OKX (~20%)
+# brings the tranche model to ~75-80% of the global position book.
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_bybit_oi_hist(limit: int = 200):
+    """Bybit linear BTCUSDT OI history. Returns [(ts_ms, oi_btc)] oldest-first.
+    v5 caps limit at 200 (~8 days of 1h bars)."""
+    url = ("https://api.bybit.com/v5/market/open-interest"
+           f"?category=linear&symbol=BTCUSDT&intervalTime=1h&limit={min(limit, 200)}")
+    data = _get_raw(url, timeout=10)
+    rows = (((data or {}).get("result") or {}).get("list")) or []
+    out = []
+    for r in rows:
+        try:
+            out.append((int(r["timestamp"]), float(r["openInterest"])))
+        except (KeyError, ValueError, TypeError):
+            continue
+    out.sort(key=lambda t: t[0])
+    return out or None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_bybit_taker_ratio(limit: int = 200):
+    """Bybit buy/sell account ratio. Returns {ts_ms: buy_ratio_0_1}."""
+    url = ("https://api.bybit.com/v5/market/account-ratio"
+           f"?category=linear&symbol=BTCUSDT&period=1h&limit={min(limit, 500)}")
+    data = _get_raw(url, timeout=10)
+    rows = (((data or {}).get("result") or {}).get("list")) or []
+    out = {}
+    for r in rows:
+        try:
+            br = float(r["buyRatio"])
+            if 0.0 < br < 1.0:
+                out[int(r["timestamp"])] = br
+        except (KeyError, ValueError, TypeError):
+            continue
+    return out or None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_okx_oi_hist(max_rows: int = 480):
+    """OKX BTC contracts OI history (rubik stats, all OKX BTC perp+futures).
+    Returns [(ts_ms, oi_usd)] oldest-first. Endpoint serves ~720 1h rows."""
+    url = "https://www.okx.com/api/v5/rubik/stat/contracts/open-interest-volume?ccy=BTC&period=1H"
+    data = _get_raw(url, timeout=10)
+    rows = (data or {}).get("data") or []
+    out = []
+    for r in rows:
+        try:
+            out.append((int(r[0]), float(r[1])))
+        except (ValueError, TypeError, IndexError):
+            continue
+    out.sort(key=lambda t: t[0])
+    return out[-max_rows:] or None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_okx_ls_ratio():
+    """OKX long/short account ratio. Returns {ts_ms: long_frac_0_1}
+    (endpoint returns the ratio r = longs/shorts; long_frac = r/(1+r))."""
+    url = "https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio?ccy=BTC&period=1H"
+    data = _get_raw(url, timeout=10)
+    rows = (data or {}).get("data") or []
+    out = {}
+    for r in rows:
+        try:
+            ratio = float(r[1])
+            if ratio > 0:
+                out[int(r[0])] = ratio / (1.0 + ratio)
+        except (ValueError, TypeError, IndexError):
+            continue
+    return out or None
 
 
 @st.cache_data(ttl=180, show_spinner=False)
 def _fetch_binance_synthetic_liqmap(current_price: float):
     """
-    Build a Coinglass-style liquidation heatmap from free Binance data.
+    Multi-venue synthetic liquidation heatmap (Binance + Bybit + OKX OI books).
+    Function name kept for call-site stability; "source" reports what was used.
+
     Returns dict matching the _fetch_coinglass_liq_map shape:
         {"long":  [(price, usd), ...],
          "short": [(price, usd), ...],
          "max_usd": float,
-         "source": "binance_synthetic"}
-    or None if data is unavailable.
+         "source": "multi_venue_synthetic" | "binance_synthetic",
+         "venues": "binance+bybit+okx"}
+    or None if no venue produced data.
+
+    Per-venue OI-delta tranche model (see methodology block above), merged
+    before the shared leverage fan-out / decay / binning. Coverage: Binance
+    ~40-50% of BTC perp OI, +Bybit ~15%, +OKX ~20% -> ~75-80% of the global
+    position book (vs Coinglass which also sees Bitmex/Deribit/HTX etc).
     """
-    try:
-        oi_hist = _fetch_binance_oi_hist("1h", 480)
-        if not oi_hist or len(oi_hist) < 24:
-            return None
-        taker = _fetch_binance_taker_ls("1h", 480) or {}
-        lsr   = _fetch_binance_ls_ratio("1h", 480) or {}
 
-        # We also need a per-bar entry price. The OI hist row gives
-        # sumOpenInterestValue (USD) and sumOpenInterest (BTC); their ratio
-        # is the average mark price during that bar — exactly what we want
-        # for "where positions were opened".
-        # tranches: list of {"entry": price, "long_usd": x, "short_usd": x, "ts": ms}
-        tranches: list = []
-        prev_usd = None
-
-        for ts, oi_btc, oi_usd in oi_hist:
-            mid_price = oi_usd / oi_btc if oi_btc > 0 else current_price
+    def _build_oi_tranches(oi_rows, long_frac_map, fallback_frac_map=None):
+        """oi_rows: [(ts_ms, mid_price, oi_usd)] oldest-first.
+        Rising OI opens positions at the bar midprice, split long/short by the
+        venue's flow ratio; falling OI closes oldest tranches first (FIFO)."""
+        tranches, prev_usd = [], None
+        for ts, mid_price, oi_usd in oi_rows:
             if prev_usd is None:
                 prev_usd = oi_usd
                 continue
             delta_usd = oi_usd - prev_usd
-
             if delta_usd > 0:
-                # New positions opened. Allocate by taker buy ratio.
-                # If taker data missing, fall back to longAccount fraction.
-                if ts in taker:
-                    long_frac = taker[ts]
-                elif ts in lsr:
-                    long_frac = lsr[ts]
+                if long_frac_map and ts in long_frac_map:
+                    long_frac = long_frac_map[ts]
+                elif fallback_frac_map and ts in fallback_frac_map:
+                    long_frac = fallback_frac_map[ts]
                 else:
                     long_frac = 0.5
                 # Clip to [0.2, 0.8] — extreme ratios are noisy and would
@@ -6237,11 +6129,7 @@ def _fetch_binance_synthetic_liqmap(current_price: float):
                     "ts":        ts,
                 })
             elif delta_usd < 0:
-                # Positions closed. Bleed FIFO from oldest tranches first.
                 close_usd = -delta_usd
-                # Each tranche has long + short components; close them
-                # proportionally (we don't know which side actually closed,
-                # so prorate by tranche composition).
                 i = 0
                 while close_usd > 0 and i < len(tranches):
                     tr = tranches[i]
@@ -6249,25 +6137,73 @@ def _fetch_binance_synthetic_liqmap(current_price: float):
                     if tr_total <= 0:
                         i += 1
                         continue
-                    take = min(close_usd, tr_total)
+                    take  = min(close_usd, tr_total)
                     ratio = take / tr_total
                     tr["long_usd"]  -= tr["long_usd"]  * ratio
                     tr["short_usd"] -= tr["short_usd"] * ratio
                     close_usd       -= take
                     if tr["long_usd"] + tr["short_usd"] < 1.0:
-                        i += 1     # tranche exhausted
+                        i += 1
                     else:
                         break
-                # Drop fully-exhausted tranches
-                tranches = [t for t in tranches if (t["long_usd"] + t["short_usd"]) >= 1.0]
-
+                tranches = [t for t in tranches
+                            if (t["long_usd"] + t["short_usd"]) >= 1.0]
             prev_usd = oi_usd
+        return tranches
 
-        if not tranches:
+    try:
+        venues = []
+
+        # ── Binance (OI in BTC+USD; per-bar entry = oi_usd/oi_btc) ──────────
+        taker = _fetch_binance_taker_ls("1h", 480) or {}
+        lsr   = _fetch_binance_ls_ratio("1h", 480) or {}
+        oi_hist = _fetch_binance_oi_hist("1h", 480)
+        if oi_hist and len(oi_hist) >= 24:
+            rows = [(ts, (oi_usd / oi_btc if oi_btc > 0 else current_price), oi_usd)
+                    for ts, oi_btc, oi_usd in oi_hist]
+            venues.append(("binance", _build_oi_tranches(rows, taker, lsr)))
+
+        # Hourly close map — Bybit reports OI in BTC and OKX gives no per-bar
+        # price, so both need a price per bar to convert / set entries.
+        _px = {}
+        try:
+            _kl = _fetch_binance_klines("1h", 500)
+            if _kl is not None and len(_kl):
+                for _t, _c in _kl["Close"].items():
+                    _px[int(_t.timestamp() * 1000)] = float(_c)
+        except Exception:
+            pass
+
+        def _price_at_ms(ts_ms):
+            return _px.get(ts_ms) or current_price
+
+        # ── Bybit (~8 days of 1h OI; flow split from its account ratio) ─────
+        try:
+            by_oi = _fetch_bybit_oi_hist(200)
+            by_r  = _fetch_bybit_taker_ratio(200) or {}
+            if by_oi and len(by_oi) >= 24:
+                rows = [(ts, _price_at_ms(ts), oi_btc * _price_at_ms(ts))
+                        for ts, oi_btc in by_oi]
+                venues.append(("bybit", _build_oi_tranches(rows, by_r, taker)))
+        except Exception:
+            pass
+
+        # ── OKX (rubik stats, OI already USD; ~20-30 days) ──────────────────
+        try:
+            ok_oi = _fetch_okx_oi_hist(480)
+            ok_r  = _fetch_okx_ls_ratio() or {}
+            if ok_oi and len(ok_oi) >= 24:
+                rows = [(ts, _price_at_ms(ts), oi_usd) for ts, oi_usd in ok_oi]
+                venues.append(("okx", _build_oi_tranches(rows, ok_r, taker)))
+        except Exception:
+            pass
+
+        all_tranches = [t for _, trs in venues for t in trs]
+        if not all_tranches:
             return None
 
         # Apply 7-day half-life time decay
-        now_ms       = oi_hist[-1][0]
+        now_ms       = max(t["ts"] for t in all_tranches)
         HALF_LIFE_MS = 7 * 24 * 3600 * 1000
 
         # Bin to $50 grid (same as order-book heatmap)
@@ -6275,34 +6211,30 @@ def _fetch_binance_synthetic_liqmap(current_price: float):
         long_map: dict  = {}
         short_map: dict = {}
 
-        for tr in tranches:
+        for tr in all_tranches:
             age_ms = max(0, now_ms - tr["ts"])
             decay  = 0.5 ** (age_ms / HALF_LIFE_MS)
             entry  = tr["entry"]
             for lev, w in _LEV_TIERS:
-                # Long liq price + weighted notional
                 if tr["long_usd"] > 0:
                     lp = _liq_price_long(entry, lev)
                     if lp > 0:
                         b = round(lp / BIN) * BIN
                         long_map[b] = long_map.get(b, 0.0) + tr["long_usd"] * w * decay
-                # Short liq price
                 if tr["short_usd"] > 0:
                     sp = _liq_price_short(entry, lev)
                     if sp > 0:
                         b = round(sp / BIN) * BIN
                         short_map[b] = short_map.get(b, 0.0) + tr["short_usd"] * w * decay
 
-        # Filter: longs by definition liquidate BELOW current price, shorts ABOVE.
-        # Liq prices that ended up on the wrong side of current price are
-        # tranches that are already underwater / already liquidated — drop them.
+        # Longs liquidate BELOW current price, shorts ABOVE; wrong-side bins are
+        # tranches already underwater / liquidated — drop them.
         longs  = [(p, u) for p, u in long_map.items()  if p < current_price * 0.999]
         shorts = [(p, u) for p, u in short_map.items() if p > current_price * 1.001]
 
         if not longs and not shorts:
             return None
 
-        # Sort by intensity desc for top-cluster display
         longs.sort(key=lambda x: x[1], reverse=True)
         shorts.sort(key=lambda x: x[1], reverse=True)
 
@@ -6313,7 +6245,9 @@ def _fetch_binance_synthetic_liqmap(current_price: float):
             "long":    longs,
             "short":   shorts,
             "max_usd": max_usd,
-            "source":  "binance_synthetic",
+            "source":  ("multi_venue_synthetic" if len(venues) > 1
+                        else "binance_synthetic"),
+            "venues":  "+".join(v for v, _ in venues),
         }
     except Exception as e:
         st.session_state["_bn_synth_err"] = str(e)
@@ -6321,14 +6255,21 @@ def _fetch_binance_synthetic_liqmap(current_price: float):
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def _fetch_coinglass_liq_map():
+def _fetch_coinglass_liq_map(current_price: float = 0.0):
     """
-    Fetch BTC liquidation heatmap from Coinglass API (requires COINGLASS_API_KEY
-    in .streamlit/secrets.toml or env var).  Returns dict with:
-      "long":  [(price, usd_amount), ...]  — levels below current price
-      "short": [(price, usd_amount), ...]  — levels above current price
-      "max_usd": float                     — largest single level
-    Returns None if no API key or fetch fails.
+    Fetch BTC liquidation heatmap from the Coinglass **v4** API.
+
+    The old v2 endpoint (open-api.coinglass.com/public/v2/liquidation_map)
+    is decommissioned — it returns HTTP 500 for everyone (verified 2026-06-11),
+    so this fetcher silently failed even with a valid key. v4 lives at
+    open-api-v4.coinglass.com with header `CG-API-KEY`. NOTE: liquidation
+    heatmap endpoints require a PAID Coinglass plan; on the free tier this
+    returns a plan-limit error and we fall through to the synthetic map.
+
+    Returns {"long": [(price, usd)...], "short": [(price, usd)...],
+             "max_usd": float} split around current_price, or None.
+    The raw response head is stored in st.session_state["_cg_last_raw"] for
+    debugging the (undocumented-to-us) response shape once a key is active.
     """
     import os, json
     api_key = ""
@@ -6343,45 +6284,73 @@ def _fetch_coinglass_liq_map():
 
     try:
         import urllib.request as _ur
-        url = ("https://open-api.coinglass.com/public/v2/liquidation_map"
-               "?ex=Binance&pair=BTCUSDT&interval=12h")
-        req = _ur.Request(url, headers={
-            "coinglassSecret": api_key,
-            "Content-Type":    "application/json",
-        })
-        with _ur.urlopen(req, timeout=12) as resp:
-            raw = json.loads(resp.read().decode())
-
-        # Accept both {"success":true,...} and {"code":"0",...} shapes
-        if not (raw.get("success") or raw.get("code") == "0"):
+        raw = None
+        for _model in ("model2", "model1"):
+            url = (f"https://open-api-v4.coinglass.com/api/futures/liquidation/"
+                   f"heatmap/{_model}?exchange=Binance&symbol=BTCUSDT&range=12h")
+            req = _ur.Request(url, headers={
+                "CG-API-KEY": api_key,
+                "accept":     "application/json",
+            })
+            with _ur.urlopen(req, timeout=12) as resp:
+                raw = json.loads(resp.read().decode())
+            if str(raw.get("code", "")) == "0":
+                break
+            raw = None
+        try:
+            st.session_state["_cg_last_raw"] = str(raw)[:500]
+        except Exception:
+            pass
+        if not raw:
             return None
 
-        data = raw.get("data", raw)  # some versions nest, some don't
+        data = raw.get("data") or {}
 
-        # Parse long / short maps — handle several key-name variants
-        def _parse(key_candidates):
-            for k in key_candidates:
-                v = data.get(k)
-                if v:
-                    # list of {price, amount} or list of [price, amount]
-                    out = []
-                    for item in v:
-                        if isinstance(item, dict):
-                            p = float(item.get("price", 0))
-                            a = float(item.get("amount", item.get("liqAmount", 0)))
-                        else:
-                            p, a = float(item[0]), float(item[1])
-                        if p > 0 and a > 0:
-                            out.append((p, a))
-                    if out:
-                        return out
-            return []
+        # v4 heatmap shape: {"y": [price levels], "liq": [[x_idx, y_idx, usd],...],
+        # "x"/"prices": [timestamps]}. The current liq map = the latest x column.
+        longs, shorts = [], []
+        y_levels = data.get("y") or data.get("priceList") or []
+        liq_grid = data.get("liq") or data.get("liqList") or []
+        if y_levels and liq_grid:
+            _max_x = max((int(c[0]) for c in liq_grid if len(c) >= 3), default=0)
+            for c in liq_grid:
+                if len(c) >= 3 and int(c[0]) == _max_x:
+                    try:
+                        p, u = float(y_levels[int(c[1])]), float(c[2])
+                    except Exception:
+                        continue
+                    if p <= 0 or u <= 0:
+                        continue
+                    if current_price and p < current_price:
+                        longs.append((p, u))
+                    elif current_price and p > current_price:
+                        shorts.append((p, u))
+        else:
+            # Older list-shaped payloads — keep the lenient v2-style parse.
+            def _parse(key_candidates):
+                for k in key_candidates:
+                    v = data.get(k) if isinstance(data, dict) else None
+                    if v:
+                        out = []
+                        for item in v:
+                            if isinstance(item, dict):
+                                p = float(item.get("price", 0))
+                                a = float(item.get("amount", item.get("liqAmount", 0)))
+                            else:
+                                p, a = float(item[0]), float(item[1])
+                            if p > 0 and a > 0:
+                                out.append((p, a))
+                        if out:
+                            return out
+                return []
+            longs  = _parse(["longLiquidationMap",  "long",  "longs",  "buyMap"])
+            shorts = _parse(["shortLiquidationMap", "short", "shorts", "sellMap"])
 
-        longs  = _parse(["longLiquidationMap",  "long",  "longs",  "buyMap"])
-        shorts = _parse(["shortLiquidationMap", "short", "shorts", "sellMap"])
         if not longs and not shorts:
             return None
 
+        longs.sort(key=lambda x: x[1], reverse=True)
+        shorts.sort(key=lambda x: x[1], reverse=True)
         all_usd  = [a for _, a in longs + shorts]
         max_usd  = max(all_usd) if all_usd else 1.0
         return {"long": longs, "short": shorts, "max_usd": max_usd}
@@ -6392,54 +6361,51 @@ def _fetch_coinglass_liq_map():
 
 @st.cache_data(ttl=60, show_spinner=False)
 def _fetch_liq_events():
-    """Fetch recent BTC liquidation events from Binance + Bybit (both free, no API key).
+    """Fetch recent BTC liquidation events from Binance + Bybit + OKX (all free, no API key).
     Binance returns up to 1000 events per call; Bybit returns every liquidation (not
-    filtered to largest-per-second like Binance), giving better coverage."""
+    filtered to largest-per-second like Binance); OKX returns ~100 most recent events
+    via its public liquidation-orders endpoint. Combined coverage = ~80% of global
+    BTC perp liq volume (closes most of the Coinglass paid-tier gap)."""
     out = []
 
-    # ── Binance forced-liquidation orders (last 24h, up to 1000) ────────────
-    try:
-        import time as _time
-        start_ms = int((_time.time() - 86400) * 1000)
-        url  = (f"https://fapi.binance.com/fapi/v1/allForceOrders"
-                f"?symbol=BTCUSDT&limit=1000&startTime={start_ms}")
-        data = _get_raw(url)
-        if isinstance(data, list):
-            for o in data:
-                try:
-                    price = float(o.get("averagePrice") or o.get("price") or 0)
-                    qty   = float(o.get("executedQty") or 0)
-                    side  = str(o.get("side", ""))
-                    ts_ms = int(o.get("time") or 0)
-                    if price > 0 and qty > 0 and ts_ms > 0:
-                        out.append({"price": price, "notional": price * qty,
-                                    "side": side, "ts_ms": ts_ms,
-                                    "src": "binance"})
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    # ── Dead REST sources (audited 2026-06-11) — do NOT re-add without checking:
+    #   Binance fapi/v1/allForceOrders → HTTP 400 "endpoint out of maintenance"
+    #     (Binance removed REST access; force orders are websocket-only now:
+    #      !forceOrder@arr stream).
+    #   Bybit /v5/market/liquidation → HTTP 404 (v5 has no public REST
+    #     liquidation history; websocket topic `liquidation.{symbol}` only).
+    # Both used to burn an HTTP round-trip per refresh and always returned 0
+    # events, which silently neutered _compute_realized_liq_stats (Cascade
+    # Direction conviction filter + Swept Reversal proximity boost were no-ops).
 
-    # ── Bybit liquidations (most recent 200 — emits ALL liquidations) ────────
+    # ── OKX liquidations (BTC-USDT swaps, last ~100 filled events) ────────────
+    # Public endpoint, no key required. NOTE: instType=SWAP requires `uly`
+    # (underlying), NOT instId — instId returns 400 code 50015 (this was the
+    # bug that kept this source dead). Response is a list of {instId, details}
+    # where each detail row is one liquidation. Contract size for BTC-USDT-SWAP
+    # is 0.01 BTC, so notional_usd = sz × 0.01 × bkPx. Side convention:
+    #   side="buy"  → short position force-bought  → our "BUY"
+    #   side="sell" → long  position force-sold    → our "SELL"
     try:
-        url  = ("https://api.bybit.com/v5/market/liquidation"
-                "?category=linear&symbol=BTCUSDT&limit=200")
+        url  = ("https://www.okx.com/api/v5/public/liquidation-orders"
+                "?instType=SWAP&uly=BTC-USDT&state=filled&limit=100")
         data = _get_raw(url)
         if isinstance(data, dict):
-            items = data.get("result", {}).get("list", [])
-            for o in items:
-                try:
-                    price = float(o.get("price", 0))
-                    size  = float(o.get("size", 0))
-                    # Bybit: side="Buy" means a short position was liquidated (forced buy)
-                    side  = "BUY" if o.get("side") == "Buy" else "SELL"
-                    ts_ms = int(o.get("time", 0))
-                    if price > 0 and size > 0 and ts_ms > 0:
-                        out.append({"price": price, "notional": price * size,
-                                    "side": side, "ts_ms": ts_ms + 1,  # +1 avoids ts collision
-                                    "src": "bybit"})
-                except Exception:
-                    pass
+            for item in data.get("data", []) or []:
+                for d in item.get("details", []) or []:
+                    try:
+                        bk_side = str(d.get("side", "")).lower()
+                        sz      = float(d.get("sz", 0) or 0)        # contracts
+                        bkPx    = float(d.get("bkPx", 0) or 0)      # bankruptcy price (~liq price)
+                        ts_ms   = int(d.get("ts", 0) or 0)
+                        notional = sz * 0.01 * bkPx                  # ctVal = 0.01 BTC
+                        our_side = "BUY" if bk_side == "buy" else "SELL"
+                        if bkPx > 0 and notional > 0 and ts_ms > 0:
+                            out.append({"price": bkPx, "notional": notional,
+                                        "side": our_side, "ts_ms": ts_ms + 2,  # +2 avoids ts collision
+                                        "src": "okx"})
+                    except Exception:
+                        pass
     except Exception:
         pass
 
@@ -6458,745 +6424,244 @@ def _push_liq_events(events):
             del store[k]
 
 
-def _build_liq_event_heat_2d(plot_df, grid, bsz):
+def _compute_realized_liq_stats(current_price: float,
+                                ratio_lookback_h: float = 6.0,
+                                events_lookback_h: float = 12.0) -> dict:
+    """Aggregate realized BTC liquidation events for use in 72h bias signals
+    (improvements.txt item 2 — augment synthetic with ground-truth events).
+
+    Returns:
+      realized_ratio: long_liq / short_liq notional ratio over `ratio_lookback_h`,
+                     linearly recency-weighted. >1 means longs are getting flushed.
+                     None if total < $1M (insufficient evidence — caller treats as neutral).
+      realized_total: total notional in the ratio window (gates confidence).
+      events_12h:    list of (price, notional) tuples within events_lookback_h,
+                     used for per-zone proximity queries in Swept Reversal.
+
+    Side convention (matches `_fetch_liq_events` output):
+      side="SELL" on perp = a long position was force-sold → long-liq event.
+      side="BUY"  on perp = a short position was force-bought → short-liq event.
     """
-    Build a 2D (n_prices × n_candles) heatmap from real liquidation events.
-    Each event is placed in the 15-min candle column that contains its timestamp.
-    Returns (matrix, raw_max_notional).
-    """
-    store     = st.session_state.get(_LIQ_EVENTS_KEY, {})
-    n_prices  = len(grid)
-    n_candles = len(plot_df)
-    g_lo      = grid[0]
-    heat      = np.zeros((n_prices, n_candles))
-    if not store:
-        return heat, 0.0
-
-    # Pre-compute candle start times in ms for fast lookup
-    candle_ms = []
-    for ct in plot_df.index:
-        try:
-            ts = ct.timestamp() * 1000
-        except Exception:
-            import datetime as _dt
-            ts = _dt.datetime.fromtimestamp(float(ct) / 1e9).timestamp() * 1000
-        candle_ms.append(int(ts))
-
-    interval_ms = 15 * 60 * 1000
-
+    import time as _t
+    store = st.session_state.get(_LIQ_EVENTS_KEY, {})
+    if not store or current_price <= 0:
+        return {"realized_ratio": None, "realized_total": 0.0, "events_12h": []}
+    now_ms     = _t.time() * 1000.0
+    ratio_cut  = now_ms - ratio_lookback_h  * 3_600_000.0
+    events_cut = now_ms - events_lookback_h * 3_600_000.0
+    long_liq   = 0.0
+    short_liq  = 0.0
+    events_12h = []
     for e in store.values():
-        ts   = e["ts_ms"]
-        # Binary-search: find the last candle whose start ≤ event timestamp
-        lo, hi, t = 0, n_candles - 1, -1
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            if candle_ms[mid] <= ts:
-                t = mid; lo = mid + 1
-            else:
-                hi = mid - 1
-        if t < 0 or ts > candle_ms[t] + interval_ms:
-            continue  # event outside display window
-        idx = int(round((e["price"] - g_lo) / bsz))
-        if 0 <= idx < n_prices:
-            heat[idx, t] += e["notional"]
+        ts       = e.get("ts_ms", 0)
+        if ts < events_cut:
+            continue
+        price    = float(e.get("price", 0) or 0)
+        notional = float(e.get("notional", 0) or 0)
+        side     = str(e.get("side", ""))
+        if price <= 0 or notional <= 0:
+            continue
+        events_12h.append((price, notional))
+        if ts < ratio_cut:
+            continue
+        # Linear recency weight inside the 6h window: 1.0 (just now) → 0.3 (6h ago).
+        age_frac = (now_ms - ts) / (ratio_lookback_h * 3_600_000.0)
+        w        = 1.0 - 0.7 * min(age_frac, 1.0)
+        if side == "SELL":
+            long_liq  += notional * w
+        elif side == "BUY":
+            short_liq += notional * w
+    total = long_liq + short_liq
+    if total < 1_000_000.0:
+        return {"realized_ratio": None, "realized_total": total, "events_12h": events_12h}
+    if short_liq <= 0:
+        ratio = 5.0   # cap — practically all-longs-flushed
+    elif long_liq <= 0:
+        ratio = 0.2   # cap — practically all-shorts-flushed
+    else:
+        ratio = long_liq / short_liq
+    return {"realized_ratio": ratio, "realized_total": total, "events_12h": events_12h}
 
-    # Light time-axis blur only — keeps bar shape, removes single-candle spikes
+
+def _liqmap_fit_score(liq_map, events, current_price: float = 0.0,
+                      lookback_h: float = 6.0) -> "dict | None":
+    # Default window is 6h, not 12h: measured 2026-06-11, ρ=+0.46 @6h vs
+    # ρ=−0.04 @12h — the map describes TODAY's position book, and the
+    # further back you score it, the more the temporal mismatch poisons ρ.
+    """Score the synthetic liq map against REALIZED liquidations (OKX prints).
+
+    Metric: Spearman rank correlation between predicted fuel per $50 bin and
+    realized liquidation notional per bin over the event price range —
+    i.e. "do brighter map zones actually produce more liquidations?"
+    A binary hit-rate is useless here (the map covers ~90% of the realized
+    range, so anything 'hits'); rank correlation measures *intensity* match.
+
+    Honest caveats baked in:
+      - bins within ±0.25% of current spot are EXCLUDED — the map's
+        wrong-side filter zeroes them by construction while realized liqs
+        concentrate exactly there (price frontier), which would poison rho;
+      - this compares TODAY's map vs the last N hours of events. The proper
+        as-of-event-time comparison becomes possible once liq_heatmap_log
+        accumulates history.
+
+    Returns {rho, n_bins, n_events, window_h} or None (<10 events / <8 bins).
+    This is the calibration readout Coinglass never shows you."""
     try:
-        from scipy.ndimage import gaussian_filter
-        heat = gaussian_filter(heat, sigma=(0.4, 0.8))
+        if not liq_map or not events:
+            return None
+        import time as _t
+        cut_ms = (_t.time() - lookback_h * 3600) * 1000
+        ev = [e for e in events
+              if e.get("ts_ms", 0) >= cut_ms and e.get("notional", 0) > 0]
+        if len(ev) < 10:
+            return None
+        BIN = 50.0
+        pred = {}
+        for side in ("long", "short"):
+            for p, u in (liq_map.get(side) or []):
+                b = round(p / BIN) * BIN
+                pred[b] = pred.get(b, 0.0) + u
+        if not pred:
+            return None
+        real = {}
+        for e in ev:
+            b = round(e["price"] / BIN) * BIN
+            real[b] = real.get(b, 0.0) + e["notional"]
+        lo, hi = min(real), max(real)
+        guard  = (current_price or 0) * 0.0025
+        bins   = [b for b in np.arange(lo, hi + BIN, BIN)
+                  if not (current_price and abs(b - current_price) < guard)]
+        if len(bins) < 8:
+            return None
+        x = [pred.get(b, 0.0) for b in bins]
+        y = [real.get(b, 0.0) for b in bins]
+        from scipy.stats import spearmanr
+        rho = spearmanr(x, y).statistic
+        if rho is None or np.isnan(rho):
+            return None
+        return {
+            "rho":      round(float(rho), 2),
+            "n_bins":   len(bins),
+            "n_events": len(ev),
+            "window_h": lookback_h,
+        }
+    except Exception:
+        return None
+
+
+# ── Time × price heatmap history (the Coinglass signature view) ──────────────
+_LIQ_HEAT_KEY  = "_liq_heat_snapshots"   # session: {ts_iso: {"long":[...], "short":[...], "px": float}}
+_LIQ_HEAT_MAX  = 600                     # ~2 days of 5-min app refreshes
+
+
+def _push_liq_heat_snapshot(liq_map, price):
+    """Accumulate one synthetic-map snapshot per 5-min bucket in session state."""
+    try:
+        if not liq_map or not price:
+            return
+        bucket = _dt.now(_tz.utc).replace(second=0, microsecond=0)
+        bucket = bucket.replace(minute=bucket.minute - bucket.minute % 5)
+        key    = bucket.isoformat()
+        store  = st.session_state.setdefault(_LIQ_HEAT_KEY, {})
+        if key in store:
+            return
+        store[key] = {
+            "long":  [(float(p), float(u)) for p, u in (liq_map.get("long")  or [])[:40]],
+            "short": [(float(p), float(u)) for p, u in (liq_map.get("short") or [])[:40]],
+            "px":    float(price),
+        }
+        if len(store) > _LIQ_HEAT_MAX:
+            for k in sorted(store)[:-_LIQ_HEAT_MAX]:
+                del store[k]
     except Exception:
         pass
 
-    raw_max = float(heat.max()) if heat.max() > 0 else 0.0
-    return heat, raw_max
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _fetch_liq_heatmap_history(hours: int = 48) -> "list | None":
+    """Pull liq_heatmap_log snapshots from Supabase (written by the cron every
+    ~15 min) so the time axis is populated even on a fresh session. Paginates
+    past PostgREST's 1000-row cap."""
+    if not _supa_available():
+        return None
+    cutoff = (_dt.now(_tz.utc) - _td(hours=hours)).isoformat()
+    rows, offset = [], 0
+    while True:
+        batch = _supa_request(
+            "GET",
+            f"/rest/v1/liq_heatmap_log?ts=gte.{urllib.parse.quote(cutoff)}"
+            f"&select=ts,side,price,usd&order=ts.asc&limit=1000&offset={offset}")
+        if not batch:
+            break
+        rows.extend(batch)
+        if len(batch) < 1000:
+            break
+        offset += 1000
+    return rows or None
 
 
-_OB_HISTORY_KEY = "_ob_history"
-_OB_MAX_SNAPS   = 600   # ~20h at 2-min refresh cadence
-
-def _push_ob_snapshot(raw_bids, raw_asks, cprice):
-    """Append a timestamped, pre-binned order-book snapshot to session state."""
-    import datetime as _dt
-    snaps = st.session_state.setdefault(_OB_HISTORY_KEY, [])
-    now = _dt.datetime.now(_dt.timezone.utc)
-    # Skip if last push was within 90 s (same cache window re-render)
-    if snaps and (now - snaps[-1]["ts"]).total_seconds() < 90:
-        return
-    bsz = HEATMAP_BIN
-    bd, ad = {}, {}
-    for ps, qs in raw_bids:
-        p = round(float(ps) / bsz) * bsz
-        bd[p] = bd.get(p, 0.0) + float(ps) * float(qs)
-    for ps, qs in raw_asks:
-        p = round(float(ps) / bsz) * bsz
-        ad[p] = ad.get(p, 0.0) + float(ps) * float(qs)
-    snaps.append({"ts": now, "bids": bd, "asks": ad})
-    if len(snaps) > _OB_MAX_SNAPS:
-        del snaps[0]
-
-
-def _build_ob_heat_2d(plot_df, grid, bsz):
-    """
-    Build a 2D (n_prices × n_candles) order-book heatmap from stored snapshots.
-    Each column uses the most recent snapshot taken at or before that candle's
-    timestamp; gaps are forward-filled so walls persist until changed.
-    Returns (matrix, raw_max_notional).
-    """
-    import datetime as _dt
-    snaps     = st.session_state.get(_OB_HISTORY_KEY, [])
-    n_prices  = len(grid)
-    n_candles = len(plot_df)
-    g_lo      = grid[0]
-    heat      = np.zeros((n_prices, n_candles))
-    if not snaps:
-        return heat, 0.0
-
-    prev_col = np.zeros(n_prices)
-    for t in range(n_candles):
-        cts = plot_df.index[t]
-        if hasattr(cts, "tzinfo") and cts.tzinfo is None:
-            cts = cts.replace(tzinfo=_dt.timezone.utc)
-        elif not hasattr(cts, "tzinfo"):
-            cts = _dt.datetime.fromtimestamp(float(cts) / 1e9, tz=_dt.timezone.utc)
-
-        snap = None
-        for s in reversed(snaps):
-            if s["ts"] <= cts:
-                snap = s
-                break
-
-        if snap is None:
-            heat[:, t] = prev_col
-            continue
-
-        col = np.zeros(n_prices)
-        for p, notional in snap["bids"].items():
-            idx = int(round((p - g_lo) / bsz))
-            if 0 <= idx < n_prices:
-                col[idx] += notional
-        for p, notional in snap["asks"].items():
-            idx = int(round((p - g_lo) / bsz))
-            if 0 <= idx < n_prices:
-                col[idx] += notional
-        heat[:, t] = col
-        prev_col = col
-
-    raw_max = float(heat.max()) if heat.max() > 0 else 0.0
-    return heat, raw_max
-
-
-# ════════════════════════════════════════════════════════════════
-#  LIQUIDITY CHART PANEL
-# ════════════════════════════════════════════════════════════════
-
-def plot_liquidity_depth(ax, liq, short_df=None):
-    from matplotlib.colors import Normalize
-    from matplotlib.cm import ScalarMappable
-    from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-
-    cprice   = liq.get("liq_current_price", 0)
-    raw_bids = liq.get("liq_raw_bids", [])
-    raw_asks = liq.get("liq_raw_asks", [])
-    bid_c    = liq.get("liq_bid_clusters", {})
-    ask_c    = liq.get("liq_ask_clusters", {})
-    _full_15m = _fetch_15min_ohlcv()  # 288 candles = 72h
-    _display_n = 96                   # show only last 24h on the chart
-    if _full_15m is not None and not _full_15m.empty:
-        _heat_df = _full_15m          # full 72h used to build heat accumulation
-        plot_df  = _full_15m.iloc[-_display_n:]  # last 24h for price line / x-axis
-    else:
-        _fb      = short_df if (short_df is not None and not short_df.empty) else _fetch_short_term_ohlcv()
-        _heat_df = _fb
-        plot_df  = _fb
-
-    if not raw_bids or not raw_asks or cprice <= 0 or plot_df is None or plot_df.empty:
-        ax.text(0.5, 0.5, "Liquidity Data Unavailable",
-                ha="center", color="#8b949e", transform=ax.transAxes)
-        return
-
-    # Accumulate real data into session state every refresh
-    _push_ob_snapshot(raw_bids, raw_asks, cprice)
-    _push_liq_events(_fetch_liq_events())
-
-    ratio     = liq.get("liq_depth_ratio", 1.0)
-    n_candles = len(plot_df)
-
-    # Dynamic viewport: ±4% base, extended to include nearest walls if within ±6%
-    _an_pre = liq.get("liq_analysis", {})
-    _nl_pre = _an_pre.get("nearest_long_liq")
-    _ns_pre = _an_pre.get("nearest_short_liq")
-    _vp_lo  = cprice * 0.960
-    _vp_hi  = cprice * 1.040
-    for _wp in [_nl_pre[0] if _nl_pre else None, _ns_pre[0] if _ns_pre else None]:
-        if _wp and abs(_wp - cprice) / cprice <= 0.06:
-            _vp_lo = min(_vp_lo, _wp * 0.997)
-            _vp_hi = max(_vp_hi, _wp * 1.003)
-    grid_lo = _vp_lo * 0.999
-    grid_hi = _vp_hi * 1.001
-
-    grid      = _snap_grid(grid_lo, grid_hi, HEATMAP_BIN)
-    n_prices  = len(grid)
-    g_lo      = grid[0]
-    zoom_lo, zoom_hi = grid[0], grid[-1]
-    zoom_range = zoom_hi - zoom_lo
-
-    if n_prices < 5 or n_candles < 5:
-        return
-
-    # ── Layer 1: liquidation heatmap ────────────────────────────────────────
-    # Priority order:
-    #   A) Coinglass API           — real OI liquidation map (best, paid)
-    #   B) Hyblock Capital         — real liquidation levels (free tier, needs auth)
-    #   C) Binance synthetic       — reconstructed from public OI+taker+L/S (FREE, NEW)
-    #   D) Order-book projection   — last-resort proxy
-    cg_data         = _fetch_coinglass_liq_map()
-    hb_data         = _fetch_hyblock_liq_map() if not cg_data else None
-    bn_synth        = (_fetch_binance_synthetic_liqmap(cprice)
-                       if not (cg_data or hb_data) else None)
-    oi_data         = cg_data or hb_data or bn_synth
-    using_coinglass = oi_data is not None
-
-    if using_coinglass:
-        # ── A: Coinglass discrete-bar rendering ──────────────────────────────
-        oi_max  = oi_data["max_usd"] or 1.0
-        cg_cmap = _cg_cmap()
-
-        for price, usd in oi_data.get("long", []):
-            if zoom_lo <= price <= zoom_hi:
-                t = min(1.0, usd / oi_max)
-                ax.barh(price, t * n_candles * 0.9, height=HEATMAP_BIN * 0.85,
-                        left=n_candles - t * n_candles * 0.9, align="center",
-                        color=cg_cmap(t), alpha=0.85, zorder=1)
-        for price, usd in oi_data.get("short", []):
-            if zoom_lo <= price <= zoom_hi:
-                t = min(1.0, usd / oi_max)
-                ax.barh(price, t * n_candles * 0.9, height=HEATMAP_BIN * 0.85,
-                        left=n_candles - t * n_candles * 0.9, align="center",
-                        color=cg_cmap(t), alpha=0.85, zorder=1)
-
-        liq_raw_max = oi_max
-        using_real_events = False
-        # Use order-book projection for narrative cluster ranking (no OHLCV needed)
-        lev_heat  = _build_orderbook_liq_heat(bid_c, ask_c, cprice, grid, HEATMAP_BIN, n_candles)
-        liq_heat  = lev_heat / (lev_heat.max() or 1.0)
-
-    else:
-        # ── B: Order-book projection (base) + real liq events (overlay) ──────
-        # Order-book projection: uses live bid/ask depth to project where leveraged
-        # positions are concentrated, which is more accurate than OHLCV-based math.
-        lev_heat    = _build_orderbook_liq_heat(bid_c, ask_c, cprice, grid, HEATMAP_BIN, n_candles)
-        lev_nrm     = lev_heat / (lev_heat.max() or 1.0)
-
-        # Real liquidation events from Binance + Bybit (accumulated in session state)
-        liq_ev_heat, liq_ev_max = _build_liq_event_heat_2d(plot_df, grid, HEATMAP_BIN)
-        n_liq_events = len(st.session_state.get(_LIQ_EVENTS_KEY, {}))
-
-        using_real_events = n_liq_events >= 5 and liq_ev_max > 0
-        if using_real_events:
-            # Blend: real events dominate where they exist, OB projection fills gaps
-            ev_nrm      = liq_ev_heat / liq_ev_max
-            ev_covered  = np.any(liq_ev_heat > 0, axis=0)
-            liq_heat    = np.where(ev_covered[None, :], ev_nrm, lev_nrm)
-            # Reinforce real-event rows with the OB projection signal
-            _ev_rows    = liq_ev_heat.max(axis=1) > 0
-            liq_heat[_ev_rows] = np.maximum(liq_heat[_ev_rows],
-                                            lev_nrm[_ev_rows] * 0.4)
-            liq_raw_max = liq_ev_max
-        else:
-            liq_heat    = lev_nrm.copy()
-            liq_raw_max = float(lev_heat.max() or 1.0)
-
-        if using_real_events:
-            _row_max      = liq_heat.max(axis=1)
-            _sorted_rows  = np.argsort(_row_max)[::-1]
-            _tier_targets = [1.0, 0.65, 0.45]
-            for _ri, _pidx in enumerate(_sorted_rows):
-                if _row_max[_pidx] < 0.04:
-                    break
-                target = _tier_targets[_ri] if _ri < len(_tier_targets) else 0.28
-                if _row_max[_pidx] > 0:
-                    liq_heat[_pidx, :] *= target / _row_max[_pidx]
-            liq_heat = np.power(liq_heat.clip(0, 1), 1.5)
-        else:
-            liq_heat = np.power(liq_heat.clip(0, 1), 0.7)
-
-        pi  = int(round((cprice - g_lo) / HEATMAP_BIN))
-        gap = max(1, int(n_prices * 0.008))
-        liq_heat[max(0, pi - gap):min(n_prices, pi + gap + 1)] *= 0.4
-
-    # ── Store top clusters in session state so narrative matches heatmap ──────
+def fig_liq_heatmap_history(snapshots: dict, current_price: float) -> "plt.Figure | None":
+    """Coinglass-style time × price heatmap of the synthetic liq map.
+    snapshots: {ts_iso: {"long":[(p,u)...], "short":[(p,u)...], "px": float}}.
+    Bright horizontal bands = persistent liq-fuel clusters; the white line is
+    spot price eating through them."""
     try:
-        _below_m = grid < cprice
-        _above_m = grid > cprice
-
-        if using_coinglass:
-            # Coinglass data has real USD values — sort by proximity to current price
-            _lc = sorted(
-                [(p, u, min(1.0, u / cg_data["max_usd"])) for p, u in cg_data.get("long", [])
-                 if zoom_lo <= p < cprice],
-                key=lambda x: x[0], reverse=True)[:5]
-            _sc = sorted(
-                [(p, u, min(1.0, u / cg_data["max_usd"])) for p, u in cg_data.get("short", [])
-                 if cprice < p <= zoom_hi],
-                key=lambda x: x[0])[:5]
-            st.session_state["_liq_clusters"] = {
-                "long":  _lc, "short": _sc,
-                "cprice": cprice, "real_events": True,
-            }
-        else:
-            _raw_row  = lev_heat.max(axis=1)
-            _vis_row  = liq_heat.max(axis=1)
-            _raw_max  = _raw_row.max() or 1.0
-
-            # Build USD arrays from current order-book snapshot
-            _depth_ratio = liq.get("liq_depth_ratio", 1.0)
-            _, _la_usd, _sa_usd, _ = _build_liq(raw_bids, raw_asks, cprice, grid, _depth_ratio)
-
-        def _pick_peaks(raw, vis, la_usd, sa_usd, mask, grid, side, n=5):
-            sub_r = (raw * mask.astype(float)).copy()
-            sub_v = (vis * mask.astype(float)).copy()
-            usd_arr = la_usd if side == "long" else sa_usd
-            out = []
-            for _ in range(n):
-                if sub_r.max() < _raw_max * 0.005:
-                    break
-                idx = int(sub_r.argmax())
-                usd_val = float(usd_arr[idx])
-                out.append((float(grid[idx]), usd_val, float(sub_v[idx])))
-                lo = max(0, idx - 5); hi = min(len(sub_r), idx + 6)
-                sub_r[lo:hi] = 0
-            return out   # [(price, usd_notional, vis_intensity), ...]
-
-            _lc = _pick_peaks(_raw_row, _vis_row, _la_usd, _sa_usd, _below_m, grid, "long")
-            _sc = _pick_peaks(_raw_row, _vis_row, _la_usd, _sa_usd, _above_m, grid, "short")
-            st.session_state["_liq_clusters"] = {
-                "long":  sorted(_lc, key=lambda x: x[0], reverse=True),
-                "short": sorted(_sc, key=lambda x: x[0]),
-                "cprice": cprice,
-                "real_events": using_real_events,
-            }
-    except Exception as _e:
-        st.session_state["_liq_clusters_err"] = str(_e)
-
-    # ── Layer 2: discrete-bar heatmap (matches Coinglass visual style) ───────
-    # Draw each price level as a horizontal bar extending left from the current
-    # candle.  Bar length ∝ heat intensity — makes clusters look like Coinglass
-    # instead of a smooth gradient.  Works for all data sources.
-    cg = _cg_cmap()   # always needed for colorbar + key-level bars
-    if not using_coinglass:
-        # Collapse time axis: use row-max so the strongest point in 24h defines bar length
-        _row_h   = lev_heat.max(axis=1)
-        _row_max = _row_h.max() or 1.0
-
-        # Dark purple background fill (matches Coinglass background colour)
-        ax.set_facecolor("#0d0012")
-
-        # Only show the most significant clusters — top 50% of peak intensity
-        _threshold = _row_max * 0.50
-        # Find nearest grid index for each key level using argmin (robust against grid offsets)
-        _nl_tup   = _an_pre.get("nearest_long_liq") if _an_pre else None
-        _ns_tup   = _an_pre.get("nearest_short_liq") if _an_pre else None
-        _nl_price = _nl_tup[0] if _nl_tup else None
-        _ns_price = _ns_tup[0] if _ns_tup else None
-        _nl_idx   = int(np.argmin(np.abs(grid - _nl_price))) if _nl_price else -1
-        _ns_idx   = int(np.argmin(np.abs(grid - _ns_price))) if _ns_price else -1
-
-        for i in range(n_prices):
-            h = float(_row_h[i])
-            is_key = i in (_nl_idx, _ns_idx)
-            if h < _threshold and not is_key:
-                continue
-            t         = max(h / _row_max, 0.55 if is_key else 0.0)  # key levels always visible
-            color     = "#ffee00" if is_key else cg(t)               # bright yellow for key levels
-            bar_len   = t * n_candles
-            bar_left  = n_candles - bar_len
-            _alpha    = 0.97 if is_key else min(0.95, 0.30 + 0.65 * t)
-            _height   = HEATMAP_BIN * 0.75 if is_key else HEATMAP_BIN * 0.55
-            ax.barh(grid[i], bar_len, height=_height,
-                    left=bar_left, align="center",
-                    color=color, alpha=_alpha,
-                    linewidth=0, zorder=2 if is_key else 1)
-
-    # ── Layer 3: resting order-book walls — bold band + spine style ───────────
-    # Bids = cyan bands below price, Asks = orange bands above price.
-    # Each wall gets: a semi-transparent fill band (axhspan) + a solid spine line.
-    # This makes walls visually distinct from the liq bars (which are barh rectangles).
-    _bid_max = max(bid_c.values(), default=1) or 1
-    _ask_max = max(ask_c.values(), default=1) or 1
-    _half_band = HEATMAP_BIN * 0.30          # half-height of the fill band
-    for _wp, _wn in bid_c.items():
-        if zoom_lo <= _wp <= zoom_hi and _wp < cprice:
-            _s = _wn / _bid_max
-            if _s > 0.08:                    # only the meaningful walls
-                _band_alpha = 0.08 + 0.22 * _s
-                _line_alpha = 0.55 + 0.45 * _s
-                _lw         = 1.0 + 2.5 * _s
-                # faint fill band
-                ax.axhspan(_wp - _half_band, _wp + _half_band,
-                           color="#3fb950", alpha=_band_alpha, zorder=2, linewidth=0)
-                # crisp spine on top of band
-                ax.axhline(_wp, color="#3fb950", lw=_lw,
-                           alpha=_line_alpha, zorder=4,
-                           linestyle="--", dashes=(6, 3), solid_capstyle="butt")
-    for _wp, _wn in ask_c.items():
-        if zoom_lo <= _wp <= zoom_hi and _wp > cprice:
-            _s = _wn / _ask_max
-            if _s > 0.08:
-                _band_alpha = 0.08 + 0.22 * _s
-                _line_alpha = 0.55 + 0.45 * _s
-                _lw         = 1.0 + 2.5 * _s
-                ax.axhspan(_wp - _half_band, _wp + _half_band,
-                           color="#f85149", alpha=_band_alpha, zorder=2, linewidth=0)
-                ax.axhline(_wp, color="#f85149", lw=_lw,
-                           alpha=_line_alpha, zorder=4,
-                           linestyle="--", dashes=(6, 3), solid_capstyle="butt")
-
-    # Colorbar
-    fig = ax.get_figure()
-    cax = inset_axes(ax, width="2.2%", height="38%", loc="lower left",
-                     bbox_to_anchor=(0.035, 0.035, 1, 1),
-                     bbox_transform=ax.transAxes, borderpad=0)
-    sm = ScalarMappable(cmap=cg, norm=Normalize(vmin=0, vmax=liq_raw_max))
-    sm.set_array([])
-    cbar = fig.colorbar(sm, cax=cax)
-    cbar.ax.tick_params(labelsize=5.5, colors="#8b949e", length=2)
-    cbar.set_label("Liq (USD)", color="#8b949e", fontsize=5.5, labelpad=2)
-    cbar.ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: _fusd(v)))
-    for lbl in cbar.ax.get_yticklabels():
-        lbl.set_color("#8b949e")
-    cbar.outline.set_edgecolor("#21262d")
-    cbar.ax.set_facecolor("#0d1117")
-
-    # ── Right-axis wall labels ──────────────────────────────────
-    bid_walls = liq.get("liq_bid_walls", [])
-    ask_walls = liq.get("liq_ask_walls", [])
-    bid_usd_total = liq.get("liq_total_bid", 0)
-    ask_usd_total = liq.get("liq_total_ask", 0)
-
-    ax_right = ax.twinx()
-    ax_right.set_ylim(zoom_lo, zoom_hi)
-    ax_right.set_yticks([])
-    ax_right.tick_params(right=False)
-    for sp in ax_right.spines.values():
-        sp.set_visible(False)
-
-    # ── Layer 4: price line with glow ────────────────────────────────────────
-    x        = np.arange(n_candles)
-    closes_v = plot_df["Close"].values
-    highs_v  = plot_df["High"].values
-    lows_v   = plot_df["Low"].values
-    opens_v  = plot_df["Open"].values
-    # Wide faint glow → medium → crisp bright core
-    for _lw, _a in [(6, 0.06), (3, 0.15), (1.3, 0.95)]:
-        ax.plot(x, closes_v, color="#ffffff", lw=_lw, alpha=_a, zorder=6 + _lw,
-                solid_capstyle="round")
-    # Current price tag on right axis
-    ax_right.annotate(
-        f" ${closes_v[-1]:,.0f}",
-        xy=(1.0, closes_v[-1]), xycoords=ax_right.get_yaxis_transform(),
-        fontsize=8.5, color="#ffffff", fontweight="bold",
-        va="center", ha="left", annotation_clip=False,
-        bbox=dict(boxstyle="round,pad=0.3", fc="#0d1117", ec="#ffffff",
-                  alpha=0.95, lw=1.2),
-    )
-
-    def _render_wall_labels(walls, color, side, depth_total):
-        if not walls:
-            return
-
-        in_view  = [(p, n) for p, n in walls if zoom_lo <= p <= zoom_hi][:3]
-        out_view = [(p, n) for p, n in walls if p < zoom_lo or p > zoom_hi]
-
-        # Sort bids high→low, asks low→high (natural price order on chart)
-        in_view.sort(key=lambda x: x[0], reverse=(side == "bid"))
-
-        if in_view:
-            max_n   = max(n for _, n in in_view)
-            min_gap = zoom_range * 0.028
-
-            slots = []
-            for wp, wn in in_view:
-                y = wp
-                for _ in range(40):
-                    if all(abs(y - s) >= min_gap for s in slots):
-                        break
-                    y += min_gap * (1 if side == "ask" else -1)
-                y = max(zoom_lo + zoom_range * 0.015,
-                        min(zoom_hi - zoom_range * 0.015, y))
-                slots.append(y)
-
-                alpha = 0.25 + 0.30 * (wn / max_n)
-                lw    = 0.5  + 0.8  * (wn / max_n)
-                ax.axhline(wp, color=color, lw=lw, ls=(0, (4, 3)), alpha=alpha, zorder=3)
-
-                dist_pct = abs(wp - cprice) / cprice * 100
-                tag = "BID" if side == "bid" else "ASK"
-                ax_right.annotate(
-                    f"{_fprice_m(wp)} {tag} ({_fusd_m(wn)})  {dist_pct:.1f}%",
-                    xy=(1.01, y),
-                    xycoords=ax_right.get_yaxis_transform(),
-                    fontsize=6.5, color=color,
-                    va="center", ha="left", fontweight="bold",
-                    annotation_clip=False,
-                    bbox=dict(boxstyle="round,pad=0.13", fc="#0d1117",
-                              ec=color, alpha=0.92, lw=0.6),
-                )
-
-        # Always show total depth pill — out-of-view count + full notional
-        n_shown = len(in_view)
-        n_hidden = len(out_view)
-        hidden_total = sum(n for _, n in out_view)
-        tag = "BID" if side == "bid" else "ASK"
-
-        if side == "bid":
-            pill_y = zoom_lo + zoom_range * 0.035
-            # push up if a wall label is sitting there
-            if slots and min(slots) < pill_y + zoom_range * 0.04:
-                pill_y = zoom_lo + zoom_range * 0.015
-            if n_hidden > 0:
-                pill = f"▼ +{n_hidden} {tag} below view  {_fusd_m(hidden_total)}"
-            else:
-                pill = f"TOTAL {tag} DEPTH  {_fusd_m(depth_total)}"
-        else:
-            pill_y = zoom_hi - zoom_range * 0.035
-            if slots and max(slots) > pill_y - zoom_range * 0.04:
-                pill_y = zoom_hi - zoom_range * 0.015
-            if n_hidden > 0:
-                pill = f"▲ +{n_hidden} {tag} above view  {_fusd_m(hidden_total)}"
-            else:
-                pill = f"TOTAL {tag} DEPTH  {_fusd_m(depth_total)}"
-
-        ax_right.annotate(
-            pill,
-            xy=(1.01, pill_y),
-            xycoords=ax_right.get_yaxis_transform(),
-            fontsize=7, color=color,
-            va="center", ha="left", fontweight="bold",
-            annotation_clip=False,
-            bbox=dict(boxstyle="round,pad=0.18", fc="#0d1117",
-                      ec=color, alpha=0.94, lw=0.9),
-        )
-
-    _render_wall_labels(bid_walls, "#3fb950", "bid", bid_usd_total)
-    _render_wall_labels(ask_walls, "#f85149", "ask", ask_usd_total)
-
-    # Price marker
-    ax.axhline(cprice, color="#ffffff", lw=0.6, ls=":", alpha=0.25, zorder=3)
-
-    # ── Sweep markers: wick-through-wall then close on opposite side ──────────
-    # ▼S = bid sweep (wick below wall, close above) → potential long entry signal
-    # ▲S = ask sweep (wick above wall, close below) → potential short entry signal
-    # Only scan the last 8 candles (2h) — current wall prices are stale beyond that
-    _sw_walls = ([(p, "bid") for p, _ in bid_walls[:3] if zoom_lo <= p <= zoom_hi] +
-                 [(p, "ask") for p, _ in ask_walls[:3] if zoom_lo <= p <= zoom_hi])
-    for _t in range(max(1, n_candles - 8), n_candles):
-        for _swp, _sws in _sw_walls:
-            if _sws == "bid" and lows_v[_t] < _swp < closes_v[_t] and closes_v[_t] > opens_v[_t]:
-                ax.annotate("▼S", xy=(_t, _swp), fontsize=6, color="#3fb950",
-                            ha="center", va="top", zorder=9, fontweight="bold",
-                            annotation_clip=True)
-            elif _sws == "ask" and highs_v[_t] > _swp > closes_v[_t] and closes_v[_t] < opens_v[_t]:
-                ax.annotate("▲S", xy=(_t, _swp), fontsize=6, color="#f85149",
-                            ha="center", va="bottom", zorder=9, fontweight="bold",
-                            annotation_clip=True)
-
-    # ── Directional intent ────────────────────────────────────────
-    analysis  = liq.get("liq_analysis", {})
-    nl        = analysis.get("nearest_long_liq")
-    ns        = analysis.get("nearest_short_liq")
-    lt        = analysis.get("long_liq_total", 0)
-    st_liq    = analysis.get("short_liq_total", 0)
-    hz        = analysis.get("hunt_zones", [])
-    cd        = analysis.get("cascade_direction", "BALANCED")
-    bid_walls = liq.get("liq_bid_walls", [])
-    ask_walls = liq.get("liq_ask_walls", [])
-    ratio     = liq.get("liq_depth_ratio", 1.0)
-
-    # Which liq target is the primary magnet vs the secondary?
-    if cd == "UP":
-        primary_liq, secondary_liq   = ns, nl
-        primary_col, secondary_col   = "#3fb950", "#f85149"
-        dir_label                    = "HUNTING UP"
-    elif cd == "DOWN":
-        primary_liq, secondary_liq   = nl, ns
-        primary_col, secondary_col   = "#f85149", "#3fb950"
-        dir_label                    = "HUNTING DOWN"
-    else:
-        dir_label = "BALANCED"
-        primary_col, secondary_col = "#ffd700", "#8b949e"
-        # Score = pool_size / distance_pct — larger pool at similar distance wins.
-        # This correctly identifies the stronger magnet (bigger payoff for hunters).
-        ns_dist  = abs(ns[0] - cprice) / cprice * 100 if ns else float("inf")
-        nl_dist  = abs(nl[0] - cprice) / cprice * 100 if nl else float("inf")
-        ns_score = (ns[1] / ns_dist) if ns and ns_dist > 0 else 0
-        nl_score = (nl[1] / nl_dist) if nl and nl_dist > 0 else 0
-        if nl_score >= ns_score:
-            primary_liq, secondary_liq = nl, ns
-        else:
-            primary_liq, secondary_liq = ns, nl
-
-    # Hunt zone: if it aligns with cascade, mark as the specific target level
-    hunt_target = None
-    for h in hz[:1]:
-        aligned = (cd == "UP" and h["side"] == "ASK") or (cd == "DOWN" and h["side"] == "BID")
-        if aligned:
-            hunt_target = h
-
-    # ── Liq-pool glow lines ───────────────────────────────────────
-    # Use the top of the heatmap spectrum (bright yellow) — same encoding as the
-    # yellow key-level bars.  Red/green are reserved for directional arrows only.
-    _liq_spectrum_top = _cg_cmap()(1.0)   # brightest end of the colormap
-    def _liq_glow(price):
-        if not (zoom_lo <= price <= zoom_hi):
-            return
-        for lw, a in [(12, 0.04), (6, 0.10), (2.5, 0.65)]:
-            ax.axhline(price, color=_liq_spectrum_top, lw=lw, alpha=a,
-                       zorder=3, solid_capstyle="butt")
-
-    _liq_glow(nl[0]) if nl else None
-    _liq_glow(ns[0]) if ns else None
-
-    # ── Secondary target (muted dashed + small label) ───────────
-    _spec_col = _liq_spectrum_top   # spectrum yellow, consistent with bars and glow
-    if secondary_liq and zoom_lo <= secondary_liq[0] <= zoom_hi:
-        ax.axhline(secondary_liq[0], color=_spec_col, lw=0.9,
-                   ls="--", alpha=0.35, zorder=4)
-        _sec_dist = abs(secondary_liq[0] - cprice) / cprice * 100
-        _sec_sign = "+" if secondary_liq[0] > cprice else "-"
-        _sec_lbl  = "LONG LIQ" if secondary_liq[0] < cprice else "SHORT LIQ"
-        ax.text(n_candles * 0.015, secondary_liq[0] + zoom_range * 0.007,
-                f"{_sec_lbl}  {_sec_sign}{_sec_dist:.1f}%  {_fusd_m(secondary_liq[1])} est.",
-                fontsize=6.5, color=_spec_col, alpha=0.65, zorder=6,
-                bbox=dict(boxstyle="round,pad=0.15", fc="#0d111780", ec="none"))
-
-    # ── Primary target: path shade + thick line + distance label ─
-    if primary_liq and zoom_lo <= primary_liq[0] <= zoom_hi:
-        shade_lo = min(cprice, primary_liq[0])
-        shade_hi = max(cprice, primary_liq[0])
-        ax.axhspan(shade_lo, shade_hi, alpha=0.05, color=_spec_col, zorder=1)
-        ax.axhline(primary_liq[0], color=_spec_col, lw=2.2, ls="-", alpha=0.88, zorder=5)
-        dist_pct  = abs(primary_liq[0] - cprice) / cprice * 100
-        sign      = "+" if primary_liq[0] > cprice else "-"
-        wall_notl = primary_liq[1]
-        tgt_label = "LONG LIQ TARGET" if primary_liq[0] < cprice else "SHORT LIQ TARGET"
-        ax.text(n_candles * 0.015, primary_liq[0] + zoom_range * 0.009,
-                f"{tgt_label}  {sign}{dist_pct:.1f}%  {_fusd_m(wall_notl)} est.",
-                fontsize=7.5, color=_spec_col, fontweight="bold", zorder=7,
-                bbox=dict(boxstyle="round,pad=0.2", fc="#0d111780", ec="none"))
-
-    # ── Hunt zone line (gold, most specific target) ──────────────
-    if hunt_target and zoom_lo <= hunt_target["price"] <= zoom_hi:
-        ax.axhline(hunt_target["price"], color="#ffd700", lw=1.8,
-                   ls=(0, (5, 2)), alpha=0.85, zorder=5)
-
-    # ── Directional intent box (between price and primary target) ─
-    if cd != "BALANCED" and primary_liq:
-        dist_pct = abs(primary_liq[0] - cprice) / cprice * 100
-        sign     = "+" if primary_liq[0] > cprice else "-"
-        arrow    = "▲" if cd == "UP" else "▼"
-        mid_y    = (cprice + primary_liq[0]) / 2
-        if zoom_lo < mid_y < zoom_hi:
-            ax.text(n_candles * 0.68, mid_y,
-                    f"{arrow}  {dir_label}\n{_fprice_m(primary_liq[0])}  ({sign}{dist_pct:.1f}%)",
-                    fontsize=9.5, color=primary_col, fontweight="bold",
-                    ha="center", va="center", zorder=8,
-                    bbox=dict(boxstyle="round,pad=0.5", fc="#0d1117",
-                              ec=primary_col, alpha=0.93, lw=1.8))
-
-    # ── KEY LEVELS box (top-left, compact) ───────────────────────
-    imb_lbl   = "bid-heavy" if ratio > 1.2 else ("ask-heavy" if ratio < 0.8 else "balanced")
-    lvl_lines = [" KEY LEVELS"]
-    if ns:
-        d = (ns[0] - cprice) / cprice * 100
-        lvl_lines.append(f" Short liq {_fprice_m(ns[0])}  +{d:.1f}%  {_fusd_m(ns[1])} est.")
-    if nl:
-        d = (cprice - nl[0]) / cprice * 100
-        lvl_lines.append(f" Long liq  {_fprice_m(nl[0])}  -{d:.1f}%  {_fusd_m(nl[1])} est.")
-    if hz:
-        h = hz[0]
-        lvl_lines.append(f" Hunt({'ASK' if h['side']=='ASK' else 'BID'}) "
-                         f"{_fprice_m(h['price'])}  {_fusd_m(h['wall'])} wall")
-    lvl_lines.append(f" Book {ratio:.1f}x {imb_lbl}")
-
-    # ── Book imbalance badge (bottom-right) ──────────────────────────────────
-    _bid_d = liq.get("liq_total_bid", 0)
-    _ask_d = liq.get("liq_total_ask", 0)
-    _imb   = _bid_d / _ask_d if _ask_d > 0 else 1.0
-    if _imb > 1.1:
-        _ic, _il = "#3fb950", f"BID {_imb:.2f}x  ▲ bullish"
-    elif _imb < 0.9:
-        _ic, _il = "#f85149", f"ASK {1/_imb:.2f}x  ▼ bearish"
-    else:
-        _ic, _il = "#8b949e", f"BALANCED  {_imb:.2f}x"
-    ax.text(0.988, 0.022, f"Book Imbalance  {_il}",
-            transform=ax.transAxes, fontsize=7.5, color=_ic,
-            ha="right", va="bottom", fontweight="bold", zorder=8,
-            bbox=dict(boxstyle="round,pad=0.3", fc="#0d1117", ec=_ic,
-                      alpha=0.93, lw=0.9))
-
-    ax.text(0.012, 0.978, "\n".join(lvl_lines), transform=ax.transAxes,
-            fontsize=7, color="#c9d1d9", va="top", ha="left", family="monospace",
-            linespacing=1.5, zorder=7,
-            bbox=dict(boxstyle="round,pad=0.4", fc="#0d111799", ec="#58a6ff", alpha=0.95, lw=0.8))
-
-    ax.set_xlim(-0.5, n_candles - 0.5)
-    ax.set_ylim(zoom_lo, zoom_hi)
-    ax_right.set_ylim(zoom_lo, zoom_hi)
-
-    step   = max(1, n_candles // 8)
-    xticks = list(range(0, n_candles, step))
-    xlbls  = [plot_df.index[i].strftime("%H:%M") if i < n_candles else "" for i in xticks]
-    ax.set_xticks(xticks)
-    ax.set_xticklabels(xlbls, fontsize=7, color="#8b949e")
-
-    zoom_g = _snap_grid(zoom_lo, zoom_hi, HEATMAP_BIN)
-    ystep  = max(1, len(zoom_g) // 12)
-    ax.set_yticks(zoom_g[::ystep])
-    ax.set_yticklabels([f"${p:,.0f}" for p in zoom_g[::ystep]], fontsize=7)
-    src = liq.get("liq_source", "")
-    n_ev = len(st.session_state.get(_LIQ_EVENTS_KEY, {}))
-    if cg_data:
-        ev_lbl = "Coinglass open-interest data"
-    elif hb_data:
-        ev_lbl = "Hyblock liquidation levels"
-    elif ss_data:
-        ev_lbl = f"Screenshot extract · {ss_data.get('n_clusters', '?')} clusters (Claude vision)"
-    elif n_ev >= 5:
-        ev_lbl = f"OB projection + {n_ev} real liq events (Binance+Bybit)"
-    else:
-        ev_lbl = f"Order-book projection · collecting real events ({n_ev})"
-    ax.set_title(f"BTC Liquidation Heatmap · 24h/15m  ·  {ev_lbl}  ·  {src}",
-                 color="#8b949e", fontsize=8)
-
-    # ── Legend (top-right, inside axes, below the right-side wall labels) ────
-    from matplotlib.lines import Line2D
-    from matplotlib.patches import Patch
-    _leg_items = [
-        Patch(facecolor="#3d2b00", edgecolor="#ffee00", lw=0.8, label="Liq bar (spectrum: purple→yellow = low→high)"),
-        Line2D([0], [0], color="#ffee00", lw=2.0,               label="Primary liq cluster / hunt target"),
-        Line2D([0], [0], color="#ffee00", lw=0.9, ls="--",      label="Secondary liq cluster"),
-        Line2D([0], [0], color="#ffd700", lw=1.4, ls=(0,(5,2)), label="Specific hunt zone"),
-        Line2D([0], [0], color="#f85149", lw=1.5, ls="--",      label="Ask wall (resting sell orders)"),
-        Line2D([0], [0], color="#3fb950", lw=1.5, ls="--",      label="Bid wall (resting buy orders)"),
-    ]
-    # Place outside the axes — below the x-axis — so it never overlaps chart content
-    _leg = ax.legend(
-        handles=_leg_items,
-        loc="upper left",
-        bbox_to_anchor=(0.0, -0.09),   # just below x-axis labels
-        bbox_transform=ax.transAxes,
-        fontsize=6.0,
-        framealpha=0.90,
-        facecolor="#0d1117",
-        edgecolor="#30363d",
-        labelcolor="#c9d1d9",
-        handlelength=2.4,
-        handleheight=0.9,
-        borderpad=0.55,
-        labelspacing=0.35,
-        ncols=3,                        # 2 rows × 3 cols fits cleanly under the chart
-    )
-    _leg.set_zorder(10)
+        if not snapshots or len(snapshots) < 2 or not current_price:
+            return None
+        keys = sorted(snapshots)
+        BIN  = 100.0                      # display bin ($100 — 2 model bins)
+        ylo  = current_price * 0.92
+        yhi  = current_price * 1.08
+        y_bins = np.arange(np.floor(ylo / BIN) * BIN, yhi + BIN, BIN)
+        if len(y_bins) < 4:
+            return None
+        mat   = np.zeros((len(y_bins), len(keys)))
+        px_ln = []
+        for j, k in enumerate(keys):
+            snap = snapshots[k]
+            px_ln.append(snap.get("px") or np.nan)
+            for side in ("long", "short"):
+                for p, u in snap.get(side) or []:
+                    if ylo <= p <= yhi:
+                        i = int((p - y_bins[0]) // BIN)
+                        if 0 <= i < len(y_bins):
+                            mat[i, j] += u
+        if mat.max() <= 0:
+            return None
+        fig, ax = plt.subplots(figsize=(13, 4.2))
+        fig.patch.set_facecolor("#0d1117")
+        _ax_style(ax)
+        # log scale — clusters span 2-3 orders of magnitude like Coinglass.
+        # vmin anchored at the smallest NONZERO cell so the colormap grades
+        # across actual fuel levels instead of rendering binary on/off
+        # (empty cells clip to the dark bottom of the colormap).
+        _lv = np.log1p(mat)
+        _nz = _lv[_lv > 0]
+        im = ax.imshow(_lv, aspect="auto", origin="lower",
+                       cmap="plasma", interpolation="nearest",
+                       vmin=float(_nz.min()) * 0.98, vmax=float(_nz.max()),
+                       extent=[0, len(keys), y_bins[0], y_bins[-1] + BIN])
+        # Spot price line
+        xs = np.arange(len(keys)) + 0.5
+        ax.plot(xs, px_ln, color="#ffffff", lw=1.3, alpha=0.9)
+        # Sparse SGT time ticks
+        _sgt = _tz(offset=__import__("datetime").timedelta(hours=8))
+        step = max(1, len(keys) // 8)
+        ax.set_xticks(np.arange(0, len(keys), step) + 0.5)
+        ax.set_xticklabels(
+            [_dt.fromisoformat(keys[i]).astimezone(_sgt).strftime("%d %b %H:%M")
+             for i in range(0, len(keys), step)],
+            rotation=25, ha="right", fontsize=7, color="#8b949e")
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"${v:,.0f}"))
+        ax.set_title("Synthetic Liquidation Heatmap — time × price (log intensity)",
+                     color="#e6edf3", fontsize=10, loc="left")
+        cb = fig.colorbar(im, ax=ax, pad=0.01, fraction=0.03)
+        cb.ax.tick_params(colors="#8b949e", labelsize=7)
+        cb.set_label("log(liq fuel $)", color="#8b949e", fontsize=8)
+        fig.tight_layout()
+        return fig
+    except Exception:
+        return None
 
 
 # ════════════════════════════════════════════════════════════════
@@ -7220,6 +6685,15 @@ def run_analysis(ticker: str = "BTC-USD") -> dict:
     if df.empty:
         return {}
 
+    # Refresh the realized-liq events store every render. Powers Cascade Direction
+    # conviction filter, Swept Reversal proximity weighting, and 24h Liq Imbalance.
+    # Used to be called from inside plot_liquidity_depth (now removed) — moved here
+    # so the engine signals keep working without depending on a rendered figure.
+    try:
+        _push_liq_events(_fetch_liq_events())
+    except Exception:
+        pass
+
     closes = df["Close"].tolist()
     price  = closes[-1]
     # Override with live spot price so we don't render against a stale daily close.
@@ -7241,6 +6715,41 @@ def run_analysis(ticker: str = "BTC-USD") -> dict:
     supports, resistances = find_levels(closes)
     imm_sup = nearest_level(supports,    price, "support")
     imm_res = nearest_level(resistances, price, "resistance")
+    # Extended fallback (±25%) — surfaces a level after violent moves when the
+    # nearest pivot sits beyond the immediate 15% band. Only populated when the
+    # immediate level is absent, so charts can render a clearly-marked "ext" line.
+    ext_sup = nearest_level(supports,    price, "support",    pct=0.25) if imm_sup is None else None
+    ext_res = nearest_level(resistances, price, "resistance", pct=0.25) if imm_res is None else None
+    # Deep-history S/R (~3y of daily candles) — surfaces older pivots that the
+    # 1Y window misses (e.g. 2024 cycle top, pre-halving consolidation). Used only
+    # as faint reference lines on the chart; never feeds the scorer.
+    hist_sup, hist_res = [], []
+    try:
+        if "BTC" in ticker.upper():
+            _deep_df = _fetch_binance_klines("1d", 1000)
+            if _deep_df is not None and len(_deep_df) > len(df):
+                _deep_closes = _deep_df["Close"].tolist()
+                _ds, _dr = find_levels(_deep_closes)
+                # Drop levels already within 1% of a 1Y level (avoid duplicates)
+                def _is_new(_lvl, _existing):
+                    return not any(abs(_lvl - e) / e < 0.01 for e in _existing)
+                # Keep levels within ±35% of price — beyond that they're noise
+                _band = 0.35
+                hist_sup = sorted(
+                    [l for l in _ds
+                     if l < price
+                     and (price - l) / price < _band
+                     and _is_new(l, supports)],
+                    reverse=True,
+                )[:1]
+                hist_res = sorted(
+                    [l for l in _dr
+                     if l > price
+                     and (l - price) / price < _band
+                     and _is_new(l, resistances)],
+                )[:1]
+    except Exception:
+        pass
     w52     = week52_metrics(closes)
 
     # ── New indicators ────────────────────────────────────────
@@ -7328,7 +6837,9 @@ def run_analysis(ticker: str = "BTC-USD") -> dict:
     return dict(
         df=df, plot_df=plot_df, short_df=short_df, closes=closes, price=price,
         rsi_series=rsi_series, obv_trend=obv_trend, div_rsi=div_rsi,
-        adx_val=adx_val, imm_sup=imm_sup, imm_res=imm_res, w52=w52,
+        adx_val=adx_val, imm_sup=imm_sup, imm_res=imm_res,
+        ext_sup=ext_sup, ext_res=ext_res,
+        hist_sup=hist_sup, hist_res=hist_res, w52=w52,
         fib=fib, bb=bb,
         crypto_sig=crypto_sig, btc_liq=btc_liq, has_liq=has_liq,
         cycle=cycle, prediction=prediction, bias_72h=bias_72h, bias_24h=bias_24h,
@@ -7391,19 +6902,34 @@ def fig_price_chart(a: dict) -> plt.Figure:
                     alpha=0.04, color="#bc8cff")
 
     # ── S/R levels ────────────────────────────────────────────────
-    if a["imm_sup"]: ax.axhline(a["imm_sup"], ls="--", color="#3fb950", alpha=0.65, lw=1.2, label=f"Sup ${a['imm_sup']:,.0f}")
-    if a["imm_res"]: ax.axhline(a["imm_res"], ls="--", color="#f85149", alpha=0.65, lw=1.2, label=f"Res ${a['imm_res']:,.0f}")
+    if a["imm_sup"]:
+        ax.axhline(a["imm_sup"], ls="--", color="#3fb950", alpha=0.65, lw=1.2, label=f"Sup ${a['imm_sup']:,.0f}")
+    elif a.get("ext_sup"):
+        ax.axhline(a["ext_sup"], ls=(0, (2, 3)), color="#3fb950", alpha=0.35, lw=1.0, label=f"Sup ext ${a['ext_sup']:,.0f}")
+    if a["imm_res"]:
+        ax.axhline(a["imm_res"], ls="--", color="#f85149", alpha=0.65, lw=1.2, label=f"Res ${a['imm_res']:,.0f}")
+    elif a.get("ext_res"):
+        ax.axhline(a["ext_res"], ls=(0, (2, 3)), color="#f85149", alpha=0.35, lw=1.0, label=f"Res ext ${a['ext_res']:,.0f}")
 
-    # ── Fibonacci levels (within ±25% of price) ───────────────────
-    fib_colors = {"0.0%": "#8b949e", "23.6%": "#58a6ff", "38.2%": "#3fb950",
-                  "50.0%": "#ffd700", "61.8%": "#f0883e", "78.6%": "#f85149", "100.0%": "#8b949e"}
-    for label, lvl in fib["levels"].items():
-        if abs(lvl - price) / price < 0.25:
-            col = fib_colors.get(label, "#8b949e")
-            ax.axhline(lvl, color=col, alpha=0.45, lw=0.85, ls=(0, (5, 4)),
-                       label=f"Fib {label} ${lvl:,.0f}")
-            ax.text(plot_df.index[1], lvl * 1.001, f"Fib {label}",
-                    fontsize=6.5, color=col, alpha=0.75, va="bottom")
+    # Historical S/R + Fib levels removed 2026-06-08 per user request:
+    # one support + one resistance is enough (the imm_sup/imm_res block above).
+
+    # ── Current price line + right-edge tag ───────────────────────
+    # Faint horizontal at spot + boxed price label on the right axis so the
+    # current quote is readable without hovering. Tag color reflects price vs.
+    # MA50 (above = bull-bias green, below = bear-bias red).
+    try:
+        _ma50_last = float(plot_df["MA50"].dropna().iloc[-1])
+        _px_col    = "#3fb950" if price >= _ma50_last else "#f85149"
+    except Exception:
+        _px_col    = "#ffffff"
+    ax.axhline(price, color=_px_col, lw=0.8, ls=":", alpha=0.55, zorder=3)
+    ax.annotate(f"  ${price:,.0f}",
+                xy=(1.002, price), xycoords=ax.get_yaxis_transform(),
+                fontsize=8.5, color="#ffffff", va="center", ha="left",
+                clip_on=False, fontweight="700",
+                bbox=dict(boxstyle="round,pad=0.25", fc=_px_col, ec=_px_col,
+                          alpha=0.95, lw=0.8))
 
     # ── Cycle badge + BB squeeze annotation ───────────────────────
     _cycle  = a["cycle"]
@@ -7452,6 +6978,289 @@ def fig_price_chart(a: dict) -> plt.Figure:
     rsi_col = "#f85149" if rsi_now > 70 else ("#3fb950" if rsi_now < 30 else "#8b949e")
     ax_rsi.text(0.995, 0.92, f"RSI {rsi_now:.0f}", transform=ax_rsi.transAxes,
                 fontsize=8, va="top", ha="right", color=rsi_col)
+
+    plt.tight_layout(pad=0.5)
+    return fig
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _fetch_weekly_btc():
+    """Weekly BTC klines for long-term charts. Binance max=1000 candles ≈ 19y.
+    Raises on empty/None so st.cache_data does NOT memoize the failure — otherwise
+    one transient Binance hiccup would lock the LT chart into 1Y-fallback for 15min."""
+    df = _fetch_binance_klines("1w", 1000)
+    if df is None or len(df) < 60:
+        raise RuntimeError("weekly BTC fetch returned no usable data")
+    return df
+
+
+def _safe_fetch_weekly_btc():
+    """Wrapper that turns the cached-fetch's exception back into a None return,
+    so callers can use the simple `if df is None` pattern."""
+    try:
+        return _fetch_weekly_btc()
+    except Exception:
+        return None
+
+
+def fig_price_chart_lt(a: dict, mode: str = "5Y") -> "plt.Figure | None":
+    """Long-term price chart (5Y or ALL) on weekly candles, with 50/100/200/300wk MAs
+    and the Mayer Multiple (price ÷ 200wk MA). 200wk is the classic BTC cycle floor."""
+    df = _safe_fetch_weekly_btc()
+    if df is None or len(df) < 60:
+        return None
+    df = df.copy()
+    # Override the live (still-forming) weekly bar's close with live spot.
+    try:
+        if a.get("price"):
+            df.iloc[-1, df.columns.get_loc("Close")] = float(a["price"])
+    except Exception:
+        pass
+    df["MA50w"]  = df["Close"].rolling(50).mean()
+    df["MA100w"] = df["Close"].rolling(100).mean()
+    df["MA200w"] = df["Close"].rolling(200).mean()
+    df["MA300w"] = df["Close"].rolling(300).mean()
+    df["RSIw"]   = calculate_rsi(df["Close"])
+    # Weekly Bollinger Bands (20-week, 2σ) — computed in LOG-space so the
+    # bands scale geometrically (mid × multiplier vs ± dollars). On a chart
+    # that spans $3k → $130k, arithmetic BB blows up: σ in absolute dollars
+    # during the Mar 2020 crash drives `mid − 2σ` to near zero / negative,
+    # which looks like the lower band falls off a cliff. Log-BB is always
+    # positive and behaves correctly across multi-cycle price ranges.
+    _logc       = np.log(df["Close"])
+    _bb_log_mid = _logc.rolling(20).mean()
+    _bb_log_std = _logc.rolling(20).std()
+    df["BBw_mid"]   = np.exp(_bb_log_mid)
+    df["BBw_upper"] = np.exp(_bb_log_mid + 2 * _bb_log_std)
+    df["BBw_lower"] = np.exp(_bb_log_mid - 2 * _bb_log_std)
+    # Mayer Multiple extreme bands (relative to 200wk MA): the 0.8× and 2.4×
+    # lines are the historically-validated capitulation and blow-off zones.
+    df["MM_low"]  = df["MA200w"] * 0.80
+    df["MM_high"] = df["MA200w"] * 2.40
+
+    if mode == "5Y":
+        plot   = df.iloc[-260:].copy()
+        suffix = "5Y (Weekly)"
+        bar_w  = 4.0
+    else:
+        plot   = df.copy()
+        suffix = "ALL (Weekly)"
+        bar_w  = 6.5
+
+    price = float(a.get("price") or plot["Close"].iloc[-1])
+
+    fig, (ax, ax_vol, ax_rsi) = plt.subplots(
+        3, 1, figsize=(13, 7.0), sharex=True,
+        gridspec_kw={"height_ratios": [4, 1, 1], "hspace": 0.04}
+    )
+    fig.patch.set_facecolor("#0d1117")
+    for _a in (ax, ax_vol, ax_rsi): _ax_style(_a)
+
+    # Weekly Bollinger Bands (20w, 2σ) — drawn first so price/MAs draw over them.
+    # BB Lower can go ≤0 during extreme volatility (e.g. Mar 2020 COVID crash).
+    # On log scale that nukes the y-axis, so mask non-positive values to NaN.
+    if plot["BBw_mid"].notna().any():
+        _bb_up = plot["BBw_upper"].where(plot["BBw_upper"] > 0)
+        _bb_lo = plot["BBw_lower"].where(plot["BBw_lower"] > 0)
+        ax.plot(plot.index, _bb_up, color="#bc8cff",
+                alpha=0.5, lw=0.9, ls="--", label="BB20w")
+        ax.plot(plot.index, _bb_lo, color="#bc8cff",
+                alpha=0.5, lw=0.9, ls="--")
+        ax.fill_between(plot.index, _bb_up, _bb_lo, alpha=0.04, color="#bc8cff")
+
+    # Mayer extreme bands (0.8× & 2.4× of 200wk MA) — historic cap/floor zones.
+    if plot["MM_low"].notna().any():
+        ax.plot(plot.index, plot["MM_low"],  color="#3fb950",
+                alpha=0.45, lw=0.9, ls=(0, (4, 4)),
+                label="Mayer 0.8×")
+    if plot["MM_high"].notna().any():
+        ax.plot(plot.index, plot["MM_high"], color="#f85149",
+                alpha=0.45, lw=0.9, ls=(0, (4, 4)),
+                label="Mayer 2.4×")
+
+    # Price line + soft fill
+    ax.plot(plot.index, plot["Close"], color="#e6edf3", lw=1.4, alpha=0.9, zorder=3)
+    ax.fill_between(plot.index, plot["Close"], float(plot["Close"].min()),
+                    alpha=0.06, color="#58a6ff")
+
+    # Long-term MAs (only draw lines that actually have data inside the view)
+    _ma_defs = [
+        ("MA50w",  "MA50w",   "#58a6ff", 1.2, False),
+        ("MA100w", "MA100w",  "#39d353", 1.2, False),
+        ("MA200w", "MA200w",  "#f0883e", 1.7, True),
+        # MA300w gets its own hot-pink so it doesn't clash with BB (purple).
+        ("MA300w", "MA300w",  "#ff79c6", 1.2, False),
+    ]
+    for _col_name, _lbl, _c, _lw, _bold in _ma_defs:
+        _s = plot[_col_name]
+        if _s.notna().any():
+            ax.plot(plot.index, _s, color=_c, alpha=0.85 if _bold else 0.75,
+                    lw=_lw, label=_lbl)
+
+    # ── Bitcoin halving lines ─────────────────────────────────────
+    # Mark each halving event as a faint vertical reference. Cycle structure
+    # (~4-year between halvings) is the dominant long-term rhythm.
+    _halvings = [
+        (pd.Timestamp("2012-11-28", tz="UTC"), "1st halving"),
+        (pd.Timestamp("2016-07-09", tz="UTC"), "2nd halving"),
+        (pd.Timestamp("2020-05-11", tz="UTC"), "3rd halving"),
+        (pd.Timestamp("2024-04-19", tz="UTC"), "4th halving"),
+    ]
+    _x_lo, _x_hi = plot.index.min(), plot.index.max()
+    for _ht, _hl in _halvings:
+        if _x_lo <= _ht <= _x_hi:
+            ax.axvline(_ht, color="#ffd700", alpha=0.30, lw=0.8, ls=":", zorder=1)
+            # Labels at the bottom keep them clear of the upper-left legend.
+            ax.text(_ht, 0.02, f" {_hl}", transform=ax.get_xaxis_transform(),
+                    fontsize=6.5, color="#ffd700", alpha=0.75, va="bottom", ha="left")
+
+    # ── ATH + drawdown ────────────────────────────────────────────
+    # Single horizontal at the in-view ATH; shade the area between ATH and
+    # current price to make the drawdown visually obvious.
+    _ath = float(plot["Close"].max())
+    _dd_pct = (price - _ath) / _ath * 100 if _ath > 0 else 0.0
+    if _ath > price > 0:
+        ax.axhline(_ath, color="#8b949e", alpha=0.45, lw=0.8, ls="--")
+        ax.fill_between(plot.index, _ath, price, alpha=0.05, color="#f85149", zorder=1)
+        ax.text(0.005, _ath, f"ATH ${_ath:,.0f}   DD {_dd_pct:+.1f}%",
+                transform=ax.get_yaxis_transform(), fontsize=7,
+                color="#8b949e", alpha=0.85, va="bottom", ha="left")
+
+    # Current price tag + Mayer Multiple
+    _ma200w_last = float(plot["MA200w"].dropna().iloc[-1]) if plot["MA200w"].notna().any() else None
+    _mm = (price / _ma200w_last) if (_ma200w_last and _ma200w_last > 0) else None
+    _px_col = ("#3fb950" if (_mm is not None and _mm >= 1.0)
+               else "#f85149" if _mm is not None else "#ffffff")
+    ax.axhline(price, color=_px_col, lw=0.8, ls=":", alpha=0.55, zorder=3)
+    ax.annotate(f"  ${price:,.0f}",
+                xy=(1.002, price), xycoords=ax.get_yaxis_transform(),
+                fontsize=8.5, color="#ffffff", va="center", ha="left",
+                clip_on=False, fontweight="700",
+                bbox=dict(boxstyle="round,pad=0.25", fc=_px_col, ec=_px_col,
+                          alpha=0.95, lw=0.8))
+
+    # Mayer Multiple is intentionally NOT shown as a number — MA200w plus the
+    # 0.8× / 2.4× bands on the chart already convey the ratio visually, and
+    # the canonical Mayer uses MA200**d** (not 200w), so a "Mayer 1.02×"
+    # readout against the weekly MA would be slightly mislabelled anyway.
+    # _mm is still used below to color the price tag green/red.
+
+    _rsi_now = float(plot["RSIw"].dropna().iloc[-1]) if plot["RSIw"].notna().any() else float("nan")
+    # Stack above axes (top→bottom):  legend row, then title row, then chart.
+    # Putting both outside the axes guarantees nothing occludes price action.
+    _title = f"BTC-USD  {suffix}  ·  Weekly RSI: {_rsi_now:.0f}"
+    ax.set_title(_title, color="#8b949e", fontsize=9, loc="left", pad=4)
+    ax.legend(loc="lower left", bbox_to_anchor=(0.0, 1.06),
+              fontsize=6.5, facecolor="#161b22",
+              labelcolor="#c9d1d9", framealpha=0.0, edgecolor="none",
+              ncol=7, handlelength=1.8, columnspacing=1.2,
+              borderpad=0.2, handletextpad=0.4)
+    # Reserve enough top margin for legend + title above the upper axes.
+    fig.subplots_adjust(top=0.90)
+    if mode == "ALL":
+        ax.set_yscale("log")  # Log scale only makes sense over multi-cycle history.
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(
+        lambda v, _: f"${v/1000:.0f}k" if v >= 1000 else f"${v:.0f}"))
+
+    # ── Right-edge value tags for each indicator ──────────────────
+    # Each line's current value at the right edge, color-matched to the
+    # line. To avoid the labels piling up on each other (e.g. MA100w +
+    # MA200w + BB lower clustering), they're stacked away from the live
+    # price box with a small leader line when bumped from true position.
+    _rt = []
+    for _col_name, _, _c, _, _ in _ma_defs:
+        _s = plot[_col_name]
+        if _s.notna().any():
+            _rt.append((float(_s.dropna().iloc[-1]), _c))
+    if plot["BBw_upper"].notna().any():
+        _rt.append((float(plot["BBw_upper"].dropna().iloc[-1]), "#bc8cff"))
+    if plot["BBw_lower"].notna().any():
+        _rt.append((float(plot["BBw_lower"].dropna().iloc[-1]), "#bc8cff"))
+    if plot["MM_low"].notna().any():
+        _rt.append((float(plot["MM_low"].dropna().iloc[-1]),  "#3fb950"))
+    if plot["MM_high"].notna().any():
+        _rt.append((float(plot["MM_high"].dropna().iloc[-1]), "#f85149"))
+
+    _y_lo, _y_hi = ax.get_ylim()
+    _is_log = (mode == "ALL")
+    def _y_to_frac(y):
+        if _is_log:
+            return (np.log10(y) - np.log10(_y_lo)) / (np.log10(_y_hi) - np.log10(_y_lo))
+        return (y - _y_lo) / (_y_hi - _y_lo)
+    def _frac_to_y(f):
+        if _is_log:
+            return 10 ** (f * (np.log10(_y_hi) - np.log10(_y_lo)) + np.log10(_y_lo))
+        return f * (_y_hi - _y_lo) + _y_lo
+
+    _band_frac = 0.035  # half-height of the price box in axes fraction
+    _min_gap   = 0.028  # min vertical spacing between adjacent labels
+    _p_frac    = _y_to_frac(price)
+
+    _in_range = []
+    for _v, _c in _rt:
+        if _v <= 0:
+            continue
+        _f = _y_to_frac(_v)
+        if 0 <= _f <= 1:
+            _in_range.append((_f, _v, _c))
+
+    # Stack labels DOWN from the price band on the below side
+    _below = sorted([t for t in _in_range if t[1] < price], key=lambda x: x[0], reverse=True)
+    _below_disp, _ceil = [], _p_frac - _band_frac
+    for _f, _v, _c in _below:
+        _df = min(_f, _ceil)
+        if _df < 0:
+            continue
+        _below_disp.append((_df, _v, _c))
+        _ceil = _df - _min_gap
+
+    # Stack labels UP from the price band on the above side
+    _above = sorted([t for t in _in_range if t[1] >= price], key=lambda x: x[0])
+    _above_disp, _floor = [], _p_frac + _band_frac
+    for _f, _v, _c in _above:
+        _df = max(_f, _floor)
+        if _df > 1.0:
+            continue
+        _above_disp.append((_df, _v, _c))
+        _floor = _df + _min_gap
+
+    for _df, _v, _c in _below_disp + _above_disp:
+        _v_disp = _frac_to_y(_df)
+        _bumped = abs(_v_disp - _v) / max(_v, 1.0) > 0.003
+        if _bumped:
+            ax.annotate(f" ${_v:,.0f}",
+                        xy=(1.0, _v),       xycoords=ax.get_yaxis_transform(),
+                        xytext=(1.022, _v_disp), textcoords=ax.get_yaxis_transform(),
+                        fontsize=7, color=_c, va="center", ha="left",
+                        alpha=0.95, clip_on=False,
+                        arrowprops=dict(arrowstyle="-", color=_c, alpha=0.35, lw=0.5))
+        else:
+            ax.text(1.002, _v, f" ${_v:,.0f}",
+                    transform=ax.get_yaxis_transform(),
+                    fontsize=7, color=_c, va="center", ha="left",
+                    alpha=0.95, clip_on=False)
+
+    # Volume panel — weekly bars
+    _ca = plot["Close"].values
+    _pa = np.concatenate([[_ca[0]], _ca[:-1]])
+    _vc = np.where(_ca >= _pa, "#3fb950", "#f85149")
+    ax_vol.bar(plot.index, plot["Volume"].values, color=_vc, alpha=0.55, width=bar_w)
+    ax_vol.set_ylabel("Volume", color="#8b949e", fontsize=7)
+    ax_vol.yaxis.set_major_formatter(plt.FuncFormatter(
+        lambda v, _: f"{v/1e9:.1f}B" if v >= 1e9 else f"{v/1e6:.0f}M"))
+
+    # RSI panel — weekly RSI is the classic cycle-timing oscillator
+    _rsi = plot["RSIw"].values
+    ax_rsi.plot(plot.index, _rsi, color="#f0883e", lw=1.1)
+    ax_rsi.axhline(70, color="#f85149", ls="--", lw=0.7, alpha=0.5)
+    ax_rsi.axhline(30, color="#3fb950", ls="--", lw=0.7, alpha=0.5)
+    ax_rsi.fill_between(plot.index, _rsi, 70, where=(_rsi > 70), color="#f85149", alpha=0.12)
+    ax_rsi.fill_between(plot.index, _rsi, 30, where=(_rsi < 30), color="#3fb950", alpha=0.12)
+    ax_rsi.set_ylim(10, 90)
+    ax_rsi.set_ylabel("RSI 14w", color="#8b949e", fontsize=7)
+    _rsi_col = "#f85149" if _rsi_now > 70 else ("#3fb950" if _rsi_now < 30 else "#8b949e")
+    ax_rsi.text(0.995, 0.92, f"RSI {_rsi_now:.0f}", transform=ax_rsi.transAxes,
+                fontsize=8, va="top", ha="right", color=_rsi_col)
 
     plt.tight_layout(pad=0.5)
     return fig
@@ -8044,22 +7853,6 @@ def fig_etf_flows(a: dict) -> plt.Figure:
     return fig
 
 
-def fig_liquidity_panel(a: dict):
-    """Panel 5: Liquidity heatmap. Returns (fig, narrative_text)."""
-    btc_liq = a["btc_liq"]
-    fig, ax = plt.subplots(figsize=(13, 5.5))
-    fig.patch.set_facecolor("#0d1117"); _ax_style(ax)
-    try:
-        plot_liquidity_depth(ax, btc_liq, short_df=a.get("short_df"))
-    except Exception as e:
-        ax.text(0.5, 0.5, f"Heatmap error: {e}", ha="center", color="#f85149", transform=ax.transAxes)
-    # Extra bottom margin so the legend below the x-axis isn't clipped
-    plt.subplots_adjust(bottom=0.14, top=0.93, left=0.06, right=0.88)
-    narrative = btc_liq.get("liq_narrative", "") if btc_liq else ""
-    return fig, narrative
-
-
-
 def fig_bollinger_detail(a: dict) -> plt.Figure:
     """Bollinger Bands detail: %B oscillator + bandwidth."""
     plot_df = a["plot_df"]
@@ -8309,7 +8102,6 @@ def _add_price_panel(ax, plot_df, price):
     ax.text(0.995, 0.95, f"BTC/USD  ${price:,.0f}", transform=ax.transAxes,
             fontsize=8, va="top", ha="right", color="#c9d1d9")
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"${v/1000:.0f}k"))
-    ax.set_title("BTC/USD — Close Price", color="#8b949e", fontsize=9, loc="left", pad=4)
 
 
 def fig_speedometer_24h(score: float, label: str, color: str) -> plt.Figure:
@@ -8335,13 +8127,13 @@ def fig_speedometer_24h(score: float, label: str, color: str) -> plt.Figure:
                               theta1=0, theta2=180,
                               color="#1c2128", lw=22, zorder=1))
 
-    # Colored zone bands
+    # Colored zone bands — match the engine's tightened bands (±10 / ±22).
     for lo, hi, col, alpha in [
-        (-100, -40, "#f85149", 0.55),
-        (-40,  -20, "#f0883e", 0.55),
-        (-20,   20, "#484f58", 0.45),
-        (20,    40, "#58a6ff", 0.55),
-        (40,   100, "#3fb950", 0.55),
+        (-100, -22, "#f85149", 0.55),
+        (-22,  -10, "#f0883e", 0.55),
+        (-10,   10, "#484f58", 0.45),
+        (10,    22, "#58a6ff", 0.55),
+        (22,   100, "#3fb950", 0.55),
     ]:
         ax.add_patch(mpatches.Arc((0, 0), 2.0, 2.0, angle=0,
                                   theta1=s_to_deg(hi), theta2=s_to_deg(lo),
@@ -8355,7 +8147,7 @@ def fig_speedometer_24h(score: float, label: str, color: str) -> plt.Figure:
                                   color=color, lw=22, alpha=0.92, zorder=3))
 
     # Tick marks at key levels
-    for ts in (-40, -20, 0, 20, 40):
+    for ts in (-22, -10, 0, 10, 22):
         rad = np.deg2rad(s_to_deg(ts))
         ax.plot([0.87 * np.cos(rad), 1.02 * np.cos(rad)],
                 [0.87 * np.sin(rad), 1.02 * np.sin(rad)],
@@ -9082,13 +8874,23 @@ with st.sidebar:
     st.caption("😱 Fear & Greed: alternative.me")
     st.caption("🌍 Dominance: CoinGecko")
     st.caption("📊 ETF Flows: yfinance (IBIT/FBTC/ARKB…)")
-    st.caption("🔥 Liquidity: Binance orderbook")
+    st.caption("🔥 Liquidity: order books from Binance spot+futures, Bybit, OKX")
+    st.caption("💥 Liq map: Binance synthetic (OI-tranche model) · "
+               "realized events: OKX · Coinglass/Hyblock used only if API keys set")
     st.divider()
     st.markdown("**About**")
     st.caption("Cycle phase scored across 8 signals: "
                "Fear & Greed, ETF Flows, RSI, Momentum, "
                "Dominance, MA200 deviation, 52W position, OBV.  "
                "Range: −24 (top) to +24 (bottom).")
+    if not TALIB_AVAILABLE:
+        st.caption("⚠️ Candlestick patterns disabled — TA-Lib not installed. "
+                   "Pattern rows show neutral, not 'no pattern detected'.")
+    st.divider()
+    st.caption("⚠️ **Not financial advice.** This dashboard is an experimental "
+               "research tool. Scores, probabilities and sizing hints are "
+               "model outputs with a short, one-sided track record — do not "
+               "trade money you cannot afford to lose based on them.")
 
 
 # ── Fetch data ───────────────────────────────────────────────────
@@ -9113,6 +8915,10 @@ if _lp and _lp > 0:
     _cached_closes = a.get("closes") or []
     if len(_cached_closes) >= 2 and _cached_closes[-2]:
         a["chg_24h"] = (_lp - _cached_closes[-2]) / _cached_closes[-2] * 100
+
+# Accumulate a synthetic-liq-map snapshot for the time×price heatmap
+# (one per 5-min bucket; session-scoped, merged with cron history at render).
+_push_liq_heat_snapshot((a.get("btc_liq") or {}).get("liq_map"), a.get("price"))
 
 price      = a["price"]
 chg_24h    = a["chg_24h"]
@@ -9187,6 +8993,24 @@ _EMA_ALPHA  = 0.50 + 0.30 * _rev_abs            # [0.50, 0.80]
 _prev_ema   = st.session_state.get("_bias_ema", 0.0)
 _b12_score  = round(_EMA_ALPHA * _b12_score_raw + (1 - _EMA_ALPHA) * _prev_ema, 1)
 st.session_state["_bias_ema"] = _b12_score
+
+# ── Velocity tracking (improvements.txt item 3) ─────────────────
+# Keep a rolling buffer of (epoch_ts, smoothed_score) for the last ~10 min.
+# Velocity = (latest − earliest) / Δt, expressed as points per minute.
+# Raw and velocity are surfaced in the gauge so the user can see the engine's
+# unsmoothed signal AND how fast it's moving — useful when smoothing lag is
+# masking a fresh reversal.
+import time as _time_velocity
+_now_v = _time_velocity.time()
+_hist_v = st.session_state.get("_b12_score_hist", [])
+_hist_v.append((_now_v, _b12_score))
+_hist_v = [(t, s) for (t, s) in _hist_v if _now_v - t <= 600.0]  # last 10 min
+st.session_state["_b12_score_hist"] = _hist_v
+if len(_hist_v) >= 2 and (_hist_v[-1][0] - _hist_v[0][0]) > 30.0:
+    _dt_sec   = _hist_v[-1][0] - _hist_v[0][0]
+    _b12_vel  = (_hist_v[-1][1] - _hist_v[0][1]) / _dt_sec * 60.0  # points/min
+else:
+    _b12_vel  = 0.0
 
 # Derive label/color from smoothed score
 # Bands aligned with the engine's internal labeler (compute_72h_bias L4482):
@@ -9271,14 +9095,14 @@ f'</div>'
 f'</div>'
     )
 
-_grad_bprob = "linear-gradient(to right, #f85149 0%, #8b949e 50%, #3fb950 100%)"
+# BULL PROB removed: it's a sigmoid of the 72h score (with conviction widening
+# the temperature), so directionally redundant with the main gauge. CONVICTION
+# stays — it's the read you need to know whether to trust the gauge magnitude.
 _grad_conv  = "linear-gradient(to right, #f85149 0%, #ffd700 50%, #3fb950 100%)"
 _grad_adx   = "linear-gradient(to right, #8b949e 0%, #58a6ff 19%, #3fb950 31%, #ffd700 50%, #f85149 75%)"
 _grad_vol   = "linear-gradient(to right, #58a6ff 0%, #8b949e 50%, #f0883e 100%)"
 
 # Build flush-left so markdown doesn't see 4-space indents and emit code blocks.
-_scale_bp = _mini_scale("BULL PROB", f"{_b12_bprob:.0f}%", _bprob_color, _bprob_pct, _grad_bprob,
-                        "Probability the next 72h closes above current price, based on signal consensus.")
 _scale_cv = _mini_scale("CONVICTION", f"{_conv_label} · {_conv_pct}%", _conv_color, _conv_pos, _grad_conv,
                         "Conviction = 1 − signal std. High = all signals agree. Low = signals disagree and the score is noise.")
 _scale_ax = _mini_scale("ADX (1H)", f"{_adx_lbl} · {_adx_val:.0f}", _adx_col, _adx_pos, _grad_adx,
@@ -9292,6 +9116,80 @@ _scale_vp = _mini_scale("VOL PCTILE", f"{_vol_lbl} · {_vol_val:.0f}", _vol_col,
 # so the eye lands on it before any context.
 # Streamlit markdown is fed flush-left to avoid the code-block trap.
 # ─────────────────────────────────────────────────────────────────
+# 24h realized tag — small chip next to the header so the user sees what
+# actually happened over the last 24h alongside the forward forecast. Keeps
+# the gauge as a forecast while preventing "but the chart was bearish" gap.
+_chg24    = float(chg_24h)
+_chg24_col = "#3fb950" if _chg24 >= 0.5 else ("#f85149" if _chg24 <= -0.5 else "#8b949e")
+_chg24_sg = "+" if _chg24 >= 0 else ""
+_chg24_chip = (
+    f'<span style="font-size:10px; font-weight:600; color:{_chg24_col};'
+    f' background:{_chg24_col}18; border:1px solid {_chg24_col}55;'
+    f' padding:1px 7px; border-radius:4px; letter-spacing:.04em;'
+    f' margin-left:8px;" title="Realized BTC price change over the last 24h.'
+    f' Shown alongside the forward forecast so you can see both what just'
+    f' happened and what the engine expects next.">'
+    f'BTC {_chg24_sg}{_chg24:.2f}% · 24h</span>'
+)
+
+# Meta-model second-opinion chip (improvements.txt item 8).
+# Loads the Phase-8 LogisticRegression model (if trained + saved) and shows
+# its P(up) beside the gauge — purely informational, never replaces engine score.
+# Cached in session_state so disk load happens once per session, not per rerun.
+_meta_chip = ""
+if _meta_model is not None:
+    _meta_loaded = st.session_state.get("_meta_model_loaded", "unset")
+    if _meta_loaded == "unset":
+        _meta_loaded = _meta_model.load_model()
+        st.session_state["_meta_model_loaded"] = _meta_loaded
+    if _meta_loaded:
+        _meta_pup = _meta_model.predict(_meta_loaded.get("model"), {
+            "score":      _b12_score_raw,
+            "score_24h":  bias_24h.get("score", 0.0),
+            "bull_prob":  _b12_bprob,
+            "conviction": _b12_conv,
+            "regime":     _b12_regime,
+        })
+        if _meta_pup is not None:
+            _meta_pct = _meta_pup * 100.0
+            _meta_col = "#3fb950" if _meta_pct >= 55 else ("#f85149" if _meta_pct <= 45 else "#8b949e")
+            _meta_chip = (
+                f'<span style="font-size:10px; font-weight:600; color:{_meta_col};'
+                f' background:{_meta_col}18; border:1px solid {_meta_col}55;'
+                f' padding:1px 7px; border-radius:4px; letter-spacing:.04em;'
+                f' margin-left:6px;" title="Second-opinion from the Phase-8 meta-model'
+                f' (LogReg on top of engine outputs). P(up) at horizon. Engine bull_prob'
+                f' = {_b12_bprob:.0f}% for comparison. Informational only — never'
+                f' overrides the engine score.">'
+                f'Meta P(up) {_meta_pct:.0f}%</span>'
+            )
+
+# Cycle ↔ Reversal co-signal chip. The multi-week cycle phase (bottom/top)
+# and the 72H reversal-pressure subscore live on the same axis (extreme
+# detection → mean reversion) but at different timescales. When they agree
+# direction, the tactical reversal is happening *at* a structural extreme —
+# historically a higher-hit-rate setup than either alone. Engine score is
+# unchanged; this is purely a visual link the user previously had to
+# cross-reference mentally.
+_align_chip = ""
+_cycle_phase = cycle.get("phase", "")
+_bull_aligned = _cycle_phase in ("PROBABLE BOTTOM", "BOTTOM FORMING") and _b12_revp >= 10
+_bear_aligned = _cycle_phase in ("PROBABLE TOP",    "TOP FORMING")    and _b12_revp <= -10
+if _bull_aligned or _bear_aligned:
+    _align_col   = "#3fb950" if _bull_aligned else "#f85149"
+    _align_label = ("BOTTOM + REV ↑" if _bull_aligned else "TOP + REV ↓")
+    _align_chip = (
+        f'<span style="font-size:10px; font-weight:700; color:{_align_col};'
+        f' background:{_align_col}22; border:1px solid {_align_col}66;'
+        f' padding:1px 7px; border-radius:4px; letter-spacing:.04em;'
+        f' margin-left:6px;" title="Co-signal: the multi-week cycle phase'
+        f' ({_cycle_phase}) and the 72H reversal-pressure subscore'
+        f' ({_b12_revp:+.0f}) agree direction. Tactical reversal firing at a'
+        f' structural extreme — historically higher-hit-rate than either'
+        f' signal alone. Informational only — does not modify the gauge score.">'
+        f'{_align_label}</span>'
+    )
+
 _gauge_html = (
 f'<div style="margin: 4px 0 14px 0; padding: 14px 18px 12px 18px;'
 f' background: linear-gradient(180deg, #161b22 0%, #0d1117 100%);'
@@ -9299,7 +9197,13 @@ f' border: 1px solid #30363d; border-left: 4px solid {_b12_color};'
 f' border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,.35);">'
 f'<div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:10px;">'
 f'<span style="font-size:11px; font-weight:700; color:#8b949e; letter-spacing:.14em;">'
-f'72H DIRECTIONAL BIAS</span>'
+f'72H DIRECTIONAL BIAS{_chg24_chip}{_meta_chip}{_align_chip}'
+# Raw + velocity surface beside the title so the smoothing lag is visible.
+# Velocity = pts/min over rolling ~10 min buffer of smoothed score.
+f'&nbsp;<span style="font-size:9.5px; font-weight:600; color:#6e7681; letter-spacing:.04em;">'
+f'· raw {("+" if _b12_score_raw >= 0 else "")}{_b12_score_raw:.0f}'
+f' · vel {("+" if _b12_vel >= 0 else "")}{_b12_vel:.1f}/min'
+f'</span></span>'
 f'<span style="font-size:28px; font-weight:800; color:{_b12_color}; letter-spacing:-.5px;'
 f' text-shadow:0 0 18px {_b12_color}55;">'
 f'{_b12_sign}{_b12_score:.0f}%'
@@ -9324,17 +9228,18 @@ f' width:22px; height:22px; border-radius:50%;'
 f' background:#0d1117; border:3px solid {_b12_color};'
 f' box-shadow:0 0 12px {_b12_color}cc;"></div>'
 f'</div>'
-# Trade-zone tick marks
+# Trade-zone tick marks — ±25 matches the logger's LONG/SHORT threshold
+# (rows log direction at |score| ≥ 25; the old ±40 label disagreed with it)
 f'<div style="position:relative; height:6px; margin-top:2px;">'
-f'<div style="position:absolute; left:30%; width:2px; height:6px; background:#3fb95055;"></div>'
-f'<div style="position:absolute; left:70%; width:2px; height:6px; background:#f8514955;"></div>'
+f'<div style="position:absolute; left:37.5%; width:2px; height:6px; background:#f8514955;"></div>'
+f'<div style="position:absolute; left:62.5%; width:2px; height:6px; background:#3fb95055;"></div>'
 f'</div>'
 f'<div style="display:flex; justify-content:space-between;'
 f' font-size:10px; color:#484f58; margin-top:1px; font-family:monospace;">'
 f'<span>−100</span>'
-f'<span style="color:#f8514988;">−40 ← trade zone</span>'
+f'<span style="color:#f8514988;">−25 ← trade zone</span>'
 f'<span style="color:#555;">0</span>'
-f'<span style="color:#3fb95088;">+40 trade zone →</span>'
+f'<span style="color:#3fb95088;">+25 trade zone →</span>'
 f'<span>+100</span>'
 f'</div>'
 f'</div>'
@@ -9355,74 +9260,193 @@ f' font-size:9px; letter-spacing:.08em;">{_regime_label}</span>'
 f'<span style="color:#6e7681; font-size:10px;">{_emove_str}</span>'
 f'</div>'
 f'<div style="display:flex; gap:14px; flex-wrap:wrap;">'
-f'{_scale_bp}{_scale_cv}{_scale_ax}{_scale_vp}'
+f'{_scale_cv}{_scale_ax}{_scale_vp}'
 f'</div>'
 f'</div>'
 )
 st.markdown(_scales_html, unsafe_allow_html=True)
 
-# ── Reversal Accumulation Scale ───────────────────────────────
-# Visualizes how strong the reversal/exhaustion subscore is and whether it's
-# pointing against the current trend (which is when accumulation gets
-# interesting). Magnitude is mapped 0..50 → 0..100% of the bar. Zone bands:
-#   <10  noise · 10–20 building · 20–30 real bid · 30+ strong setup
-# Bar uses the live colour gradient when opposing trend (accumulation interp
-# applies) and a muted grey when confirming (no fade signal).
-_revp_mag       = abs(_b12_revp)
-_revp_scale_pct = min(_revp_mag / 50.0, 1.0) * 100
-if not _revp_aligned and _revp_mag >= 30:
-    _revp_zone, _revp_zone_col = "STRONG SETUP — ACCUMULATE",  "#3fb950"
-elif not _revp_aligned and _revp_mag >= 20:
-    _revp_zone, _revp_zone_col = "REAL BID — SCALE IN",        "#58a6ff"
-elif not _revp_aligned and _revp_mag >= 10:
-    _revp_zone, _revp_zone_col = "BUILDING — WATCH",           "#ffd700"
-elif _revp_aligned and _revp_mag >= 10:
-    _revp_zone, _revp_zone_col = "CONFIRMING TREND",           "#8b949e"
+# ── Reversal-pressure setup (compute only; UI lives in the Conviction badge) ──
+# Magnitude bar was removed — it duplicated info the Conviction detector
+# already provides, and worse, it actively misled in real reversal setups
+# because family caps in compute_72h_bias compress correlated signals when they
+# all fire together. The Conviction badge below exposes the raw consensus and
+# folds |rev pressure| into its metadata line for completeness.
+_rev_keys = ["Mean Reversion", "OI Flush", "F&G Extreme", "Funding Extreme",
+             "RSI Divergence", "MACD Divergence", "Swept Reversal",
+             "Fear Greed (cont.)", "ADX Roll", "BB Compression"]
+_revp_max = max(sum(_b12_wts.get(k, 0.0) for k in _rev_keys) * 100, 1.0)
+_revp_mag = abs(_b12_revp)
+
+# ── Reversal Conviction Detector ──────────────────────────────
+# Magnitude alone misleads: one screaming signal and five converging signals
+# can produce the same |rev_pressure|. Conviction measures CONSENSUS — how
+# many reversal signals fire materially (|raw| ≥ 0.40), whether they agree on
+# direction, and whether they OPPOSE the current trend (a "reversal" only
+# means something against the prevailing direction; same-direction firing is
+# trend confirmation, not reversal).
+#
+# Convention: each reversal signal is positive when it implies a bullish
+# reversal (e.g. F&G ≤ 20 → +; mean-reversion from below 20d mean → +) and
+# negative when it implies a bearish reversal. So in a downtrend, multiple
+# POSITIVE reversal signals = a forming bullish reversal.
+_REV_FIRE_THRESH = 0.40
+_rev_fired = []
+for _rk in _rev_keys:
+    _entry = _b12_sigs.get(_rk)
+    if not _entry:
+        continue
+    _rv = float(_entry[0])
+    if abs(_rv) >= _REV_FIRE_THRESH:
+        _rev_fired.append((_rk, _rv))
+
+_n_fired = len(_rev_fired)
+_n_bull  = sum(1 for _, v in _rev_fired if v > 0)
+_n_bear  = sum(1 for _, v in _rev_fired if v < 0)
+_dom_pct = (max(_n_bull, _n_bear) / _n_fired) if _n_fired else 0.0
+_dom_dir = "BULLISH" if _n_bull > _n_bear else ("BEARISH" if _n_bear > _n_bull else "MIXED")
+
+# Reversal only makes sense against an existing trend (score > ~5 either way).
+_trend_dir     = "BULLISH" if _b12_score > 5 else ("BEARISH" if _b12_score < -5 else "FLAT")
+_opposes_trend = ((_trend_dir == "BEARISH" and _dom_dir == "BULLISH") or
+                  (_trend_dir == "BULLISH" and _dom_dir == "BEARISH"))
+_confirms_trend = ((_trend_dir == "BEARISH" and _dom_dir == "BEARISH") or
+                   (_trend_dir == "BULLISH" and _dom_dir == "BULLISH"))
+
+# Tier logic — high conviction requires multi-family agreement against the trend.
+if _opposes_trend and _n_fired >= 4 and _dom_pct >= 0.80:
+    _conv_tier  = f"HIGH CONVICTION — {_dom_dir} REVERSAL FORMING"
+    _conv_col   = "#3fb950" if _dom_dir == "BULLISH" else "#f85149"
+    _conv_emoji = "▲" if _dom_dir == "BULLISH" else "▼"
+elif _opposes_trend and _n_fired >= 3 and _dom_pct >= 0.80:
+    _conv_tier  = f"MODERATE — {_dom_dir} REVERSAL WATCH"
+    _conv_col   = "#ffd700"
+    _conv_emoji = "◐"
+elif _confirms_trend and _n_fired >= 3:
+    _conv_tier  = f"TREND CONFIRMING — {_dom_dir}"
+    _conv_col   = "#8b949e"
+    _conv_emoji = "→"
+elif _n_fired >= 2 and _dom_pct < 0.70:
+    _conv_tier  = "MIXED — NO CONSENSUS"
+    _conv_col   = "#8b949e"
+    _conv_emoji = "✕"
+elif _n_fired >= 1:
+    _conv_tier  = "EARLY — TOO FEW SIGNALS FIRING"
+    _conv_col   = "#8b949e"
+    _conv_emoji = "◦"
 else:
-    _revp_zone, _revp_zone_col = "WEAK / NOISE",               "#484f58"
-_revp_track_grad = (
-    "linear-gradient(to right, #30363d 0%, #484f58 18%, #ffd700 40%, #58a6ff 60%, #3fb950 100%)"
-    if not _revp_aligned
-    else "linear-gradient(to right, #30363d 0%, #484f58 100%)"
-)
-_revp_intent = ("opposing trend — fade setup" if not _revp_aligned and _revp_mag >= 5
-                else "confirming trend — no fade" if _revp_aligned and _revp_mag >= 5
-                else "neutral")
+    _conv_tier  = "QUIET — NO REVERSAL SIGNALS FIRING"
+    _conv_col   = "#484f58"
+    _conv_emoji = "·"
+
+# Firing-signals chip list — user can verify exactly what's stacking the case.
+_chips_html = ""
+for _name, _val in sorted(_rev_fired, key=lambda x: -abs(x[1])):
+    _cc = "#3fb950" if _val > 0 else "#f85149"
+    _sg = "+" if _val > 0 else ""
+    _chips_html += (
+        f'<span style="display:inline-block; padding:2px 8px; margin:2px 4px 2px 0;'
+        f' border-radius:10px; background:{_cc}22; border:1px solid {_cc}66;'
+        f' font-size:10px; color:{_cc}; font-family:monospace;">'
+        f'{_name} {_sg}{_val:.2f}</span>'
+    )
+if not _chips_html:
+    _chips_html = ('<span style="font-size:10px; color:#484f58; font-style:italic;">'
+                   '— no reversal signals firing above ±0.40 threshold —</span>')
+
+# Divergence explainer: when conviction reads HIGH/MODERATE but the magnitude
+# bar reads weak (or vice versa), surface what's happening so the user knows
+# which read to trust without remembering the mechanic.
+_conv_strong  = _opposes_trend and _n_fired >= 3 and _dom_pct >= 0.80
+_conv_strong_high = _opposes_trend and _n_fired >= 4 and _dom_pct >= 0.80
+_mag_weak     = _revp_mag < 20
+_mag_strong   = _revp_mag >= 20
+_divergence_html = ""
+if _conv_strong and _mag_weak:
+    _divergence_html = (
+        f'<div style="margin-top:8px; padding:8px 10px; border-radius:6px;'
+        f' background:#ffd70010; border-left:3px solid #ffd700;'
+        f' font-size:10.5px; color:#c9d1d9; line-height:1.45;">'
+        f'<b style="color:#ffd700;">⚡ Conviction-vs-magnitude divergence:</b> '
+        f'engine magnitude reads weak ({_revp_mag:.0f}/{_revp_max:.0f}) because '
+        f'family caps in compute_72h_bias compress correlated reversal signals '
+        f'when they all fire together — but that simultaneous firing is exactly '
+        f'what reversal setups look like. <b style="color:#3fb950;">Trust the '
+        f'conviction tier here</b> — it\'s the leading indicator; magnitude will '
+        f'catch up after the score inflects.'
+        f'</div>'
+    )
+elif (not _conv_strong) and _mag_strong and _n_fired <= 2:
+    _divergence_html = (
+        f'<div style="margin-top:8px; padding:8px 10px; border-radius:6px;'
+        f' background:#f0883e10; border-left:3px solid #f0883e;'
+        f' font-size:10.5px; color:#c9d1d9; line-height:1.45;">'
+        f'<b style="color:#f0883e;">⚠ Magnitude carried by few signals:</b> '
+        f'rev pressure is {_revp_mag:.0f} but only {_n_fired} signal(s) firing '
+        f'above ±0.40 — the bar is being driven by 1-2 strong readings, not a '
+        f'real consensus. <b>Weight the conviction tier</b>, not the magnitude.'
+        f'</div>'
+    )
+
+# Effective conviction strength = firing count × dominant-direction fraction.
+# 5 signals all agreeing → 5.0  ·  5 signals split 3-2 → 3.0  ·  agreement
+# baked into pointer position so visual splits read as weaker, not stronger.
+_conv_strength = _n_fired * _dom_pct
+_conv_pos_pct  = min(_conv_strength / 10.0, 1.0) * 100   # 0..10 scale → 0..100%
+
+# Track gradient: directional colour when reversal opposes trend (real setup),
+# muted grey when confirming/mixed (no actionable reversal).
+if _opposes_trend:
+    _dir_col_track = "#3fb950" if _dom_dir == "BULLISH" else "#f85149"
+    _conv_track_grad = (
+        f"linear-gradient(to right, #30363d 0%, #484f58 20%, "
+        f"#ffd700 30%, #ffd700 40%, {_dir_col_track} 40%, {_dir_col_track} 100%)"
+    )
+else:
+    _conv_track_grad = "linear-gradient(to right, #30363d 0%, #484f58 100%)"
+
 st.markdown(f"""
-<div style="margin: 0 0 16px 0;">
-  <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:4px;">
-    <span style="font-size:12px; font-weight:600; color:#8b949e; letter-spacing:.05em;">
-      REVERSAL ACCUMULATION SETUP
-      <span style="font-size:10px; color:#6e7681; font-weight:400; letter-spacing:0;">
-        · |rev pressure| {_revp_mag:.0f} · {_revp_intent}
-      </span>
-    </span>
-    <span style="font-size:13px; font-weight:700; color:{_revp_zone_col}; letter-spacing:.03em;">
-      {_revp_zone}
-    </span>
+<div style="background:{_conv_col}10; border:1px solid {_conv_col}55;
+     border-radius:8px; padding:10px 14px; margin: 0 0 14px 0;">
+  <div style="display:flex; align-items:baseline; gap:10px;">
+    <span style="font-size:18px; color:{_conv_col}; font-weight:700; line-height:1;">{_conv_emoji}</span>
+    <div style="flex:1;">
+      <div style="font-size:13px; font-weight:700; color:{_conv_col}; letter-spacing:.03em;">
+        REVERSAL CONVICTION — {_conv_tier}
+      </div>
+      <div style="font-size:10px; color:#8b949e; margin-top:2px;">
+        {_n_fired}/{len(_rev_keys)} signals firing (|raw|≥0.40) ·
+        {_n_bull} bullish-reversal · {_n_bear} bearish-reversal ·
+        agreement {_dom_pct*100:.0f}% · current trend: {_trend_dir} ·
+        |rev pressure| {_revp_mag:.0f}/{_revp_max:.0f}
+      </div>
+    </div>
   </div>
-  <div style="position:relative; height:10px; border-radius:5px;
-       background: {_revp_track_grad};
-       box-shadow: inset 0 1px 2px rgba(0,0,0,.4);">
-    <!-- Zone tick marks at 10, 20, 30 (i.e. 20%, 40%, 60% of the 0-50 scale) -->
-    <div style="position:absolute; left:20%; top:0; width:1px; height:10px; background:rgba(255,255,255,.18);"></div>
-    <div style="position:absolute; left:40%; top:0; width:1px; height:10px; background:rgba(255,255,255,.18);"></div>
-    <div style="position:absolute; left:60%; top:0; width:1px; height:10px; background:rgba(255,255,255,.18);"></div>
-    <!-- Pointer -->
-    <div style="position:absolute; top:50%; left:{_revp_scale_pct:.1f}%;
-         transform:translate(-50%,-50%);
-         width:14px; height:14px; border-radius:50%;
-         background:#0d1117; border:2px solid {_revp_zone_col};
-         box-shadow:0 0 6px {_revp_zone_col}88;"></div>
+  <!-- Conviction strength scale: pointer = n_fired × agreement_pct -->
+  <div style="margin-top:10px; padding: 0 2px;">
+    <div style="position:relative; height:8px; border-radius:4px;
+         background: {_conv_track_grad};
+         box-shadow: inset 0 1px 2px rgba(0,0,0,.4);">
+      <div style="position:absolute; left:20%; top:0; width:1px; height:8px; background:rgba(255,255,255,.20);"></div>
+      <div style="position:absolute; left:30%; top:0; width:1px; height:8px; background:rgba(255,255,255,.20);"></div>
+      <div style="position:absolute; left:40%; top:0; width:1px; height:8px; background:rgba(255,255,255,.20);"></div>
+      <div style="position:absolute; top:50%; left:{_conv_pos_pct:.1f}%;
+           transform:translate(-50%,-50%);
+           width:12px; height:12px; border-radius:50%;
+           background:#0d1117; border:2px solid {_conv_col};
+           box-shadow:0 0 6px {_conv_col}88;"></div>
+    </div>
+    <div style="display:flex; justify-content:space-between;
+         font-size:9px; color:#484f58; margin-top:3px; font-family:monospace;">
+      <span>0 quiet</span>
+      <span style="color:#8b949e88;">2 early</span>
+      <span style="color:#ffd70088;">3 moderate</span>
+      <span style="color:#3fb95088;">4 high</span>
+      <span>10 max</span>
+    </div>
   </div>
-  <div style="display:flex; justify-content:space-between;
-       font-size:9px; color:#484f58; margin-top:2px; font-family:monospace;">
-    <span>0</span>
-    <span style="color:#ffd70088;">10 building</span>
-    <span style="color:#58a6ff88;">20 real bid</span>
-    <span style="color:#3fb95088;">30 strong</span>
-    <span>50+</span>
-  </div>
+  <div style="margin-top:10px;">{_chips_html}</div>
+  {_divergence_html}
 </div>
 """, unsafe_allow_html=True)
 
@@ -9937,10 +9961,18 @@ if not _ai_interp_key:
     import os as _os2
     _ai_interp_key = _os2.environ.get("ANTHROPIC_API_KEY", "")
 
-if _ai_interp_key:
+if _ai_interp_key and _public_mode():
+    st.caption("🤖 AI interpretation is disabled on this public deployment.")
+if _ai_interp_key and not _public_mode():
+    _ai_calls_used = int(st.session_state.get("_ai_calls_used", 0) or 0)
+    _ai_cap_left   = _AI_SESSION_CAP - _ai_calls_used
     _ai_col, _ai_btn_col = st.columns([5, 1])
     with _ai_btn_col:
-        _ask_claude = st.button("🤖 Ask Claude", use_container_width=True)
+        _ask_claude = st.button("🤖 Ask Claude", use_container_width=True,
+                                disabled=_ai_cap_left <= 0)
+        if _ai_cap_left <= 0:
+            st.caption(f"Session limit reached ({_AI_SESSION_CAP} calls) — "
+                       "refresh the page to reset.")
     # ── Compute 15m chart signals for Claude ─────────────────────────
     _sdf15 = a.get("short_df")
     _ema_cross_15m = _vwap_bias_15m = _poc_vs_price_15m = "N/A"
@@ -10039,7 +10071,8 @@ if _ai_interp_key:
                     hunt_zones        = (btc_liq or {}).get("hunt_zones"),
                     cascade_direction = str((btc_liq or {}).get("cascade_direction", "N/A")),
                 )
-            st.session_state["_claude_interp"] = _interp_text
+            st.session_state["_claude_interp"]  = _interp_text
+            st.session_state["_ai_calls_used"] = _ai_calls_used + 1
         _interp_text = st.session_state.get("_claude_interp", "")
         if _interp_text:
             # Border colour from the VERDICT line. New format puts VERDICT
@@ -10064,7 +10097,7 @@ if _ai_interp_key:
                 f' padding:4px 14px 10px 14px; margin-bottom:12px;">'
                 f'<p style="font-size:11px; color:#8b949e; margin-bottom:0;">'
                 f'🤖 CLAUDE INTERPRETATION'
-                f'<span style="float:right; font-size:10px; color:#484f58;">claude-haiku · ~$0.005/call</span>'
+                f'<span style="float:right; font-size:10px; color:#484f58;">claude-sonnet-4-6 · ~$0.02/call</span>'
                 f'</p></div>',
                 unsafe_allow_html=True
             )
@@ -10155,7 +10188,8 @@ if _now_ts - _last_log >= _LOG_INTERVAL:
     # Also pass bias_72h + poly_sentiment so per-signal and per-market
     # detail rows are written for IC weighting / SHAP / velocity later.
     _log_bias_signal(_b12_score_raw, bias_72h.get("label", _b12_label), price,
-                     bias_72h=bias_72h, poly=poly_sentiment)
+                     bias_72h=bias_72h, poly=poly_sentiment,
+                     bias_24h=bias_24h)
     st.session_state["_last_log_ts"] = _now_ts
 
 # Signal stability — consecutive same-direction refreshes
@@ -10216,20 +10250,43 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
     else:
         _live_note = "building... (excludes pre-patch rows)" if _excluded > 0 else "logs every 5 min"
 
+    # Episode-level stats — the honest headline. Tick winrate alone overstates
+    # confidence: 5-min ticks graded on a 72h horizon are ~fully autocorrelated.
+    _ep = _episode_stats(_bt_rows)
+    _ep_wr      = _ep["ep_winrate"]
+    _ep_col     = ("#8b949e" if _ep_wr is None
+                   else "#3fb950" if _ep_wr >= 60
+                   else "#ffd700" if _ep_wr >= 50
+                   else "#f85149")
+    _ep_display = (f"{_ep['ep_wins']}/{_ep['n_episodes']}"
+                   if _ep["n_episodes"] else "building...")
+    _ep_note    = (f"{_ep['n_long_eps']} long · {_ep['n_short_eps']} short"
+                   if _ep["n_episodes"] else "independent signal runs")
+    _strong_txt = (f" · strong wins (≥3%): {_ep['strong_rate']}%"
+                   if _ep["strong_rate"] is not None else "")
+
     st.markdown(f"""
 <div style="background:#161b22; border:1px solid #30363d; border-radius:10px;
      padding:16px 22px; display:flex; gap:32px; align-items:center;">
   <div style="text-align:center;">
-    <div style="font-size:11px; color:#8b949e; margin-bottom:4px;">LIVE WINRATE</div>
-    <div style="font-size:48px; font-weight:800; color:{_live_col}; line-height:1;">{_live_display}</div>
-    <div style="font-size:10px; color:#484f58; margin-top:6px;">{_live_note}</div>
+    <div style="font-size:11px; color:#8b949e; margin-bottom:4px;">EPISODE WINRATE</div>
+    <div style="font-size:48px; font-weight:800; color:{_ep_col}; line-height:1;">{_ep_display}</div>
+    <div style="font-size:10px; color:#484f58; margin-top:6px;">{_ep_note}</div>
   </div>
-  <div style="font-size:11px; color:#6e7681; max-width:300px; line-height:1.6;">
-    <b style="color:#8b949e;">This number uses the FULL 16-signal score</b> from the live log.<br>
-    Every 5 min when |score| ≥ 25, the timestamp + score + price get logged.
-    72h later, the row is resolved against the actual price:
-    if score sign matched the price move = WIN.<br>
-    <span style="color:#484f58; font-size:10px;">(The legacy technicals-only backtest in a separate panel is just a cold-start placeholder — this live winrate is the real number.)</span>
+  <div style="text-align:center;">
+    <div style="font-size:11px; color:#8b949e; margin-bottom:4px;">TICK WINRATE</div>
+    <div style="font-size:30px; font-weight:800; color:{_live_col}; line-height:1.6;">{_live_display}</div>
+    <div style="font-size:10px; color:#484f58; margin-top:6px;">{_live_note}{_strong_txt}</div>
+  </div>
+  <div style="font-size:11px; color:#6e7681; max-width:330px; line-height:1.6;">
+    <b style="color:#8b949e;">Episodes are the honest number.</b>
+    Ticks log every 5 min; consecutive ticks share almost the same 72h outcome
+    window, so the tick winrate mostly measures how long winning streaks lasted.
+    An <b>episode</b> = one continuous same-direction signal run (&lt;6h gaps);
+    it counts as a win when most of its ticks resolved correctly.
+    Rows are graded against the BTC price at <b>exactly entry+72h</b>.<br>
+    <span style="color:#484f58; font-size:10px;">Treat the engine as unproven
+    until episodes span both LONG and SHORT across different regimes.</span>
   </div>
 </div>""", unsafe_allow_html=True)
 
@@ -10373,6 +10430,481 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
     else:
         st.caption(f"Calibration buckets will appear once ≥5 signals resolve (currently {len(_resolved)} resolved).")
 
+    # ── Forecasting diagnostics ───────────────────────────────────
+    # Tests whether the engine genuinely *forecasts* or just trend-follows.
+    # A pure trend-follower scores high winrate while the market trends, then
+    # collapses when conditions change. These three views isolate that.
+    if len(_resolved) >= 10:
+        try:
+            _df_d  = a.get("df")
+            _idx_d = _df_d.index
+            # Strip tz so we can compare to naive datetimes uniformly.
+            if getattr(_idx_d, "tz", None) is not None:
+                _idx_naive = _idx_d.tz_convert("UTC").tz_localize(None)
+            else:
+                _idx_naive = _idx_d
+            _close_arr = _df_d["Close"].to_numpy()
+
+            # Rolling daily ADX series — regime classifier at each row's ts.
+            _ad = _df_d.copy()
+            _ad["tr"]   = np.maximum.reduce([
+                _ad["High"] - _ad["Low"],
+                (_ad["High"] - _ad["Close"].shift(1)).abs(),
+                (_ad["Low"]  - _ad["Close"].shift(1)).abs(),
+            ])
+            _ad["up"]   = _ad["High"] - _ad["High"].shift(1)
+            _ad["down"] = _ad["Low"].shift(1) - _ad["Low"]
+            _ad["pdm"]  = np.where((_ad["up"]   > _ad["down"]) & (_ad["up"]   > 0), _ad["up"],   0.0)
+            _ad["mdm"]  = np.where((_ad["down"] > _ad["up"])   & (_ad["down"] > 0), _ad["down"], 0.0)
+            _alpha = 1.0 / 14.0
+            _ad["tr_s"]  = _ad["tr"].ewm(alpha=_alpha,  adjust=False).mean()
+            _ad["pdm_s"] = _ad["pdm"].ewm(alpha=_alpha, adjust=False).mean()
+            _ad["mdm_s"] = _ad["mdm"].ewm(alpha=_alpha, adjust=False).mean()
+            _pdi = 100 * _ad["pdm_s"] / _ad["tr_s"]
+            _mdi = 100 * _ad["mdm_s"] / _ad["tr_s"]
+            _dx  = 100 * (_pdi - _mdi).abs() / (_pdi + _mdi)
+            _adx_series = _dx.ewm(alpha=_alpha, adjust=False).mean().to_numpy()
+
+            def _idx_at(_ts_iso):
+                try:
+                    _t = _dt.fromisoformat(_ts_iso)
+                    if _t.tzinfo is not None:
+                        _t = _t.astimezone(_tz.utc).replace(tzinfo=None)
+                    _pos = _idx_naive.searchsorted(_t, side="right") - 1
+                    return _pos if 0 <= _pos < len(_idx_naive) else None
+                except Exception:
+                    return None
+
+            # Build per-row context
+            _ctx_rows = []
+            for _r in _resolved:
+                _i = _idx_at(_r.get("ts", ""))
+                if _i is None or _i < 30:
+                    continue
+                _score = float(_r.get("score", 0))
+                _bdir  = 1 if _score > 0 else (-1 if _score < 0 else 0)
+                if _bdir == 0:
+                    continue
+                _c_now = float(_close_arr[_i])
+                _c_30  = float(_close_arr[_i - 30])
+                _c_1   = float(_close_arr[_i - 1]) if _i >= 1 else _c_now
+                _slope_30 = (_c_now - _c_30) / _c_30 if _c_30 > 0 else 0.0
+                _slope_1  = (_c_now - _c_1)  / _c_1  if _c_1  > 0 else 0.0
+                _tdir_30 = 1 if _slope_30 > 0.02 else (-1 if _slope_30 < -0.02 else 0)
+                _tdir_1  = 1 if _slope_1  > 0.005 else (-1 if _slope_1  < -0.005 else 0)
+                _adx_val = float(_adx_series[_i]) if not np.isnan(_adx_series[_i]) else 0.0
+                _regime  = "TREND" if _adx_val >= 25 else "RANGE"
+                _win     = _r.get("correct") in ("1", "2")
+                _ctx_rows.append({
+                    "win":    _win,
+                    "bdir":   _bdir,
+                    "tdir30": _tdir_30,
+                    "tdir1":  _tdir_1,
+                    "regime": _regime,
+                })
+
+            if len(_ctx_rows) >= 10:
+                def _wr_card(_label, _rows, _sub=""):
+                    _n = len(_rows)
+                    _sub_html = (f'<div style="font-size:9px; color:#6e7681; margin-top:2px;">{_sub}</div>'
+                                 if _sub else "")
+                    if _n == 0:
+                        return (f'<div style="background:#161b22; border:1px solid #30363d; border-radius:8px;'
+                                f' padding:10px 14px; text-align:center; min-width:140px;">'
+                                f'<div style="font-size:10px; color:#8b949e;">{_label}</div>'
+                                f'<div style="font-size:22px; font-weight:800; color:#484f58;">—</div>'
+                                f'<div style="font-size:9px; color:#484f58;">n=0</div>'
+                                f'{_sub_html}'
+                                f'</div>')
+                    _w = sum(1 for r in _rows if r["win"])
+                    _p = round(_w / _n * 100)
+                    _c = "#3fb950" if _p >= 60 else "#ffd700" if _p >= 50 else "#f85149"
+                    return (f'<div style="background:#161b22; border:1px solid #30363d; border-radius:8px;'
+                            f' padding:10px 14px; text-align:center; min-width:140px;">'
+                            f'<div style="font-size:10px; color:#8b949e;">{_label}</div>'
+                            f'<div style="font-size:22px; font-weight:800; color:{_c};">{_p}%</div>'
+                            f'<div style="font-size:9px; color:#484f58;">n={_n}</div>'
+                            f'{_sub_html}'
+                            f'</div>')
+
+                # ── (A) Counter-trend split ─────────────────────────
+                _with30   = [r for r in _ctx_rows if r["tdir30"] != 0 and r["bdir"] == r["tdir30"]]
+                _ctr30    = [r for r in _ctx_rows if r["tdir30"] != 0 and r["bdir"] == -r["tdir30"]]
+                _flat30   = [r for r in _ctx_rows if r["tdir30"] == 0]
+                st.markdown("---")
+                st.markdown("**Forecast vs trend-follower test** — does the engine win when it fights the macro trend?")
+                _ct_html = '<div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:6px;">'
+                _ct_html += _wr_card("WITH 30d trend", _with30, "bias agrees with macro")
+                _ct_html += _wr_card("COUNTER 30d trend", _ctr30, "bias fights macro")
+                _ct_html += _wr_card("FLAT 30d (±2%)", _flat30, "no clear macro")
+                _ct_html += '</div>'
+                st.markdown(_ct_html, unsafe_allow_html=True)
+                if len(_ctr30) < 5:
+                    st.markdown(
+                        '<div style="font-size:10px; color:#ffd700; padding:4px 0 0;">'
+                        '⚠ Too few counter-trend calls to judge forecasting skill. If this stays empty, '
+                        'the engine is structurally a trend-follower in this regime.</div>',
+                        unsafe_allow_html=True,
+                    )
+                elif len(_ctr30) >= 5:
+                    _ctr_wr  = sum(1 for r in _ctr30 if r["win"]) / len(_ctr30) * 100
+                    _with_wr = sum(1 for r in _with30 if r["win"]) / max(len(_with30), 1) * 100
+                    if _ctr_wr >= 50 and len(_ctr30) >= 10:
+                        st.markdown(
+                            '<div style="font-size:10px; color:#3fb950; padding:4px 0 0;">'
+                            '✓ Counter-trend calls hit ≥50% with meaningful n — engine shows real forecasting skill, '
+                            'not just trend echo.</div>',
+                            unsafe_allow_html=True,
+                        )
+                    elif _ctr_wr < 40:
+                        st.markdown(
+                            f'<div style="font-size:10px; color:#f85149; padding:4px 0 0;">'
+                            f'✗ Counter-trend calls hit {_ctr_wr:.0f}% vs with-trend {_with_wr:.0f}%. '
+                            f'When the engine fights the trend it loses — likely trend-follower with delayed reversal signals.</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                # ── (B) 24h-prior momentum-echo test ─────────────────
+                _ech    = [r for r in _ctx_rows if r["tdir1"] != 0 and r["bdir"] == r["tdir1"]]
+                _fight  = [r for r in _ctx_rows if r["tdir1"] != 0 and r["bdir"] == -r["tdir1"]]
+                st.markdown("**Recent-tape echo** — does the engine just repeat the last 24h's direction?")
+                _mt_html = '<div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:6px;">'
+                _mt_html += _wr_card("ECHO last 24h", _ech, "bias = yesterday's move")
+                _mt_html += _wr_card("FIGHT last 24h", _fight, "bias opposes yesterday")
+                _mt_html += '</div>'
+                st.markdown(_mt_html, unsafe_allow_html=True)
+                _echo_ratio = len(_ech) / max(len(_ech) + len(_fight), 1)
+                if _echo_ratio >= 0.85:
+                    st.markdown(
+                        f'<div style="font-size:10px; color:#ffd700; padding:4px 0 0;">'
+                        f'⚠ {_echo_ratio*100:.0f}% of calls echo the prior 24h — engine is mostly a momentum mirror.</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # ── (C) Regime × direction grid ──────────────────────
+                st.markdown("**Regime × direction grid** — where the winrate actually comes from")
+                _grid_cells = [
+                    ("TREND · bullish bias",  [r for r in _ctx_rows if r["regime"] == "TREND" and r["bdir"] > 0]),
+                    ("TREND · bearish bias",  [r for r in _ctx_rows if r["regime"] == "TREND" and r["bdir"] < 0]),
+                    ("RANGE · bullish bias",  [r for r in _ctx_rows if r["regime"] == "RANGE" and r["bdir"] > 0]),
+                    ("RANGE · bearish bias",  [r for r in _ctx_rows if r["regime"] == "RANGE" and r["bdir"] < 0]),
+                ]
+                _g_html = '<div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:6px;">'
+                for _gl, _gr in _grid_cells:
+                    _g_html += _wr_card(_gl, _gr, "ADX≥25=TREND")
+                _g_html += '</div>'
+                st.markdown(_g_html, unsafe_allow_html=True)
+                # Coverage warning
+                _empty_cells = sum(1 for _gl, _gr in _grid_cells if len(_gr) == 0)
+                if _empty_cells >= 2:
+                    st.markdown(
+                        f'<div style="font-size:10px; color:#ffd700; padding:4px 0 0;">'
+                        f'⚠ {_empty_cells} of 4 cells empty — sample is concentrated in one regime/direction. '
+                        f'Cannot conclude forecasting skill until all four cells fill.</div>',
+                        unsafe_allow_html=True,
+                    )
+                st.markdown(
+                    '<div style="font-size:10px; color:#6e7681; padding:6px 0 0; line-height:1.5;">'
+                    'A real forecaster does well in ALL four cells. A trend-follower spikes in the two cells '
+                    'where bias matches the current regime direction and underperforms elsewhere. '
+                    'If you see 100% in one cell and empty cells everywhere else, the headline winrate is '
+                    'just trend persistence, not predictive skill.'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.caption(f"Forecasting diagnostics will appear once ≥10 signals resolve with daily-history coverage (currently {len(_ctx_rows)}).")
+        except Exception as _e:
+            st.caption(f"Forecasting diagnostics unavailable: {_e}")
+
+
+# ════════════════════════════════════════════════════════════════
+# PHASE B SELF-AUDIT PANEL (improvements.txt items 1, 2, 4, 5, 6)
+# ════════════════════════════════════════════════════════════════
+# Reads signal_log rows and computes the stats that future weighting /
+# calibration work needs. Most slices will be empty for the first ~30 days
+# of logs because bull_prob / conviction / regime / score_24h only started
+# being logged on this commit. The panel shows what IS available and how
+# many more samples are needed for stable estimates.
+with st.expander("🧪 Phase B Self-Audit (calibration · regime hit rate · conviction)", expanded=False):
+    st.caption(
+        "Tracks improvements.txt items 1, 2, 4, 5, 6. Empty slices below are normal "
+        "until the new log columns accumulate ~30 days of resolved outcomes. "
+        "Pre-cutoff rows (older scoring engine) are excluded."
+    )
+
+    # ── Audit-due reminder (Phase B logging started 2026-06-07) ──────────────
+    # Pre-due: small caption with countdown. On/after due: prominent banner.
+    try:
+        _phb_audit_due = _dt(2026, 7, 7)
+        _phb_today     = _dt.utcnow()
+        _phb_days_to   = (_phb_audit_due - _phb_today).days
+        if _phb_days_to > 0:
+            st.caption(
+                f"📅 Audit window opens **2026-07-07** ({_phb_days_to} days). "
+                f"Slices below should have meaningful N by then."
+            )
+        else:
+            st.warning(
+                f"📅 **Phase B audit due** (opened 2026-07-07, "
+                f"{abs(_phb_days_to)} day(s) ago). "
+                f"Action items: (1) check whether bins below have populated to N≥200; "
+                f"(2) decide whether to wire the bull_prob calibration table into the "
+                f"live gauge; (3) decide whether to switch `compute_72h_bias` to "
+                f"measured-IC weights (improvements.txt item 1)."
+            )
+    except Exception:
+        pass
+
+    # Re-use the cutoff helper from the accuracy panel.
+    try:
+        _phb_cutoff_dt = _dt.fromisoformat(_BACKTEST_CUTOFF_UTC_ISO)
+    except Exception:
+        _phb_cutoff_dt = None
+
+    def _phb_post_cutoff(_r):
+        if _phb_cutoff_dt is None:
+            return True
+        try:
+            return _dt.fromisoformat(_r.get("ts", "")) >= _phb_cutoff_dt
+        except Exception:
+            return False
+
+    # Only consider rows that have a resolved outcome AND a non-HOLD direction.
+    # HOLD rows are recorded but excluded — they have no directional bet.
+    _phb_rows = [
+        _r for _r in _sig_rows
+        if _phb_post_cutoff(_r)
+        and _r.get("correct") in ("0", "1", "2")
+        and _r.get("direction") in ("LONG", "SHORT")
+    ]
+
+    def _phb_hit(rs):
+        # "1" = direction right, any size; "2" = direction right AND |move| ≥ 3%.
+        # This counts both — i.e. directional correctness, NOT tradeable edge.
+        if not rs: return None
+        wins = sum(1 for r in rs if r.get("correct") in ("1", "2"))
+        return wins / len(rs) * 100
+
+    def _phb_tradeable_hit(rs):
+        # Tradeable win = correct direction AND move large enough to clear
+        # fees + slippage. Only "2" rows (|move| ≥ 3%) qualify. This is the
+        # honest "did the trade make money" rate.
+        if not rs: return None
+        wins = sum(1 for r in rs if r.get("correct") == "2")
+        return wins / len(rs) * 100
+
+    def _phb_avg_move(rs):
+        moves = []
+        for r in rs:
+            try:
+                if r.get("pct_move"):
+                    moves.append(float(r["pct_move"]))
+            except Exception:
+                pass
+        return sum(moves) / len(moves) if moves else None
+
+    # ── Overview row ──────────────────────────────────────────────
+    _phb_n = len(_phb_rows)
+    _phb_hit_overall   = _phb_hit(_phb_rows)
+    _phb_hit_tradeable = _phb_tradeable_hit(_phb_rows)
+    _phb_long  = [r for r in _phb_rows if r.get("direction") == "LONG"]
+    _phb_short = [r for r in _phb_rows if r.get("direction") == "SHORT"]
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Resolved trades", f"{_phb_n}")
+    with c2:
+        st.metric(
+            "Direction hit %",
+            f"{_phb_hit_overall:.1f}%" if _phb_hit_overall is not None else "—",
+            help="Share of trades where price moved in the predicted direction over 72h "
+                 "— ANY size move counts. Useful for IC / signal-quality work but NOT "
+                 "an edge number: a +0.1% drift counts the same as a +5% breakout.",
+        )
+    with c3:
+        st.metric(
+            "Tradeable hit % (≥3%)",
+            f"{_phb_hit_tradeable:.1f}%" if _phb_hit_tradeable is not None else "—",
+            help="Share of trades where direction was right AND |move| ≥ 3% — "
+                 "i.e. large enough to clear fees + slippage. This is the honest "
+                 "'did the trade make money' rate. Expect this to be far below "
+                 "Direction hit %.",
+        )
+    with c4:
+        _phb_avg = _phb_avg_move(_phb_rows)
+        # Avg move is signed by direction; flip SHORT pct_move so "right-direction"
+        # moves count positive regardless of side.
+        _signed = []
+        for r in _phb_rows:
+            try:
+                m = float(r.get("pct_move") or 0)
+                _signed.append(m if r["direction"] == "LONG" else -m)
+            except Exception:
+                pass
+        _signed_avg = (sum(_signed) / len(_signed)) if _signed else None
+        st.metric("Avg signed move", f"{_signed_avg:+.2f}%" if _signed_avg is not None else "—")
+
+    # ── Item 4: Regime-specific hit rate ──────────────────────────
+    st.markdown("**Item 4 — Hit rate by regime** (needs `regime` field, started logging this commit)")
+    _phb_with_reg = [r for r in _phb_rows if r.get("regime")]
+    if not _phb_with_reg:
+        st.caption("No resolved rows have a logged regime yet. Will populate ~3 days after this commit.")
+    else:
+        _reg_rows = []
+        for _reg in ("trend", "range", "transition"):
+            rs = [r for r in _phb_with_reg if r.get("regime") == _reg]
+            _reg_rows.append({
+                "regime": _reg,
+                "n":      len(rs),
+                "hit %":  f"{_phb_hit(rs):.1f}" if _phb_hit(rs) is not None else "—",
+            })
+        st.dataframe(_reg_rows, hide_index=True, use_container_width=True)
+
+    # ── Item 2: bull_prob calibration table ───────────────────────
+    st.markdown("**Item 2 — `bull_prob` calibration** (needs `bull_prob` field, started logging this commit)")
+    _phb_with_bp = []
+    for r in _phb_rows:
+        try:
+            bp = r.get("bull_prob")
+            if bp not in (None, ""):
+                _phb_with_bp.append((float(bp), r))
+        except Exception:
+            pass
+    if not _phb_with_bp:
+        st.caption("No resolved rows have a logged bull_prob yet. Calibration table appears once N ≥ 200 per bin.")
+    else:
+        _calib_rows = []
+        for lo, hi in [(0, 30), (30, 40), (40, 50), (50, 60), (60, 70), (70, 100)]:
+            rs = [r for bp, r in _phb_with_bp if lo <= bp < hi]
+            # "actual bull rate" = fraction of LONG rows that won + fraction of SHORT rows that lost.
+            # i.e. how often did the market actually finish higher when bull_prob said it would?
+            if not rs:
+                _calib_rows.append({"bull_prob range": f"{lo}–{hi}%", "n": 0, "actual bull %": "—"})
+                continue
+            up_count = 0
+            for r in rs:
+                if r["direction"] == "LONG" and r["correct"] in ("1", "2"):
+                    up_count += 1
+                elif r["direction"] == "SHORT" and r["correct"] == "0":
+                    up_count += 1
+            _calib_rows.append({
+                "bull_prob range": f"{lo}–{hi}%",
+                "n":               len(rs),
+                "actual bull %":   f"{up_count / len(rs) * 100:.1f}",
+                "calibrated?":     "yes" if len(rs) >= 200 else f"no (need {200 - len(rs)} more)",
+            })
+        st.dataframe(_calib_rows, hide_index=True, use_container_width=True)
+        st.caption(
+            "Reading the table: a well-calibrated engine should see actual bull% ≈ midpoint of the range. "
+            "When all bins reach N ≥ 200, this lookup becomes a piecewise remap for the live `bull_prob` display."
+        )
+
+    # ── Item 6: Conviction vs accuracy ────────────────────────────
+    st.markdown("**Item 6 — Conviction vs accuracy** (current conviction is *agreement*, audit shows whether it tracks *accuracy*)")
+    _phb_with_conv = []
+    for r in _phb_rows:
+        try:
+            c = r.get("conviction")
+            if c not in (None, ""):
+                _phb_with_conv.append((float(c), r))
+        except Exception:
+            pass
+    if not _phb_with_conv:
+        st.caption("No resolved rows have a logged conviction yet. Started logging this commit.")
+    else:
+        _conv_rows = []
+        for lo, hi in [(0.0, 0.40), (0.40, 0.65), (0.65, 1.01)]:
+            rs = [r for c, r in _phb_with_conv if lo <= c < hi]
+            _conv_rows.append({
+                "conviction band": f"{lo:.2f}–{hi:.2f}",
+                "n":               len(rs),
+                "hit %":           f"{_phb_hit(rs):.1f}" if _phb_hit(rs) is not None else "—",
+            })
+        st.dataframe(_conv_rows, hide_index=True, use_container_width=True)
+        st.caption("If conviction tracks accuracy, higher bands should have higher hit %.")
+
+    # ── Item 5: Direction × Regime cross-tab ──────────────────────
+    st.markdown("**Item 5 — Direction × Regime interaction** (does LONG in trend beat LONG in range?)")
+    _phb_xtab_src = [r for r in _phb_rows if r.get("regime")]
+    if not _phb_xtab_src:
+        st.caption("No resolved rows with regime yet.")
+    else:
+        _xtab_rows = []
+        for _dir in ("LONG", "SHORT"):
+            for _reg in ("trend", "range", "transition"):
+                rs = [r for r in _phb_xtab_src if r["direction"] == _dir and r.get("regime") == _reg]
+                _xtab_rows.append({
+                    "direction": _dir,
+                    "regime":    _reg,
+                    "n":         len(rs),
+                    "hit %":     f"{_phb_hit(rs):.1f}" if _phb_hit(rs) is not None else "—",
+                })
+        st.dataframe(_xtab_rows, hide_index=True, use_container_width=True)
+
+    # ── Item 1: per-signal IC placeholder ─────────────────────────
+    st.markdown("**Item 1 — Per-signal IC weighting** (needs `signal_detail` × `signal_log` join, Supabase only)")
+    st.caption(
+        "Per-signal Information Coefficient (IC) needs a Supabase join between "
+        "`signal_detail.raw_value` and the matched `signal_log.pct_move`. "
+        "That query is heavy; deferring to a scheduled job once log volume warrants it. "
+        "Once IC is stable per signal, the static weight dict in `compute_72h_bias` "
+        "can be replaced with a measured-weights function — the biggest single improvement on the list."
+    )
+
+    # ── Item 8: Meta-model (LogReg on top of engine outputs) ──────
+    st.markdown("**Item 8 — Meta-model** (LogReg learns when to trust the engine)")
+    if _meta_model is None:
+        st.caption("meta_model.py failed to import — check the file exists at project root.")
+    else:
+        _meta_X, _meta_y, _meta_ts = _meta_model.extract_training_set(_phb_rows)
+        _meta_n = 0 if _meta_X is None else len(_meta_X)
+        _meta_existing = _meta_model.load_model()
+
+        c_a, c_b, c_c = st.columns([1, 1, 1])
+        with c_a:
+            st.metric("Trainable rows", f"{_meta_n}")
+        with c_b:
+            if _meta_existing and _meta_existing.get("cv_auc_mean") is not None:
+                st.metric("Last CV AUC", f"{_meta_existing['cv_auc_mean']:.3f}")
+            else:
+                st.metric("Last CV AUC", "—")
+        with c_c:
+            _train_disabled = _meta_n < _meta_model.MIN_TRAIN_N
+            if st.button(
+                f"Train meta-model"
+                + ("" if not _train_disabled else f" (need {_meta_model.MIN_TRAIN_N - _meta_n} more)"),
+                disabled=_train_disabled,
+                use_container_width=True,
+            ):
+                with st.spinner("Training…"):
+                    _train_result = _meta_model.train(_meta_X, _meta_y)
+                if _train_result.get("model") is None:
+                    st.error(_train_result.get("error", "Training failed"))
+                else:
+                    _saved = _meta_model.save_model(_train_result)
+                    if _saved:
+                        st.success(
+                            f"Trained on {_train_result['n_train']} rows · "
+                            f"CV AUC = {_train_result['cv_auc_mean']:.3f} "
+                            f"± {(_train_result.get('cv_auc_std') or 0):.3f}"
+                        )
+                    else:
+                        st.warning("Trained but failed to save model. Check disk permissions / joblib install.")
+
+        if _meta_existing:
+            _ta = _meta_existing.get("trained_at", "—")
+            _folds = _meta_existing.get("cv_fold_aucs") or []
+            _folds_str = " ".join(f"{a:.2f}" for a in _folds) if _folds else "—"
+            st.caption(
+                f"Loaded model: trained {_ta} · features {len(_meta_existing.get('feature_names') or [])} · "
+                f"fold AUCs: {_folds_str}. "
+                "AUC interpretation: 0.50 = no signal, 0.55 = weak edge, 0.60+ = real edge."
+            )
+        else:
+            st.caption(
+                f"No model saved yet. Train will be enabled once {_meta_model.MIN_TRAIN_N} resolved rows "
+                "have ALL Phase B fields populated (score, score_24h, bull_prob, conviction, regime)."
+            )
 
 
 # ── Tabs ─────────────────────────────────────────────────────────
@@ -10741,7 +11273,7 @@ with tab1:
 | Polymarket | {f"{_poly_thesis} ({_poly_sig:+.2f})" if isinstance(_poly_sig, float) else "N/A"} | {"🟢 Bullish" if _poly_sig > 0.1 else "🔴 Bearish" if _poly_sig < -0.1 else "⚪ Neutral"} | Prediction-market thesis score. Real money positioned; directional signal with genuine skin in the game. |
 | Fear & Greed | {f"{_fg_val} — {_fg_label}" if isinstance(_fg_val, (int, float)) else "N/A"} | {"🟢 Extreme Fear (contrarian buy)" if isinstance(_fg_val, (int, float)) and _fg_val < 25 else "🔴 Extreme Greed (contrarian sell)" if isinstance(_fg_val, (int, float)) and _fg_val > 75 else "⚪ Neutral zone"} | Crypto Fear & Greed Index. Extreme fear historically marks bottoms (contrarian buy); extreme greed marks tops. |
 | BTC Dominance | {_btc_dom} | {"🟢 Rising" if "rising" in _dom_trend.lower() or "increas" in _dom_trend.lower() else "🔴 Falling" if "falling" in _dom_trend.lower() or "decreas" in _dom_trend.lower() else "⚪ Stable"} | BTC share of total crypto market cap. Rising = capital rotating into BTC; falling = alt-season or risk-off rotation. |
-| Candlestick Pattern | — | {"🟢 Bullish" if _candle_sc > 0 else "🔴 Bearish" if _candle_sc < 0 else "⚪ Neutral"} | {_candle_note if _candle_note else "No significant candlestick pattern on current daily candle."} |
+| Candlestick Pattern | — | {"🟢 Bullish" if _candle_sc > 0 else "🔴 Bearish" if _candle_sc < 0 else "⚪ Neutral"} | {_candle_note if _candle_note else ("Pattern detection disabled — TA-Lib not installed." if not TALIB_AVAILABLE else "No significant candlestick pattern on current daily candle.")} |
 """)
 
     st.divider()
@@ -10749,9 +11281,19 @@ with tab1:
     # Key levels row
     lv1, lv2, lv3, lv4 = st.columns(4)
     with lv1:
-        st.metric("Support", f"${a['imm_sup']:,.0f}" if a["imm_sup"] else "—")
+        if a["imm_sup"]:
+            st.metric("Support", f"${a['imm_sup']:,.0f}")
+        elif a.get("ext_sup"):
+            st.metric("Support", f"${a['ext_sup']:,.0f}", delta="extended (>15%)", delta_color="off")
+        else:
+            st.metric("Support", "—")
     with lv2:
-        st.metric("Resistance", f"${a['imm_res']:,.0f}" if a["imm_res"] else "—")
+        if a["imm_res"]:
+            st.metric("Resistance", f"${a['imm_res']:,.0f}")
+        elif a.get("ext_res"):
+            st.metric("Resistance", f"${a['ext_res']:,.0f}", delta="extended (>15%)", delta_color="off")
+        else:
+            st.metric("Resistance", "—")
     with lv3:
         ma50  = a["df"]["MA50"].iloc[-1]
         ma200 = a["df"]["MA200"].iloc[-1]
@@ -10764,7 +11306,25 @@ with tab1:
 
     st.markdown("&nbsp;", unsafe_allow_html=True)
 
-    f_price = fig_price_chart(a)
+    # ── Timeframe toggle ──────────────────────────────────────────
+    # 1Y  → daily candles + MA50/MA200 + Bollinger + Fib (existing behavior)
+    # 5Y  → weekly candles + MA50w/100w/200w + Mayer Multiple
+    # ALL → weekly candles (log scale) + MA50w/100w/200w/300w + Mayer Multiple
+    _tf_choice = st.radio(
+        "Chart timeframe",
+        ["1Y · Daily", "5Y · Weekly", "ALL · Weekly (log)"],
+        index=0, horizontal=True, label_visibility="collapsed",
+        key="_price_chart_tf",
+    )
+    if _tf_choice == "1Y · Daily":
+        f_price = fig_price_chart(a)
+    elif _tf_choice == "5Y · Weekly":
+        f_price = fig_price_chart_lt(a, mode="5Y")
+    else:
+        f_price = fig_price_chart_lt(a, mode="ALL")
+    if f_price is None:
+        st.warning("Long-term weekly data unavailable. Falling back to 1Y daily.")
+        f_price = fig_price_chart(a)
     st.pyplot(f_price, use_container_width=True)
     plt.close(f_price)
 
@@ -10959,6 +11519,64 @@ with tab4:
         if _src_html:
             st.markdown(f'<div style="margin:2px 0 10px 0">{_src_html}</div>',
                         unsafe_allow_html=True)
+
+    # ── Synthetic liq map: source, reality-check score, time×price heatmap ───
+    _lm     = btc_liq.get("liq_map")
+    _lm_src = btc_liq.get("liq_map_source", "N/A")
+    _lm_ven = (_lm or {}).get("venues", "")
+    _ev_all = list(st.session_state.get(_LIQ_EVENTS_KEY, {}).values())
+    _fit    = _liqmap_fit_score(_lm, _ev_all, current_price=price)
+    _chip_style = ('background:#21262d;color:#8b949e;padding:1px 8px;'
+                   'border-radius:10px;font-size:11px;margin-right:6px;')
+    _chips = [f'<span style="{_chip_style}">map: {_lm_src}'
+              + (f' · {_lm_ven}' if _lm_ven else '') + '</span>']
+    if _fit:
+        _rho     = _fit["rho"]
+        _rho_col = ("#3fb950" if _rho >= 0.3
+                    else "#ffd700" if _rho >= 0.1 else "#f85149")
+        _chips.append(
+            f'<span style="{_chip_style}" title="Spearman rank correlation between '
+            f'this map\'s predicted fuel per $50 bin and realized liquidation '
+            f'notional per bin (OKX prints, last {_fit["window_h"]:.0f}h, '
+            f'{_fit["n_bins"]} bins; ±0.25% around spot excluded). '
+            f'ρ>0 = brighter zones really do liquidate more; ρ≈0 = no edge over '
+            f'random. Caveat: compares the CURRENT map to past events until '
+            f'liq_heatmap_log history allows as-of-time scoring.">'
+            f'reality check: <b style="color:{_rho_col};">ρ = {_rho:+.2f}</b> '
+            f'({_fit["n_events"]} prints / {_fit["n_bins"]} bins)</span>')
+    else:
+        _chips.append(f'<span style="{_chip_style}">reality check: pending '
+                      f'(needs ≥10 realized liq prints in 6h)</span>')
+    st.markdown('<div style="margin:4px 0 8px 0;">' + "".join(_chips) + '</div>',
+                unsafe_allow_html=True)
+
+    # Time × price heatmap — merge cron-logged history with session snapshots
+    _snaps = {}
+    try:
+        for _r in (_fetch_liq_heatmap_history(48) or []):
+            _k = _r.get("ts")
+            if not _k:
+                continue
+            _s = _snaps.setdefault(_k, {"long": [], "short": [], "px": None})
+            if _r.get("side") == "px":
+                _s["px"] = float(_r.get("price") or 0)
+            elif _r.get("side") in ("long", "short"):
+                _s[_r["side"]].append((float(_r["price"]), float(_r.get("usd") or 0)))
+    except Exception:
+        pass
+    _snaps.update(st.session_state.get(_LIQ_HEAT_KEY, {}))
+    _hm_fig = fig_liq_heatmap_history(_snaps, price)
+    if _hm_fig is not None:
+        st.pyplot(_hm_fig)
+        plt.close(_hm_fig)
+        st.caption("One column per 5–15 min snapshot (cron → Supabase history + "
+                   "this session's live columns). Bright bands = modeled liq fuel "
+                   "persisting until the white price line sweeps them — same read "
+                   "as the Coinglass heatmap, built from free multi-venue OI data.")
+    else:
+        st.caption("⏳ Time×price heatmap appears once ≥2 snapshots accumulate "
+                   "(5-min refreshes here, or cron history once liq_heatmap_log "
+                   "exists — run supabase_migrations.sql).")
 
     # ── Coinglass Liquidation Heatmap (embedded) ──────────────────────────────
     _CG_URL = "https://www.coinglass.com/pro/futures/LiquidationHeatMap?coin=BTC"

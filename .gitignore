@@ -4,3 +4,6 @@ __pycache__/
 *.log
 signal_log.csv
 .streamlit/secrets.toml
+.ipynb_checkpoints/
+models/
+bias_misses_annotated.png
