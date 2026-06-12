@@ -6248,6 +6248,13 @@ def _fetch_binance_synthetic_liqmap(current_price: float):
             "source":  ("multi_venue_synthetic" if len(venues) > 1
                         else "binance_synthetic"),
             "venues":  "+".join(v for v, _ in venues),
+            # Surviving tranches with birth timestamps — consumed by the
+            # ray-based heatmap renderer (fig_liq_heatmap_rays), which needs
+            # to know WHEN each cluster was created, not just where it sits.
+            "tranches": [{"ts": int(t["ts"]), "entry": float(t["entry"]),
+                          "long_usd": float(t["long_usd"]),
+                          "short_usd": float(t["short_usd"])}
+                         for t in all_tranches],
         }
     except Exception as e:
         st.session_state["_bn_synth_err"] = str(e)
@@ -6658,6 +6665,120 @@ def fig_liq_heatmap_history(snapshots: dict, current_price: float) -> "plt.Figur
         cb = fig.colorbar(im, ax=ax, pad=0.01, fraction=0.03)
         cb.ax.tick_params(colors="#8b949e", labelsize=7)
         cb.set_label("log(liq fuel $)", color="#8b949e", fontsize=8)
+        fig.tight_layout()
+        return fig
+    except Exception:
+        return None
+
+
+def fig_liq_heatmap_rays(liq_map: dict, current_price: float,
+                         window_h: int = 72) -> "plt.Figure | None":
+    """Coinglass-style ray-based liquidation heatmap.
+
+    Structural differences vs fig_liq_heatmap_history (the snapshot stacker):
+      1. TIME-ANCHORED RAYS — each surviving OI tranche draws its liq levels
+         from the tranche's BIRTH time forward, so bands appear when positions
+         were opened instead of spanning the whole axis uniformly.
+      2. SWEEP TERMINATION — a ray ends permanently at the first 15m candle
+         whose low..high range touches the level (those liqs fired).
+      3. LINEAR color scale (vmax at p99) — heavy clusters glow, noise stays
+         dark, matching the Coinglass look; log scaling flattened contrast.
+      4. Leverage tiers smeared into 3 sub-tiers (±12%) so bands don't render
+         as 6 mechanical echo stripes per entry price.
+
+    Display-only: the engine's binned map (Hunt Zone Pull etc.) is untouched.
+    Honest limitation: tranche notionals are the CURRENT post-FIFO survivors,
+    so history renders slightly thinner than it actually was at the time."""
+    try:
+        tranches = (liq_map or {}).get("tranches") or []
+        if len(tranches) < 5 or not current_price:
+            return None
+        # Fetch ~250h of 15m candles (API cap) but DISPLAY only the last
+        # window_h. The extra history exists so a level swept before the
+        # display window stays dead instead of ghosting back at column 0.
+        bars = _fetch_binance_klines("15m", 1000)
+        if bars is None or len(bars) < 8:
+            return None
+        n_disp  = min(window_h * 4, len(bars))
+        bar_ms  = np.array([int(t.timestamp() * 1000) for t in bars.index])
+        highs   = bars["High"].to_numpy(dtype=float)
+        lows    = bars["Low"].to_numpy(dtype=float)
+        n_bars  = len(bar_ms)
+        d0      = n_bars - n_disp            # first displayed column
+
+        BIN  = 50.0
+        _dlo = float(lows[d0:].min());  _dhi = float(highs[d0:].max())
+        ylo  = min(_dlo, current_price) * 0.95
+        yhi  = max(_dhi, current_price) * 1.05
+        y0   = np.floor(ylo / BIN) * BIN
+        n_y  = int((yhi - y0) // BIN) + 1
+        if n_y < 8:
+            return None
+        mat  = np.zeros((n_y, n_bars))
+
+        HALF_LIFE_MS = 7 * 24 * 3600 * 1000
+        now_ms       = int(bar_ms[-1])
+        # Smear each leverage tier into 3 sub-leverages so a single entry
+        # price doesn't paint 6 razor-thin mechanical stripes.
+        _SUB = [(0.88, 0.25), (1.0, 0.50), (1.12, 0.25)]
+
+        def _paint(level, start_idx, fuel):
+            i = int((level - y0) // BIN)
+            if not (0 <= i < n_y) or start_idx >= n_bars:
+                return
+            seg = (lows[start_idx:] <= level) & (level <= highs[start_idx:])
+            hit = np.argmax(seg) if seg.any() else None
+            end = start_idx + int(hit) if hit is not None else n_bars
+            if hit is not None and hit == 0:
+                return                      # born already inside the candle — swept at birth
+            mat[i, start_idx:end] += fuel
+
+        for tr in tranches:
+            ts    = int(tr["ts"])
+            entry = float(tr["entry"])
+            decay = 0.5 ** (max(0, now_ms - ts) / HALF_LIFE_MS)
+            start = int(np.searchsorted(bar_ms, ts))
+            for lev, w in _LEV_TIERS:
+                m = _LEV_MMR.get(lev, _MAINT_MARGIN)
+                for mult, sw in _SUB:
+                    L = lev * mult
+                    if tr["long_usd"] > 0:
+                        _paint(entry * (1.0 - 1.0 / L) / (1.0 - m),
+                               start, tr["long_usd"] * w * sw * decay)
+                    if tr["short_usd"] > 0:
+                        _paint(entry * (1.0 + 1.0 / L) / (1.0 + m),
+                               start, tr["short_usd"] * w * sw * decay)
+
+        # Slice to the display window only after painting/sweeping full history
+        mat_d    = mat[:, d0:]
+        closes_d = bars["Close"].to_numpy(dtype=float)[d0:]
+        idx_d    = bars.index[d0:]
+        if mat_d.max() <= 0:
+            return None
+        fig, ax = plt.subplots(figsize=(13, 4.6))
+        fig.patch.set_facecolor("#0d1117")
+        _ax_style(ax)
+        nz   = mat_d[mat_d > 0]
+        vmax = float(np.percentile(nz, 99))
+        im = ax.imshow(mat_d, aspect="auto", origin="lower",
+                       cmap="viridis", interpolation="nearest",
+                       vmin=0.0, vmax=vmax,
+                       extent=[0, n_disp, y0, y0 + n_y * BIN])
+        ax.plot(np.arange(n_disp) + 0.5, closes_d, color="#ffffff", lw=1.1, alpha=0.95)
+        _sgt = _tz(offset=__import__("datetime").timedelta(hours=8))
+        step = max(1, n_disp // 8)
+        ax.set_xticks(np.arange(0, n_disp, step) + 0.5)
+        ax.set_xticklabels(
+            [idx_d[i].tz_convert(_sgt).strftime("%d %b %H:%M")
+             for i in range(0, n_disp, step)],
+            rotation=25, ha="right", fontsize=7, color="#8b949e")
+        ax.set_ylim(ylo, yhi)
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"${v:,.0f}"))
+        ax.set_title("Synthetic Liquidation Heatmap — tranche rays, sweep-terminated "
+                     "(linear intensity)", color="#e6edf3", fontsize=10, loc="left")
+        cb = fig.colorbar(im, ax=ax, pad=0.01, fraction=0.03)
+        cb.ax.tick_params(colors="#8b949e", labelsize=7)
+        cb.set_label("liq fuel $ (linear, p99 cap)", color="#8b949e", fontsize=8)
         fig.tight_layout()
         return fig
     except Exception:
@@ -8879,10 +9000,12 @@ with st.sidebar:
                "realized events: OKX · Coinglass/Hyblock used only if API keys set")
     st.divider()
     st.markdown("**About**")
-    st.caption("Cycle phase scored across 8 signals: "
-               "Fear & Greed, ETF Flows, RSI, Momentum, "
-               "Dominance, MA200 deviation, 52W position, OBV.  "
-               "Range: −24 (top) to +24 (bottom).")
+    st.caption("Cycle phase scored across 14 signals: "
+               "Fear & Greed, ETF Flows, RSI+Divergence, Momentum, "
+               "Dominance, MA200 deviation, 52W position, OBV, Funding, "
+               "Pi Cycle Top, Polymarket thesis, CVD60, ADX compression, "
+               "Liq asymmetry.  Range: −36 (top) to +36 (bottom); "
+               "|total| ≥ 18 = probable extreme.")
     if not TALIB_AVAILABLE:
         st.caption("⚠️ Candlestick patterns disabled — TA-Lib not installed. "
                    "Pattern rows show neutral, not 'no pattern detected'.")
@@ -11550,33 +11673,43 @@ with tab4:
     st.markdown('<div style="margin:4px 0 8px 0;">' + "".join(_chips) + '</div>',
                 unsafe_allow_html=True)
 
-    # Time × price heatmap — merge cron-logged history with session snapshots
-    _snaps = {}
-    try:
-        for _r in (_fetch_liq_heatmap_history(48) or []):
-            _k = _r.get("ts")
-            if not _k:
-                continue
-            _s = _snaps.setdefault(_k, {"long": [], "short": [], "px": None})
-            if _r.get("side") == "px":
-                _s["px"] = float(_r.get("price") or 0)
-            elif _r.get("side") in ("long", "short"):
-                _s[_r["side"]].append((float(_r["price"]), float(_r.get("usd") or 0)))
-    except Exception:
-        pass
-    _snaps.update(st.session_state.get(_LIQ_HEAT_KEY, {}))
-    _hm_fig = fig_liq_heatmap_history(_snaps, price)
+    # Time × price heatmap. Primary: ray-based renderer (bands born at tranche
+    # open time, terminated when a 15m candle sweeps the level — the Coinglass
+    # construction). Fallback: snapshot stacker if tranche data is missing.
+    _hm_fig = fig_liq_heatmap_rays(_lm, price)
     if _hm_fig is not None:
         st.pyplot(_hm_fig)
         plt.close(_hm_fig)
-        st.caption("One column per 5–15 min snapshot (cron → Supabase history + "
-                   "this session's live columns). Bright bands = modeled liq fuel "
-                   "persisting until the white price line sweeps them — same read "
-                   "as the Coinglass heatmap, built from free multi-venue OI data.")
+        st.caption("Each band is born when its positions were opened (OI tranche) "
+                   "and dies the first time a 15m candle touches it — those liqs "
+                   "fired. Linear intensity: only genuinely heavy clusters glow. "
+                   "Built from free Binance+Bybit+OKX OI data; history thins "
+                   "slightly vs reality because closed tranches are pruned.")
     else:
-        st.caption("⏳ Time×price heatmap appears once ≥2 snapshots accumulate "
-                   "(5-min refreshes here, or cron history once liq_heatmap_log "
-                   "exists — run supabase_migrations.sql).")
+        # Fallback: cron-logged snapshots + this session's columns
+        _snaps = {}
+        try:
+            for _r in (_fetch_liq_heatmap_history(48) or []):
+                _k = _r.get("ts")
+                if not _k:
+                    continue
+                _s = _snaps.setdefault(_k, {"long": [], "short": [], "px": None})
+                if _r.get("side") == "px":
+                    _s["px"] = float(_r.get("price") or 0)
+                elif _r.get("side") in ("long", "short"):
+                    _s[_r["side"]].append((float(_r["price"]), float(_r.get("usd") or 0)))
+        except Exception:
+            pass
+        _snaps.update(st.session_state.get(_LIQ_HEAT_KEY, {}))
+        _hm_fig2 = fig_liq_heatmap_history(_snaps, price)
+        if _hm_fig2 is not None:
+            st.pyplot(_hm_fig2)
+            plt.close(_hm_fig2)
+            st.caption("Snapshot-stacked heatmap (fallback — tranche data "
+                       "unavailable this refresh).")
+        else:
+            st.caption("⏳ Heatmap appears once liq-map data is available "
+                       "(needs OI history from at least one venue).")
 
     # ── Coinglass Liquidation Heatmap (embedded) ──────────────────────────────
     _CG_URL = "https://www.coinglass.com/pro/futures/LiquidationHeatMap?coin=BTC"
