@@ -7578,6 +7578,52 @@ def fig_intraday_15m(a: dict) -> "plt.Figure | None":
             ax_c.text(1, _wp, " ask", transform=ax_c.get_yaxis_transform(),
                       fontsize=5.5, color="#f85149", va="top", alpha=0.8)
 
+    # ── Hunt-zone magnet overlays (multi-venue synthetic liq map) ───────
+    # Draws the SAME structures the engines score: liq_analysis.hunt_zones,
+    # filtered exactly like the 24h "Nearby Liq Magnet" signal (≥$1M fuel
+    # within ±2.5% of spot, top 3 per side by hunt_score). Violet bands =
+    # projected liquidation fuel acting as a price magnet; the badge shows
+    # the net pull split. Walls (green/red dashes) are resting orders —
+    # *resistance*; hunt zones are stop/liq fuel — *attraction*.
+    _hz_all  = _liq_anal.get("hunt_zones", []) or []
+    _hz_near = [z for z in _hz_all
+                if z.get("notional", z.get("wall", 0)) >= 1_000_000
+                and abs(float(z["price"]) - cur) / cur <= 0.025]
+    _hz_up   = sorted([z for z in _hz_near if float(z["price"]) > cur],
+                      key=lambda z: z.get("hunt_score", 0), reverse=True)[:3]
+    _hz_dn   = sorted([z for z in _hz_near if float(z["price"]) < cur],
+                      key=lambda z: z.get("hunt_score", 0), reverse=True)[:3]
+    _hz_col  = "#bc8cff"
+    for _z in _hz_up + _hz_dn:
+        _zp = float(_z["price"])
+        _zn = float(_z.get("notional", _z.get("wall", 0)))
+        _za = min(0.32, 0.10 + _zn / 8e7)
+        ax_c.axhspan(_zp - 75, _zp + 75, color=_hz_col, alpha=_za, zorder=1.5)
+        _zarrow = "↑" if _zp > cur else "↓"
+        ax_c.text(0.012, _zp,
+                  " hunt {} \${:,.0f} · \${:.0f}M".format(_zarrow, _zp, _zn / 1e6),
+                  transform=ax_c.get_yaxis_transform(), fontsize=6.0,
+                  color=_hz_col, va="center", fontweight="bold", zorder=5,
+                  bbox=dict(boxstyle="round,pad=0.12", fc="#0d1117",
+                            ec=_hz_col, lw=0.4, alpha=0.72))
+    # Net magnet pull — identical hunt_score weighting the engines use.
+    _pull_up = sum(z.get("hunt_score", 0) for z in _hz_up)
+    _pull_dn = sum(z.get("hunt_score", 0) for z in _hz_dn)
+    if _pull_up + _pull_dn > 0:
+        _pp   = _pull_up / (_pull_up + _pull_dn) * 100
+        _pcol = "#3fb950" if _pp >= 60 else ("#f85149" if _pp <= 40 else "#8b949e")
+        ax_c.text(0.99, 0.035,
+                  "Liq magnet: ↑{:.0f}% / ↓{:.0f}%".format(_pp, 100 - _pp),
+                  transform=ax_c.transAxes, ha="right", va="bottom",
+                  fontsize=7.0, color=_pcol, fontweight="bold", zorder=6,
+                  bbox=dict(boxstyle="round,pad=0.25", fc="#161b22",
+                            ec=_pcol, lw=0.6, alpha=0.85))
+    # Extend the y-range just enough to show nearby zones sitting beyond
+    # the day's traded range — that's exactly where the prediction lives.
+    _zone_ps = [float(z["price"]) for z in _hz_up + _hz_dn]
+    _ylo_f = min(p_lo - _pad, (min(_zone_ps) - 150)) if _zone_ps else p_lo - _pad
+    _yhi_f = max(p_hi + _pad, (max(_zone_ps) + 150)) if _zone_ps else p_hi + _pad
+
     # ── Candles ────────────────────────────────────────────────────────
     ax_c.bar(xs, closes - opens, 0.55, bottom=opens, color=colors, alpha=1.0, zorder=3)
     ax_c.bar(xs, highs  - lows,  0.12, bottom=lows,  color=colors, alpha=0.9, zorder=3)
@@ -7631,7 +7677,7 @@ def fig_intraday_15m(a: dict) -> "plt.Figure | None":
             tick_lbls.append("")
 
     ax_c.set_xlim(-1, n)
-    ax_c.set_ylim(p_lo - _pad, p_hi + _pad)
+    ax_c.set_ylim(_ylo_f, _yhi_f)
     ax_c.set_xticks([])
     ax_c.tick_params(bottom=False, which="both")
     ax_c.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: "\${:,.0f}".format(v)))
@@ -7697,7 +7743,7 @@ def fig_intraday_15m(a: dict) -> "plt.Figure | None":
                bbox=dict(boxstyle="round,pad=0.18", fc="#0d1117", ec=_cur_col, lw=0.9, alpha=0.95))
     ax_vp.set_xlim(0, 1.1); ax_vp.set_xticks([])
     ax_vp.tick_params(labelleft=False, bottom=False, left=False, right=False)
-    ax_vp.set_ylim(p_lo - _pad, p_hi + _pad)
+    ax_vp.set_ylim(_ylo_f, _yhi_f)
     ax_vp.set_title("Vol\nProfile", color="#484f58", fontsize=6, pad=2)
     for _sp in ax_vp.spines.values(): _sp.set_visible(False)
 
