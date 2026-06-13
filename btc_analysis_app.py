@@ -622,6 +622,74 @@ def _baseline_episode_stats(rows: list, gap_hours: float = 6.0) -> dict:
     }
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def _forecast_diagnostic(rows: list) -> "dict | None":
+    """Is the 72h score a FORECAST or just a coincident momentum mirror?
+
+    A genuine forecast correlates with FUTURE returns; a coincident/lagging
+    indicator only correlates with PAST returns. Uses each row's entry_price
+    as a BTC price series and grades the score against:
+      - fwd72  : the true +72h-forward return (timestamp-exact lookup)
+      - trail24: the trailing-24h return (the dumb momentum baseline)
+    Reports Spearman correlations + a period-split (the early-vs-late split is
+    what exposes regime-confounded 'forecast' correlations as mirages).
+
+    The decisive numbers: corr(score→fwd72) vs corr(trail24→fwd72) — if the
+    engine doesn't beat raw momentum at predicting the future, its 30 signals
+    add no forecast value. Returns None if <200 forward points."""
+    try:
+        recs = []
+        for r in rows:
+            try:
+                recs.append((_dt.fromisoformat(r["ts"]), float(r["score"]),
+                             float(r["entry_price"])))
+            except Exception:
+                continue
+        if len(recs) < 250:
+            return None
+        d = pd.DataFrame(recs, columns=["ts", "score", "price"]).drop_duplicates("ts")
+        d["ts"] = pd.to_datetime(d["ts"], utc=True)
+        d = d.sort_values("ts").reset_index(drop=True)
+
+        def _shifted_ret(hours, direction):
+            # direction +1 = FORWARD return  (price[t+h]/price[t] − 1)
+            # direction −1 = TRAILING return (price[t]/price[t−h] − 1)
+            tgt = d["ts"] + pd.Timedelta(hours=hours * direction)
+            ref = d[["ts", "price"]].rename(columns={"ts": "rts", "price": "rprice"})
+            key = "_t"
+            left = d.assign(**{key: tgt}).sort_values(key)
+            m = pd.merge_asof(left, ref.sort_values("rts"), left_on=key,
+                              right_on="rts", direction="nearest",
+                              tolerance=pd.Timedelta(minutes=90))
+            rp = m.sort_values("ts")["rprice"].values
+            now = d["price"].values
+            ret = (rp / now - 1) if direction > 0 else (now / rp - 1)
+            return ret * 100
+
+        fwd72   = _shifted_ret(72, +1)
+        trail24 = _shifted_ret(24, -1)
+        sc      = d["score"].values
+
+        def _rho(a, b):
+            s = pd.DataFrame({"a": a, "b": b}).dropna()
+            return round(s["a"].corr(s["b"], method="spearman"), 3) if len(s) >= 100 else None
+
+        n_fwd = int(np.sum(~np.isnan(fwd72)))
+        full  = _rho(sc, fwd72)
+        half  = len(sc) // 2
+        early = _rho(sc[:half], fwd72[:half])
+        late  = _rho(sc[half:], fwd72[half:])
+        return {
+            "n": n_fwd,
+            "score_vs_fwd72":   full,                 # forecast power
+            "score_vs_trail24": _rho(sc, trail24),    # how momentum-like
+            "trail24_vs_fwd72": _rho(trail24, fwd72), # momentum baseline's own edge
+            "early_fwd": early, "late_fwd": late,     # regime-robustness
+        }
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def _backtest_tech_signals(days: int = 55) -> dict:
     """
@@ -10913,6 +10981,56 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
                 st.caption(f"Forecasting diagnostics will appear once ≥10 signals resolve with daily-history coverage (currently {len(_ctx_rows)}).")
         except Exception as _e:
             st.caption(f"Forecasting diagnostics unavailable: {_e}")
+
+        # ── (D) Forecast-vs-coincident correlation test ──────────────
+        # The quantitative version of the above: does the score correlate with
+        # FUTURE returns (forecast) or only PAST returns (coincident mirror)?
+        st.markdown("**Forecast vs coincident** — does the score lead price, or just echo it?")
+        _fd = _forecast_diagnostic(_sig_rows)
+        if _fd is None:
+            st.caption("Needs ≥250 logged points with +72h price available — accumulating.")
+        else:
+            _fwd  = _fd["score_vs_fwd72"]
+            _coin = _fd["score_vs_trail24"]
+            _mom  = _fd["trail24_vs_fwd72"]
+            def _fc(v, good_hi=0.15):
+                if v is None: return "#8b949e"
+                return "#3fb950" if v >= good_hi else ("#ffd700" if v >= 0.05 else "#f85149")
+            def _cell(label, val, col, sub):
+                _vs = f"{val:+.2f}" if isinstance(val, (int, float)) else "—"
+                return (f'<div style="background:#0d1117; border:1px solid #30363d; '
+                        f'border-radius:8px; padding:8px 12px; min-width:150px;">'
+                        f'<div style="font-size:10px; color:#8b949e;">{label}</div>'
+                        f'<div style="font-size:22px; font-weight:800; color:{col};">{_vs}</div>'
+                        f'<div style="font-size:9px; color:#6e7681;">{sub}</div></div>')
+            _html = '<div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:6px;">'
+            _html += _cell("score → FUTURE +72h", _fwd, _fc(_fwd), "ρ &gt;0 = forecasts (the goal)")
+            _html += _cell("momentum → +72h", _mom, _fc(_mom), "trailing-24h baseline")
+            _html += _cell("score → PAST 24h", _coin, "#8b949e", "high = momentum-like")
+            _html += '</div>'
+            st.markdown(_html, unsafe_allow_html=True)
+            # Verdict
+            _beats = (isinstance(_fwd, (int, float)) and isinstance(_mom, (int, float))
+                      and _fwd > _mom + 0.05 and _fwd >= 0.15)
+            _flip  = (isinstance(_fd["early_fwd"], (int, float)) and isinstance(_fd["late_fwd"], (int, float))
+                      and _fd["early_fwd"] * _fd["late_fwd"] < 0)
+            _coincident = (isinstance(_fwd, (int, float)) and isinstance(_coin, (int, float))
+                           and _coin >= 0.30 and _fwd < 0.12)
+            if _beats and not _flip:
+                _vc, _vt = "#3fb950", ("✓ Score forecasts forward returns AND beats the momentum baseline — "
+                                       "genuine predictive signal, not just price echo.")
+            elif _coincident:
+                _vc, _vt = "#f85149", ("✗ Strong past-return correlation but weak forward correlation — "
+                                       "the score is currently a COINCIDENT momentum mirror, not a 3-day "
+                                       "forecast. It mostly tells you what price already did.")
+            else:
+                _vc, _vt = "#ffd700", ("~ Weak/ambiguous forward edge, not clearly beating raw momentum — "
+                                       "forecast value unproven.")
+            if _flip:
+                _vt += f" Forward ρ flips sign across the sample (early {_fd['early_fwd']:+.2f} → late {_fd['late_fwd']:+.2f}) — any positive correlation is regime-confounded, not robust."
+            st.markdown(f'<div style="font-size:10px; color:{_vc}; padding:5px 0 0; line-height:1.5;">'
+                        f'{_vt} <span style="color:#484f58;">(n={_fd["n"]}, Spearman ρ)</span></div>',
+                        unsafe_allow_html=True)
 
 
 # ════════════════════════════════════════════════════════════════
