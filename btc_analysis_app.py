@@ -7564,19 +7564,17 @@ def fig_intraday_15m(a: dict) -> "plt.Figure | None":
     if _cseg is not None:
         ax_c.axvspan(_cseg - 0.5, n - 0.5, color="#e3b341", alpha=0.09, zorder=0)
 
-    # ── Liquidity wall overlays ─────────────────────────────────────────
-    for _wp, _wn in _bid_walls[:4]:
+    # ── Liquidity wall overlays — top 3 each side, dim/thin so they read as
+    # background context. Colours are explained in the legend (Bid/Ask wall),
+    # so no per-line text labels (they were the bulk of the clutter).
+    for _wp, _wn in _bid_walls[:3]:
         if p_lo * 0.98 <= _wp <= p_hi * 1.02:
-            _wt = min(2.5, 0.6 + float(_wn) / 3e7)
-            ax_c.axhline(_wp, color="#3fb950", lw=_wt, ls="--", alpha=0.55, zorder=2)
-            ax_c.text(1, _wp, " bid", transform=ax_c.get_yaxis_transform(),
-                      fontsize=5.5, color="#3fb950", va="bottom", alpha=0.8)
-    for _wp, _wn in _ask_walls[:4]:
+            _wt = min(2.0, 0.5 + float(_wn) / 4e7)
+            ax_c.axhline(_wp, color="#3fb950", lw=_wt, ls="--", alpha=0.35, zorder=2)
+    for _wp, _wn in _ask_walls[:3]:
         if p_lo * 0.98 <= _wp <= p_hi * 1.02:
-            _wt = min(2.5, 0.6 + float(_wn) / 3e7)
-            ax_c.axhline(_wp, color="#f85149", lw=_wt, ls="--", alpha=0.55, zorder=2)
-            ax_c.text(1, _wp, " ask", transform=ax_c.get_yaxis_transform(),
-                      fontsize=5.5, color="#f85149", va="top", alpha=0.8)
+            _wt = min(2.0, 0.5 + float(_wn) / 4e7)
+            ax_c.axhline(_wp, color="#f85149", lw=_wt, ls="--", alpha=0.35, zorder=2)
 
     # ── Hunt-zone magnet overlays (multi-venue synthetic liq map) ───────
     # Draws the SAME structures the engines score: liq_analysis.hunt_zones,
@@ -7594,18 +7592,25 @@ def fig_intraday_15m(a: dict) -> "plt.Figure | None":
     _hz_dn   = sorted([z for z in _hz_near if float(z["price"]) < cur],
                       key=lambda z: z.get("hunt_score", 0), reverse=True)[:3]
     _hz_col  = "#bc8cff"
-    for _z in _hz_up + _hz_dn:
-        _zp = float(_z["price"])
-        _zn = float(_z.get("notional", _z.get("wall", 0)))
-        _za = min(0.32, 0.10 + _zn / 8e7)
-        ax_c.axhspan(_zp - 75, _zp + 75, color=_hz_col, alpha=_za, zorder=1.5)
+    # Single highest-probability target only: top hunt_score among nearby
+    # zones (hunt_score = fuel/dist² × cascade-chain — the engine's own
+    # "most likely to get swept next" ranking). The rest stay off the chart;
+    # the badge below still summarizes the full nearby field.
+    _hz_top = max(_hz_up + _hz_dn, key=lambda z: z.get("hunt_score", 0),
+                  default=None)
+    if _hz_top is not None:
+        _zp = float(_hz_top["price"])
+        _zn = float(_hz_top.get("notional", _hz_top.get("wall", 0)))
         _zarrow = "↑" if _zp > cur else "↓"
-        ax_c.text(0.012, _zp,
-                  " hunt {} \${:,.0f} · \${:.0f}M".format(_zarrow, _zp, _zn / 1e6),
-                  transform=ax_c.get_yaxis_transform(), fontsize=6.0,
-                  color=_hz_col, va="center", fontweight="bold", zorder=5,
-                  bbox=dict(boxstyle="round,pad=0.12", fc="#0d1117",
-                            ec=_hz_col, lw=0.4, alpha=0.72))
+        # Single clean line (not a band) at the highest-hunt_score target.
+        # Label anchored at the RIGHT edge so it never collides with the POC
+        # tag on the left.
+        ax_c.axhline(_zp, color=_hz_col, lw=1.3, ls=(0, (5, 3)), alpha=0.9, zorder=2.5)
+        ax_c.text(0.992, _zp, "HUNT {} \${:,.0f} · \${:.0f}M".format(_zarrow, _zp, _zn / 1e6),
+                  transform=ax_c.get_yaxis_transform(), fontsize=6.4,
+                  color=_hz_col, va="center", ha="right", fontweight="bold", zorder=6,
+                  bbox=dict(boxstyle="round,pad=0.2", fc="#0d1117",
+                            ec=_hz_col, lw=0.8, alpha=0.9))
     # Net magnet pull — identical hunt_score weighting the engines use.
     _pull_up = sum(z.get("hunt_score", 0) for z in _hz_up)
     _pull_dn = sum(z.get("hunt_score", 0) for z in _hz_dn)
@@ -7618,9 +7623,9 @@ def fig_intraday_15m(a: dict) -> "plt.Figure | None":
                   fontsize=7.0, color=_pcol, fontweight="bold", zorder=6,
                   bbox=dict(boxstyle="round,pad=0.25", fc="#161b22",
                             ec=_pcol, lw=0.6, alpha=0.85))
-    # Extend the y-range just enough to show nearby zones sitting beyond
+    # Extend the y-range just enough to show the target if it sits beyond
     # the day's traded range — that's exactly where the prediction lives.
-    _zone_ps = [float(z["price"]) for z in _hz_up + _hz_dn]
+    _zone_ps = [float(_hz_top["price"])] if _hz_top is not None else []
     _ylo_f = min(p_lo - _pad, (min(_zone_ps) - 150)) if _zone_ps else p_lo - _pad
     _yhi_f = max(p_hi + _pad, (max(_zone_ps) + 150)) if _zone_ps else p_hi + _pad
 
@@ -7648,9 +7653,9 @@ def fig_intraday_15m(a: dict) -> "plt.Figure | None":
               transform=ax_c.get_yaxis_transform(),
               color="#e3b341", fontsize=6.5, va="bottom", zorder=5)
 
-    # ── Market structure labels (last 6 chronologically — mix of highs & lows) ─
+    # ── Market structure labels (last 4 chronologically — mix of highs & lows) ─
     _struct_sorted = sorted(struct_labels, key=lambda t: t[0])
-    for _sx, _sy, _slbl, _scol, _sside in _struct_sorted[-6:]:
+    for _sx, _sy, _slbl, _scol, _sside in _struct_sorted[-4:]:
         _yoff = _pad * 0.35 if _sside == "high" else -_pad * 0.35
         ax_c.text(_sx, _sy + _yoff, _slbl, fontsize=6.5, color=_scol,
                   ha="center", va="bottom" if _sside == "high" else "top",
