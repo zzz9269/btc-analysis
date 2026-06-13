@@ -6958,7 +6958,14 @@ def run_analysis(ticker: str = "BTC-USD") -> dict:
     obv_trend             = calculate_obv_trend(df)
     div_rsi               = detect_rsi_divergence(closes, rsi_series)
     adx_val               = calculate_adx(df)
-    supports, resistances = find_levels(closes)
+    # order=3 (±3-day pivots) not 5: order=5 only flags swing highs that are the
+    # max close over an 11-day window, which skips the minor shelves price
+    # actually reacts at (e.g. it jumped straight to +11% resistance while real
+    # supply sat ~+6%/+9% closer). These levels are DISPLAY-only — the 72h/24h
+    # engines read detect_price_traps + liq clusters, not find_levels — so the
+    # finer setting can't perturb the scores. Deep-history pass below stays
+    # coarse (order=5) for major multi-year pivots.
+    supports, resistances = find_levels(closes, order=3)
     imm_sup = nearest_level(supports,    price, "support")
     imm_res = nearest_level(resistances, price, "resistance")
     # Extended fallback (±25%) — surfaces a level after violent moves when the
