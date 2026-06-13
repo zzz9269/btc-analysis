@@ -10466,27 +10466,31 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
   </div>
 </div>""", unsafe_allow_html=True)
 
-    # ── Score history chart (last 72h from log) ───────────────────
-    _cutoff_72h = _dt.now(_tz.utc).timestamp() - 72 * 3600
+    # ── Score history chart ───────────────────────────────────────
+    # Window is 7 days, not 72h: a row can only be graded 72h after it's
+    # logged, so the most-recent 72h is ALWAYS unresolved. To actually show
+    # win/loss hits we must reach back into the graded past. The last 72h is
+    # marked as a "maturing" zone since those ticks have no outcome yet.
+    _HIST_LOOKBACK_H = 168
+    _sgt = _tz(offset=__import__("datetime").timedelta(hours=8))
+    _cutoff_hist = _dt.now(_tz.utc).timestamp() - _HIST_LOOKBACK_H * 3600
     _hist_rows  = []
     for _r in _sig_rows:
         try:
             _ts = _dt.fromisoformat(_r["ts"]).timestamp()
-            if _ts >= _cutoff_72h:
-                _sgt = _tz(offset=__import__("datetime").timedelta(hours=8))
+            if _ts >= _cutoff_hist:
                 _local_ts = _dt.fromisoformat(_r["ts"]).astimezone(_sgt).replace(tzinfo=None)
                 _hist_rows.append((_local_ts, float(_r["score"])))
         except Exception:
             continue
 
-    # Always render a 72h-wide chart — empty space on the left until data fills in
     import matplotlib.dates as mdates
     import datetime as _datetime
 
     _sgt_tz   = _tz(offset=_datetime.timedelta(hours=8))
     _now_sgt  = _dt.now(_tz.utc).astimezone(_sgt_tz).replace(tzinfo=None)
     _x_end    = _now_sgt
-    _x_start  = _now_sgt - _datetime.timedelta(hours=72)
+    _x_start  = _now_sgt - _datetime.timedelta(hours=_HIST_LOOKBACK_H)
 
     _sf, _sa = plt.subplots(figsize=(13, 2.6))
     _sf.patch.set_facecolor("#0d1117")
@@ -10511,12 +10515,39 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
                              where=(_sv <= -25), color="#f85149", alpha=0.20)
             _sa.fill_between(_hist_times, _sv, 0,
                              where=((_sv > -25) & (_sv < 25)), color="#8b949e", alpha=0.08)
-        # Markers make each 5-min reading visible even when scores are tiny
-        _sa.plot(_hist_times, _sv, color="#58a6ff", lw=1.8,
-                 marker="o", ms=2.2, mfc="#58a6ff", mec="#58a6ff", zorder=3)
+        # Thin line (no per-tick markers over a 7-day span — too dense)
+        _sa.plot(_hist_times, _sv, color="#58a6ff", lw=1.2, zorder=3)
         # Auto-zoom Y so a flat line near zero is still visible, but keep
         # ±25 in view as the minimum reference window. Cap at ±75.
         _y_abs = float(min(max(np.abs(_sv).max() * 1.25, 25), 75))
+
+    # ── Win/loss outcome ribbon (bottom strip) ─────────────────────────
+    # Shade each RESOLVED episode green (win) / red (loss) as a bar along the
+    # bottom — the honest unit (consecutive same-direction ticks share a 72h
+    # window, so we don't dot every autocorrelated tick). Uses the same
+    # _episode_stats over post-cutoff rows that feeds the 4/8 headline.
+    _ep_hits = _episode_stats(_bt_rows)
+    _n_marked = 0
+    for _e in _ep_hits.get("episodes", []):
+        _es = _e["start"].astimezone(_sgt).replace(tzinfo=None)
+        _ee = _e["end"].astimezone(_sgt).replace(tzinfo=None)
+        if _ee < _x_start or _es > _x_end:
+            continue
+        _es = max(_es, _x_start); _ee = min(_ee, _x_end)
+        _won  = _e["wins"] / _e["n"] > 0.5
+        _ecol = "#3fb950" if _won else "#f85149"
+        # Bottom ribbon (axes-fraction y so it's independent of score range)
+        _sa.axvspan(_es, _ee, ymin=0.0, ymax=0.06, color=_ecol, alpha=0.9, zorder=4)
+        # Faint full-height tint so the run is locatable against the line
+        _sa.axvspan(_es, _ee, ymin=0.06, ymax=1.0, color=_ecol, alpha=0.06, zorder=0)
+        _n_marked += 1
+
+    # Divider: everything right of this is < 72h old → not yet graded.
+    _mature_x = _now_sgt - _datetime.timedelta(hours=72)
+    _sa.axvline(_mature_x, color="#6e7681", lw=0.8, ls=(0, (3, 3)), alpha=0.7, zorder=2)
+    _sa.axvspan(_mature_x, _x_end, ymin=0.0, ymax=1.0, color="#6e7681", alpha=0.05, zorder=0)
+    _sa.text(_mature_x, 0.97, " maturing (<72h, ungraded) →", transform=_sa.get_xaxis_transform(),
+             fontsize=6, color="#6e7681", va="top", ha="left", zorder=5)
 
     _sa.text(1.002, 40,  "+40",  transform=_sa.get_yaxis_transform(), fontsize=6, color="#3fb950", va="center")
     _sa.text(1.002, 25,  "+25",  transform=_sa.get_yaxis_transform(), fontsize=6, color="#3fb950", va="center")
@@ -10528,7 +10559,8 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
     _sa.set_ylabel("Bias Score", color="#8b949e", fontsize=7)
     _sa.tick_params(colors="#8b949e", labelsize=7)
     for _sp in _sa.spines.values(): _sp.set_edgecolor("#30363d")
-    _sa.set_title("72h Bias Score History  (every 5 min · SGT)",
+    _sa.set_title("72h Bias Score — 7-day history  ·  bottom ribbon = resolved "
+                  "episodes (green win / red loss · SGT)",
                   color="#8b949e", fontsize=8, loc="left", pad=4)
     _sa.xaxis.set_major_formatter(mdates.DateFormatter("%d %b %H:%M"))
     _sa.xaxis.set_major_locator(mdates.HourLocator(interval=6))
