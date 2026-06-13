@@ -7603,14 +7603,9 @@ def fig_intraday_15m(a: dict) -> "plt.Figure | None":
         _zn = float(_hz_top.get("notional", _hz_top.get("wall", 0)))
         _zarrow = "↑" if _zp > cur else "↓"
         # Single clean line (not a band) at the highest-hunt_score target.
-        # Label anchored at the RIGHT edge so it never collides with the POC
-        # tag on the left.
+        # The label is drawn later in the volume-profile gutter (see ax_vp
+        # section) so it never sits on top of the candles.
         ax_c.axhline(_zp, color=_hz_col, lw=1.3, ls=(0, (5, 3)), alpha=0.9, zorder=2.5)
-        ax_c.text(0.992, _zp, "HUNT {} \${:,.0f} · \${:.0f}M".format(_zarrow, _zp, _zn / 1e6),
-                  transform=ax_c.get_yaxis_transform(), fontsize=6.4,
-                  color=_hz_col, va="center", ha="right", fontweight="bold", zorder=6,
-                  bbox=dict(boxstyle="round,pad=0.2", fc="#0d1117",
-                            ec=_hz_col, lw=0.8, alpha=0.9))
     # Net magnet pull — identical hunt_score weighting the engines use.
     _pull_up = sum(z.get("hunt_score", 0) for z in _hz_up)
     _pull_dn = sum(z.get("hunt_score", 0) for z in _hz_dn)
@@ -7746,6 +7741,13 @@ def fig_intraday_15m(a: dict) -> "plt.Figure | None":
     ax_vp.text(0.05, cur, "\${:,.0f}".format(cur),
                color=_cur_col, fontsize=7, va="center", fontweight="bold", zorder=5,
                bbox=dict(boxstyle="round,pad=0.18", fc="#0d1117", ec=_cur_col, lw=0.9, alpha=0.95))
+    # Hunt-target tag lives here in the gutter (not over the candles). The
+    # dashed line on the price panel marks the level; this names it.
+    if _hz_top is not None:
+        ax_vp.text(0.05, _zp, "{} \${:,.0f}·\${:.0f}M".format(_zarrow, _zp, _zn / 1e6),
+                   color=_hz_col, fontsize=6.2, va="center", fontweight="bold", zorder=5,
+                   bbox=dict(boxstyle="round,pad=0.16", fc="#0d1117",
+                             ec=_hz_col, lw=0.8, alpha=0.95))
     ax_vp.set_xlim(0, 1.1); ax_vp.set_xticks([])
     ax_vp.tick_params(labelleft=False, bottom=False, left=False, right=False)
     ax_vp.set_ylim(_ylo_f, _yhi_f)
