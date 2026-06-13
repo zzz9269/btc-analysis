@@ -7723,7 +7723,10 @@ def fig_intraday_15m(a: dict) -> "plt.Figure | None":
                       key=lambda z: z.get("hunt_score", 0), reverse=True)[:3]
     _hz_dn   = sorted([z for z in _hz_near if float(z["price"]) < cur],
                       key=lambda z: z.get("hunt_score", 0), reverse=True)[:3]
-    _hz_col  = "#bc8cff"
+    # Magenta — deliberately unique on this chart. The old violet (#bc8cff)
+    # was nearly identical to the VWAP line (#d2a8ff); nothing else here is
+    # pink/magenta, so the hunt target now reads unambiguously.
+    _hz_col  = "#ff4dd2"
     # Single highest-probability target only: top hunt_score among nearby
     # zones (hunt_score = fuel/dist² × cascade-chain — the engine's own
     # "most likely to get swept next" ranking). The rest stay off the chart;
