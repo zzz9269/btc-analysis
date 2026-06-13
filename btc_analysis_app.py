@@ -565,6 +565,63 @@ def _episode_stats(rows: list, gap_hours: float = 6.0) -> dict:
     }
 
 
+def _wilson_ci(wins: int, n: int, z: float = 1.96) -> "tuple[int, int] | None":
+    """95% Wilson score interval for a win proportion, returned as integer
+    percentages. Wilson (not normal approx) because it stays valid at the tiny
+    n and extreme p we actually have — it's what turns '4/8' into the honest
+    '17–83%, inconclusive' instead of a number that looks like a grade."""
+    if not n:
+        return None
+    p     = wins / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half   = (z * (((p * (1 - p) + z * z / (4 * n)) / n) ** 0.5)) / denom
+    return (max(0, round((centre - half) * 100)),
+            min(100, round((centre + half) * 100)))
+
+
+def _baseline_episode_stats(rows: list, gap_hours: float = 6.0) -> dict:
+    """Same episode logic as _episode_stats, but the direction comes from the
+    2-signal baseline (score_baseline: EMA Structure + OI Funding) and each row
+    is graded against its own pct_move. This answers the only question that
+    matters — does the ~30-signal engine beat a dumb baseline on the same
+    windows? Only rows with a populated score_baseline AND pct_move count, so
+    it stays empty until baseline logging (started ~2026-06-11) has aged 72h."""
+    res = []
+    for r in rows:
+        sb = r.get("score_baseline")
+        pm = r.get("pct_move")
+        if sb in (None, "") or pm in (None, ""):
+            continue
+        try:
+            sb = float(sb); pm = float(pm); ts = _dt.fromisoformat(r["ts"])
+        except Exception:
+            continue
+        d = "LONG" if sb >= 25 else ("SHORT" if sb <= -25 else None)
+        if d is None:
+            continue
+        win = (d == "LONG" and pm > 0) or (d == "SHORT" and pm < 0)
+        res.append((ts, d, win))
+    res.sort(key=lambda t: t[0])
+    episodes, cur = [], None
+    for ts, d, win in res:
+        if cur and d == cur["dir"] and (ts - cur["end"]).total_seconds() < gap_hours * 3600:
+            cur["end"] = ts; cur["n"] += 1; cur["wins"] += int(win)
+        else:
+            if cur:
+                episodes.append(cur)
+            cur = {"dir": d, "start": ts, "end": ts, "n": 1, "wins": int(win)}
+    if cur:
+        episodes.append(cur)
+    ep_wins = sum(1 for e in episodes if e["wins"] / e["n"] > 0.5)
+    return {
+        "n_episodes": len(episodes),
+        "ep_wins":    ep_wins,
+        "ep_winrate": round(ep_wins / len(episodes) * 100) if episodes else None,
+        "tick_n":     len(res),
+    }
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def _backtest_tech_signals(days: int = 55) -> dict:
     """
@@ -10436,10 +10493,40 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
                    else "#f85149")
     _ep_display = (f"{_ep['ep_wins']}/{_ep['n_episodes']}"
                    if _ep["n_episodes"] else "building...")
+    # 95% Wilson CI — turns "4/8" into an honest range so a coin-flip sample
+    # doesn't read as a grade. Wide interval = not enough evidence yet.
+    _ci = _wilson_ci(_ep["ep_wins"], _ep["n_episodes"]) if _ep["n_episodes"] else None
     _ep_note    = (f"{_ep['n_long_eps']} long · {_ep['n_short_eps']} short"
                    if _ep["n_episodes"] else "independent signal runs")
+    _ci_txt     = (f"95% CI {_ci[0]}–{_ci[1]}%"
+                   + ("  ·  spans 50% → inconclusive" if _ci and _ci[0] <= 50 <= _ci[1] else "")
+                   if _ci else "")
     _strong_txt = (f" · strong wins (≥3%): {_ep['strong_rate']}%"
                    if _ep["strong_rate"] is not None else "")
+
+    # Engine vs 2-signal baseline (EMA+OI) on the same windows — the only test
+    # that says whether the ~30 signals add value. Empty until baseline rows
+    # (logged from ~2026-06-11) age past 72h.
+    _bl = _baseline_episode_stats(_bt_rows)
+    if _bl["n_episodes"]:
+        _delta   = (_ep_wr or 0) - (_bl["ep_winrate"] or 0)
+        _bl_col  = "#3fb950" if _delta > 0 else ("#f85149" if _delta < 0 else "#8b949e")
+        _bl_html = (f'<div style="text-align:center;">'
+                    f'<div style="font-size:11px; color:#8b949e; margin-bottom:4px;">'
+                    f'vs BASELINE</div>'
+                    f'<div style="font-size:30px; font-weight:800; color:{_bl_col}; '
+                    f'line-height:1.6;">{_delta:+d}pp</div>'
+                    f'<div style="font-size:10px; color:#484f58; margin-top:6px;">'
+                    f'engine {_ep_wr}% vs EMA+OI {_bl["ep_winrate"]}% '
+                    f'({_bl["n_episodes"]} eps)</div></div>')
+    else:
+        _bl_html = ('<div style="text-align:center;">'
+                    '<div style="font-size:11px; color:#8b949e; margin-bottom:4px;">'
+                    'vs BASELINE</div>'
+                    '<div style="font-size:20px; font-weight:700; color:#484f58; '
+                    'line-height:2.4;">pending</div>'
+                    '<div style="font-size:10px; color:#484f58; margin-top:6px;">'
+                    'EMA+OI baseline matures ~72h after 11 Jun</div></div>')
 
     st.markdown(f"""
 <div style="background:#161b22; border:1px solid #30363d; border-radius:10px;
@@ -10448,7 +10535,9 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
     <div style="font-size:11px; color:#8b949e; margin-bottom:4px;">EPISODE WINRATE</div>
     <div style="font-size:48px; font-weight:800; color:{_ep_col}; line-height:1;">{_ep_display}</div>
     <div style="font-size:10px; color:#484f58; margin-top:6px;">{_ep_note}</div>
+    <div style="font-size:9.5px; color:#6e7681; margin-top:2px;">{_ci_txt}</div>
   </div>
+  {_bl_html}
   <div style="text-align:center;">
     <div style="font-size:11px; color:#8b949e; margin-bottom:4px;">TICK WINRATE</div>
     <div style="font-size:30px; font-weight:800; color:{_live_col}; line-height:1.6;">{_live_display}</div>
