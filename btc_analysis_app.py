@@ -29,6 +29,12 @@ try:
     from core import price_history as _price_hist
 except Exception:
     _price_hist = None
+# Industry-grade backtest metrics (expectancy, bootstrap CI, drift null,
+# Brier skill). Pure numpy/scipy; safe to import.
+try:
+    from core import backtest_metrics as _bt_metrics
+except Exception:
+    _bt_metrics = None
 
 warnings.filterwarnings("ignore")
 
@@ -10582,56 +10588,107 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
     _strong_txt = (f" · strong wins (≥3%): {_ep['strong_rate']}%"
                    if _ep["strong_rate"] is not None else "")
 
-    # Engine vs 2-signal baseline (EMA+OI) on the same windows — the only test
-    # that says whether the ~30 signals add value. Empty until baseline rows
-    # (logged from ~2026-06-11) age past 72h.
-    _bl = _baseline_episode_stats(_bt_rows)
-    if _bl["n_episodes"]:
-        _delta   = (_ep_wr or 0) - (_bl["ep_winrate"] or 0)
-        _bl_col  = "#3fb950" if _delta > 0 else ("#f85149" if _delta < 0 else "#8b949e")
-        _bl_html = (f'<div style="text-align:center;">'
-                    f'<div style="font-size:11px; color:#8b949e; margin-bottom:4px;">'
-                    f'vs BASELINE</div>'
-                    f'<div style="font-size:30px; font-weight:800; color:{_bl_col}; '
-                    f'line-height:1.6;">{_delta:+d}pp</div>'
-                    f'<div style="font-size:10px; color:#484f58; margin-top:6px;">'
-                    f'engine {_ep_wr}% vs EMA+OI {_bl["ep_winrate"]}% '
-                    f'({_bl["n_episodes"]} eps)</div></div>')
-    else:
-        _bl_html = ('<div style="text-align:center;">'
-                    '<div style="font-size:11px; color:#8b949e; margin-bottom:4px;">'
-                    'vs BASELINE</div>'
-                    '<div style="font-size:20px; font-weight:700; color:#484f58; '
-                    'line-height:2.4;">pending</div>'
-                    '<div style="font-size:10px; color:#484f58; margin-top:6px;">'
-                    'EMA+OI baseline matures ~72h after 11 Jun</div></div>')
+    # ── Industry-grade scorecard ────────────────────────────────────────
+    # Leads with the metrics that actually measure skill (expectancy + excess
+    # over the drift baseline, with episode-level bootstrap CIs), not raw
+    # winrate. Winrate is demoted to a secondary line because in a trending
+    # market it just echoes drift. See core/backtest_metrics.py.
+    _M     = _bt_metrics.evaluate(_bt_rows) if _bt_metrics else {"n_signals": 0}
+    _bcmp  = _bt_metrics.baseline_comparison(_bt_rows) if _bt_metrics else {"ready": False, "n_episodes": 0}
+    _fdiag = _forecast_diagnostic(_sig_rows)   # honest full-history forward IC
 
-    st.markdown(f"""
-<div style="background:#161b22; border:1px solid #30363d; border-radius:10px;
-     padding:16px 22px; display:flex; gap:32px; align-items:center;">
-  <div style="text-align:center;">
-    <div style="font-size:11px; color:#8b949e; margin-bottom:4px;">EPISODE WINRATE</div>
-    <div style="font-size:48px; font-weight:800; color:{_ep_col}; line-height:1;">{_ep_display}</div>
-    <div style="font-size:10px; color:#484f58; margin-top:6px;">{_ep_note}</div>
-    <div style="font-size:9.5px; color:#6e7681; margin-top:2px;">{_ci_txt}</div>
-  </div>
-  {_bl_html}
-  <div style="text-align:center;">
-    <div style="font-size:11px; color:#8b949e; margin-bottom:4px;">TICK WINRATE</div>
-    <div style="font-size:30px; font-weight:800; color:{_live_col}; line-height:1.6;">{_live_display}</div>
-    <div style="font-size:10px; color:#484f58; margin-top:6px;">{_live_note}{_strong_txt}</div>
-  </div>
-  <div style="font-size:11px; color:#6e7681; max-width:330px; line-height:1.6;">
-    <b style="color:#8b949e;">Episodes are the honest number.</b>
-    Ticks log every 5 min; consecutive ticks share almost the same 72h outcome
-    window, so the tick winrate mostly measures how long winning streaks lasted.
-    An <b>episode</b> = one continuous same-direction signal run (&lt;6h gaps);
-    it counts as a win when most of its ticks resolved correctly.
-    Rows are graded against the BTC price at <b>exactly entry+72h</b>.<br>
-    <span style="color:#484f58; font-size:10px;">Treat the engine as unproven
-    until episodes span both LONG and SHORT across different regimes.</span>
-  </div>
-</div>""", unsafe_allow_html=True)
+    def _fmt_ci(ci):
+        return (f"95% CI {ci[0]:+.1f}…{ci[1]:+.1f}%" if ci and ci[0] is not None else "CI: need ≥4 eps")
+
+    def _mcell(label, big, bigcol, sub):
+        return (f'<div style="text-align:center; min-width:120px;">'
+                f'<div style="font-size:10.5px; color:#8b949e; margin-bottom:3px;">{label}</div>'
+                f'<div style="font-size:26px; font-weight:800; color:{bigcol}; line-height:1.1;">{big}</div>'
+                f'<div style="font-size:9px; color:#6e7681; margin-top:4px; line-height:1.35;">{sub}</div></div>')
+
+    if _M.get("n_signals", 0) == 0:
+        st.markdown('<div style="background:#161b22; border:1px solid #30363d; '
+                    'border-radius:10px; padding:16px 22px; color:#8b949e; font-size:13px;">'
+                    'Scorecard builds once signals resolve (≥72h after logging).</div>',
+                    unsafe_allow_html=True)
+    else:
+        _vcode = _M.get("verdict_code", "inconclusive")
+        _vcol  = {"edge": "#3fb950", "negative": "#f85149",
+                  "no_edge": "#d29922", "inconclusive": "#d29922",
+                  "unmeasurable": "#d29922"}.get(_vcode, "#8b949e")
+
+        # 1) Excess over always-short — the money metric
+        if _M["n_long"] == 0 or _M["n_short"] == 0:
+            _ex_big, _ex_col = "n/a", "#8b949e"
+            _ex_sub = f"all {'SHORT' if _M['n_long']==0 else 'LONG'} — == constant rule"
+        else:
+            _ex = _M["excess_vs_short"]; _eci = _M["excess_ci"]
+            _ex_col = ("#3fb950" if (_eci[0] or 0) > 0 else
+                       "#f85149" if (_eci[1] or 0) < 0 else "#d29922")
+            _ex_big = f"{_ex:+.1f}%"; _ex_sub = _fmt_ci(_eci)
+
+        # 2) Expectancy
+        _exp_ci = _M["expectancy_ci"]
+        _exp_col = ("#3fb950" if (_exp_ci[0] or 0) > 0 else
+                    "#f85149" if (_exp_ci[1] or 0) < 0 else "#d29922")
+        _exp_sub = _fmt_ci(_exp_ci) + (" · spans 0" if _exp_ci[0] is not None and _exp_ci[0] <= 0 <= _exp_ci[1] else "")
+
+        # 3) Edge vs drift baseline
+        _edge_pp = _M["edge_vs_drift_pp"]
+        _edge_col = "#3fb950" if _edge_pp > 3 else ("#f85149" if _edge_pp < -3 else "#d29922")
+        _edge_sub = f"engine {_M['tick_winrate']:.0f}% vs always-{'short' if _M['n_short']>=_M['n_long'] else 'long'} {_M['drift_null_wr']:.0f}%"
+
+        # 4) Forward IC (honest, full-history)
+        if _fdiag and _fdiag.get("score_vs_fwd72") is not None:
+            _icv = _fdiag["score_vs_fwd72"]
+            _ic_col = "#3fb950" if _icv >= 0.15 else ("#f85149" if _icv < 0.03 else "#d29922")
+            _ic_big = f"{_icv:+.2f}"; _ic_sub = f"score→+72h, n={_fdiag['n']}"
+        else:
+            _ic_big, _ic_col, _ic_sub = "—", "#8b949e", "accumulating"
+
+        # 5) Brier skill
+        if _M.get("brier_skill") is not None:
+            _bs = _M["brier_skill"]
+            _bs_col = "#3fb950" if _bs > 0.02 else ("#f85149" if _bs < -0.02 else "#d29922")
+            _bs_big = f"{_bs:+.2f}"; _bs_sub = f"vs base rate, n={_M['n_bull_prob']}"
+        else:
+            _bs_big, _bs_col, _bs_sub = "—", "#8b949e", f"need ≥{_bt_metrics.MIN_N_BRIER} w/ prob"
+
+        # 6) vs EMA+OI baseline (gated)
+        if _bcmp.get("ready"):
+            _bd = (_M["episode_winrate"] or 0) - (_bcmp["ep_winrate"] or 0)
+            _bd_col = "#3fb950" if _bd > 0 else ("#f85149" if _bd < 0 else "#d29922")
+            _bd_big = f"{_bd:+.0f}pp"; _bd_sub = f"vs EMA+OI ({_bcmp['n_episodes']} eps)"
+        else:
+            _bd_big, _bd_col = "pending", "#8b949e"
+            _bd_sub = f"{_bcmp.get('n_episodes',0)}/{_bt_metrics.MIN_EPISODES_BASE} baseline eps"
+
+        _cards = "".join([
+            _mcell("EXCESS vs ALWAYS-SHORT", _ex_big, _ex_col, _ex_sub),
+            _mcell("EXPECTANCY / signal", f"{_M['expectancy']:+.1f}%", _exp_col, _exp_sub),
+            _mcell("EDGE vs DRIFT", f"{_edge_pp:+.0f}pp", _edge_col, _edge_sub),
+            _mcell("FORWARD IC", _ic_big, _ic_col, _ic_sub),
+            _mcell("BRIER SKILL", _bs_big, _bs_col, _bs_sub),
+            _mcell("vs EMA+OI", _bd_big, _bd_col, _bd_sub),
+        ])
+
+        st.markdown(
+            f'<div style="background:#161b22; border:1px solid #30363d; border-radius:10px; '
+            f'padding:14px 18px;">'
+            f'<div style="background:{_vcol}18; border-left:3px solid {_vcol}; '
+            f'border-radius:6px; padding:7px 11px; margin-bottom:12px; font-size:11.5px; '
+            f'color:{_vcol}; font-weight:600;">VERDICT — {_M["verdict"]}</div>'
+            f'<div style="display:flex; gap:18px; flex-wrap:wrap; justify-content:space-between;">'
+            f'{_cards}</div>'
+            f'<div style="font-size:9.5px; color:#484f58; margin-top:12px; line-height:1.5;">'
+            f'Episode winrate {_M["n_ep_wins"]}/{_M["n_episodes"]} '
+            f'({_M["episode_winrate"]:.0f}%, Wilson {("–".join(map(str,_wilson_ci(_M["n_ep_wins"],_M["n_episodes"]))) + "%") if _wilson_ci(_M["n_ep_wins"],_M["n_episodes"]) else "n/a"}) · '
+            f'tick {_M["tick_winrate"]:.0f}% ({_M["n_signals"]} resolved) · '
+            f'avg win {_M["avg_win"]:+.1f}% vs avg loss {_M["avg_loss"]:+.1f}%. '
+            f'<b>Winrate is demoted on purpose</b> — in a trending market it just '
+            f'echoes drift; expectancy &amp; excess-over-baseline (with episode '
+            f'bootstrap CIs) are the honest skill measures.</div></div>',
+            unsafe_allow_html=True)
 
     # ── Score history chart ───────────────────────────────────────
     # Window is 7 days, not 72h: a row can only be graded 72h after it's
