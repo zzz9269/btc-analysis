@@ -7054,13 +7054,21 @@ def run_analysis(ticker: str = "BTC-USD") -> dict:
 
     short_df      = _fetch_short_term_ohlcv()
     df_4h         = _fetch_4h_ohlcv()
-    # ⑯ Track 4h fetch freshness: compare session-state timestamp to now.
-    # If score refreshes faster than the 15-min cache, EMA Structure may be stale.
-    _4h_prev_len = st.session_state.get("_4h_cached_len", -1)
-    _4h_cur_len  = len(df_4h) if df_4h is not None else 0
-    if _4h_cur_len != _4h_prev_len:
-        st.session_state["_4h_fetch_ts"]   = _dt.now(_tz.utc).timestamp()
-        st.session_state["_4h_cached_len"] = _4h_cur_len
+    # ⑯ Track 4h data freshness from the NEWEST candle's open time (robust).
+    # The newest 4h bar is the currently-forming one, so a healthy feed has it
+    # opened within the last 4h (0–240 min). A much larger age means the feed
+    # (Binance → yfinance fallback) is returning stale bars.
+    # (The old heuristic compared candle COUNT across renders; count is fixed at
+    # the fetch limit, so it never reset and the "age" just counted up from
+    # session start — which is why it showed nonsense like 1807 min.)
+    try:
+        if df_4h is not None and len(df_4h):
+            _last4h = pd.Timestamp(df_4h.index[-1])
+            _last4h = (_last4h.tz_localize("UTC") if _last4h.tzinfo is None
+                       else _last4h.tz_convert("UTC"))
+            st.session_state["_4h_last_bar_ts"] = _last4h.timestamp()
+    except Exception:
+        pass
     prediction    = predict_direction(df, btc_liq)
     bias_72h      = compute_72h_bias(df, btc_liq, short_df=short_df, poly=poly_sentiment,
                                      oi_data=oi_funding, df_4h=df_4h, crypto_sig=crypto_sig,
@@ -9843,12 +9851,15 @@ with _c24_spacer:
 
 st.divider()
 
-# ⑯ 4h data staleness indicator — EMA Structure is 18% of score but cached 15 min
-_4h_fetch_ts   = st.session_state.get("_4h_fetch_ts", 0)
-_4h_age_min    = int((_dt.now(_tz.utc).timestamp() - _4h_fetch_ts) / 60) if _4h_fetch_ts else 0
-_4h_stale      = _4h_age_min >= 10   # flag if 4h data is ≥10 min old
-_4h_stale_note = (f" · ⚠ 4h data {_4h_age_min}min old — EMA Structure may lag"
-                  if _4h_stale else f" · 4h data {_4h_age_min}min ago")
+# ⑯ 4h data staleness — measured from the NEWEST 4h candle's open time.
+# Normal range is 0–240 min (the bar currently forming). Only flag as stale
+# when we're missing the current bar entirely (>300 min = feed actually broke),
+# which is when EMA Structure (the highest-weighted signal) would genuinely lag.
+_4h_last_ts    = st.session_state.get("_4h_last_bar_ts", 0)
+_4h_age_min    = int((_dt.now(_tz.utc).timestamp() - _4h_last_ts) / 60) if _4h_last_ts else 0
+_4h_stale      = _4h_age_min >= 300
+_4h_stale_note = (f" · ⚠ 4h feed stale ({_4h_age_min}min) — EMA Structure may lag"
+                  if _4h_stale else f" · 4h live (bar {_4h_age_min}/240min)")
 
 # Signal breakdown inside expander — 2 rows of 6 (dynamic)
 with st.expander(f"📊 72h Bias — Signal Breakdown ({len(_b12_sigs)} signals){_4h_stale_note}", expanded=False):
