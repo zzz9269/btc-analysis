@@ -234,6 +234,16 @@ price    = float(result.get("price") or 0)
 bias_72h = result.get("bias_72h") or {}
 score    = float(bias_72h.get("score") or 0)
 label    = str(bias_72h.get("label") or "N/A")
+# Anti-teleport on the charted series: clamp this tick's change vs the last
+# durable Supabase row (shared limiter so cron + local app stay identical).
+# This is the authoritative server-side writer, so it's where the slew limit
+# matters most. Best-effort — returns score unchanged if the read fails.
+_slew = getattr(mod, "_slew_limit_score", None)
+if _slew is not None:
+    _raw_score = score
+    score = float(_slew(score))
+    if abs(score - _raw_score) >= 0.05:
+        print(f"  · slew-limited score {_raw_score:+.1f} → {score:+.1f}")
 direction = "LONG" if score >= 25 else ("SHORT" if score <= -25 else "HOLD")
 
 print(f"  price=${price:,.2f}  score={score:+.1f}  label={label}  direction={direction}")

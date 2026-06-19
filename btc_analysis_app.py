@@ -107,6 +107,12 @@ _LOG_FIELDS    = ["ts", "score", "label", "direction",
                   "score_baseline"]
 _LOG_INTERVAL  = 300    # seconds between log writes (5 min)
 _OUTCOME_HOURS = 72.0   # hours to wait before resolving outcome (matches "72h bias" name)
+# Anti-teleport slew limit for the logged/charted 72h score. A 72h forecast must
+# not jump tens of points between 5-min ticks; the score may move at most this
+# many points per log interval (scaled by elapsed time so a cron gap can still
+# catch up). Source-level fixes (continuous EMA Structure + regime blend) mean
+# this rarely binds — it's a backstop so a single artifact can't produce a cliff.
+_SCORE_SLEW_PER_TICK = 12.0   # points per _LOG_INTERVAL
 
 # Backtest cutoff: rows logged BEFORE this UTC timestamp were produced by an
 # older scoring engine (e.g. the double-EMA-smoothing bug fixed in commit
@@ -115,7 +121,30 @@ _OUTCOME_HOURS = 72.0   # hours to wait before resolving outcome (matches "72h b
 # reflect ONLY the current engine.
 # Bump this whenever you change the scoring engine in a way that breaks
 # comparability with prior logs.
-_BACKTEST_CUTOFF_UTC_ISO = "2026-05-30T16:24:19+00:00"  # = 2026-05-31 00:24 SGT
+_BACKTEST_CUTOFF_UTC_ISO = "2026-06-19T16:00:00+00:00"  # = 2026-06-20 00:00 SGT
+# ^ bumped for the anti-churn engine change (2026-06-19): EMA Structure made
+#   continuous (tanh of EMA gap, no sign-flip cliff), regime weights blended
+#   continuously across ADX instead of hard-switching at 18/28, and a durable
+#   score slew-limiter added in _log_bias_signal. These change tick-to-tick
+#   score dynamics, so pre-cutoff rows aren't comparable for winrate/IC.
+
+
+def _post_backtest_cutoff(_r) -> bool:
+    """True if a signal row is from the current scoring engine (post-cutoff).
+    Shared by the accuracy panel AND the Claude plugin's track-record summary
+    so both measure the engine on exactly the same rows."""
+    try:
+        _c = _dt.fromisoformat(_BACKTEST_CUTOFF_UTC_ISO)
+    except Exception:
+        return True
+    try:
+        return _dt.fromisoformat(_r.get("ts", "")) >= _c
+    except Exception:
+        return False
+
+
+def _filter_bt_rows(rows: list) -> list:
+    return [r for r in (rows or []) if _post_backtest_cutoff(r)]
 
 
 # ════════════════════════════════════════════════════════════════
@@ -169,6 +198,10 @@ def _log_bias_signal(score: float, label: str, price: float,
 
     All writes are best-effort. Missing tables / failures don't crash the app.
     """
+    # Anti-teleport: clamp the logged value's per-tick change (durable, shared
+    # with the headless cron). See _slew_limit_score. direction/label below are
+    # derived from the limited score so the logged row is self-consistent.
+    score = _slew_limit_score(score)
     direction = "LONG" if score >= 25 else ("SHORT" if score <= -25 else "HOLD")
     ts = _dt.now(_tz.utc).isoformat()
 
@@ -351,6 +384,59 @@ def _supa_last_signal_age_min() -> "float | None":
         return (_dt.now(_tz.utc) - ts).total_seconds() / 60.0
     except Exception:
         return None
+
+
+def _supa_last_score() -> "tuple | None":
+    """(score, age_minutes) of the most recent signal_log row, or None.
+
+    Lightweight 1-row fetch used by the score slew-limiter in _log_bias_signal.
+    Reads DURABLE storage (Supabase) rather than st.session_state, so the
+    headless cron and the local app anchor to the exact same previous value and
+    the logged/charted series stays identical across both environments."""
+    if not _supa_available():
+        return None
+    try:
+        raw = _supa_request(
+            "GET", "/rest/v1/signal_log?select=ts,score&order=ts.desc&limit=1")
+        if not isinstance(raw, list) or not raw:
+            return None
+        r = raw[0]
+        if r.get("score") is None:
+            return None
+        ts = _dt.fromisoformat(str(r.get("ts", "")).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=_tz.utc)
+        age_min = (_dt.now(_tz.utc) - ts).total_seconds() / 60.0
+        return float(r["score"]), age_min
+    except Exception:
+        return None
+
+
+def _slew_limit_score(score: float) -> float:
+    """Anti-teleport limiter for the logged/charted 72h score.
+
+    A 72h forecast must not jump tens of points between 5-min ticks. Clamp the
+    fresh score's change vs the last DURABLE reading (Supabase) so the logged
+    series ramps over a few ticks instead of cliff-stepping. The cap scales with
+    elapsed time, so a genuine gap (cron outage) still lets the score catch up;
+    a cold start or a stale/very-old anchor (>40 min) passes through unclamped.
+
+    Shared by BOTH writers — the local app (_log_bias_signal) and the headless
+    cron (log_signal.py) — so the single Supabase series they share stays smooth
+    regardless of which process wrote a given tick. Best-effort: any failure
+    returns the score unchanged. NOTE: applied only to the *logged* value; the
+    live in-memory bias_72h['score'] stays raw so the gauge/AI remain responsive."""
+    try:
+        prev = _supa_last_score()
+        if prev is not None:
+            pscore, age_min = prev
+            if 0.0 < age_min <= 40.0:
+                ticks    = max(1.0, age_min / (_LOG_INTERVAL / 60.0))
+                max_step = _SCORE_SLEW_PER_TICK * ticks
+                return float(np.clip(score, pscore - max_step, pscore + max_step))
+    except Exception:
+        pass
+    return float(score)
 
 
 def _resolve_signal_outcomes(current_price: float) -> list:
@@ -1251,6 +1337,21 @@ _CLAUDE_SYSTEM_PROMPT = """You are an expert Bitcoin trading analyst embedded in
 ## ENGINE ARCHITECTURE
 Two parallel engines: **72h bias** (24–72h horizon, score ±100, 16 signals) and **24h bias** (intraday, score ±100, 13 signals). Both use ADX-based regime switching (TREND / RANGE / TRANSITION) which dynamically shifts signal weights. The actual current weights (post-regime, post-decay) are shown next to each signal in the data — trust those numbers, not generic priors.
 
+## CALIBRATE AGAINST THE MEASURED TRACK RECORD (read this before trusting the score)
+The payload contains an `ENGINE TRACK RECORD` block with THIS engine's measured skill on its own resolved signals. It overrides the architecture's optimism — the weights above describe *intent*, the track record describes *realised performance*. Apply it as a hard governor on confidence and size:
+- **Forward IC is the master number.** It is Spearman corr(score → realised +72h return). The 72h score is NOT guaranteed to be forward-looking — it is measured each run.
+  - Forward IC ≥ 0.15 → the score has genuine predictive edge; you may treat its magnitude as forecast strength and let HIGH confidence stand when other rules allow.
+  - Forward IC 0.05–0.15 → marginal; cap confidence at MEDIUM and prefer structure (liq clusters, Polymarket, invalidation) over score magnitude.
+  - Forward IC < 0.05 (or "coincident momentum mirror") → the score mostly **echoes the last 24h of price** and adds little over raw momentum. Do NOT read a high |score| as a strong forecast. Cap confidence at MEDIUM (LOW if it also fails to beat the momentum/baseline lines), and say so plainly in the defensibility step. A big bullish score after a big up-move is the engine describing the past, not predicting the future.
+- **Expectancy / excess-vs-drift with CIs that span 0 → no demonstrated edge.** Treat the direction as a coin-flip-plus-structure read; lean on R:R and invalidation, not conviction.
+- **All-one-direction track record (n_long=0 or n_short=0)** → the engine equals a constant always-long/short rule; its winrate is drift, not skill. Discount the headline winrate accordingly.
+- **Brier skill ≤ 0** → bull_prob is miscalibrated; don't quote it as a probability in the win-rate step.
+- **Engine ≤ baseline (EMA+OI)** → the extra signals aren't adding episode-level edge; don't over-credit the Tier-3/4 machinery.
+When the track record and the live score disagree about how confident to be, the track record wins. State the governing number in the defensibility line (e.g. "forward IC +0.04 → score is coincident, capping at MEDIUM").
+
+## META-MODEL SECOND OPINION
+The payload may include a `META-MODEL SECOND OPINION` P(up). It is an independent LogReg cross-check, NOT part of the engine score and it never overrides it. Use it only as a tie-breaker / disagreement flag: if it diverges sharply from the 72h direction, note the conflict and shade confidence down one notch; if it confirms, you may note the agreement but do not inflate size on it alone.
+
 ## 72h SIGNAL HIERARCHY (BASE weights — TREND/RANGE shift them, then horizon-decay applies)
 
 **Tier 1 — Structural anchors:**
@@ -1387,6 +1488,70 @@ Reduce one band if `liq_map_source` = orderbook_proxy AND liq-cluster signals ar
 Under 500 words total."""
 
 
+def _format_track_record_for_claude(M: "dict | None",
+                                    bcmp: "dict | None",
+                                    fdiag: "dict | None") -> str:
+    """Compact, honest summary of the engine's MEASURED skill for the plugin to
+    calibrate against. Leads with forward IC (the forecast-vs-coincident
+    finding) because that decides how much the headline 72h score is worth as a
+    *prediction* versus a coincident momentum echo. All values are already
+    None-gated by the metrics layer; we just narrate them."""
+    M = M or {}; bcmp = bcmp or {}; fdiag = fdiag or {}
+    if M.get("n_signals", 0) == 0:
+        return ("(No resolved track record yet — the scorecard builds once "
+                "signals age ≥72h. Treat the engine as UNVALIDATED: cap "
+                "confidence at MEDIUM and lean on liquidation structure + "
+                "Polymarket + invalidation, not the raw score magnitude.)")
+    L = []
+    # 1) Forward IC — the decisive forecast-vs-coincident numbers
+    ic   = fdiag.get("score_vs_fwd72")
+    coin = fdiag.get("score_vs_trail24")
+    mom  = fdiag.get("trail24_vs_fwd72")
+    if ic is not None:
+        if   ic >= 0.15: _v = "genuine forward edge"
+        elif ic < 0.05:  _v = "WEAK/NO forward edge — the score is largely a COINCIDENT momentum mirror, not a predictor"
+        else:            _v = "marginal forward edge"
+        L.append(f"Forward IC (score → +72h return, Spearman, n={fdiag.get('n')}): {ic:+.2f} — {_v}.")
+        if coin is not None or mom is not None:
+            L.append(f"  · score↔trailing-24h momentum: {coin:+.2f} (high ⇒ score mostly echoes recent price); "
+                     f"raw-momentum's own forward IC: {mom:+.2f} (beat THIS to add value).")
+        _e, _l = fdiag.get("early_fwd"), fdiag.get("late_fwd")
+        if _e is not None and _l is not None:
+            L.append(f"  · regime-split forward IC: early {_e:+.2f} / late {_l:+.2f} "
+                     f"(sign flip ⇒ the 'edge' is regime-confounded, not real).")
+    else:
+        L.append("Forward IC: still accumulating (<250 forward points) — the score's predictive value is UNPROVEN; do not treat magnitude as forecast strength.")
+    # 2) Expectancy + excess over the drift baseline (the money metrics)
+    _exp = M.get("expectancy"); _eci = M.get("expectancy_ci") or (None, None)
+    if _exp is not None:
+        _span = " — CI spans 0, not distinguishable from zero" if (_eci[0] is not None and _eci[0] <= 0 <= _eci[1]) else ""
+        L.append(f"Expectancy: {_exp:+.2f}% mean signed return per episode (95% CI {_eci[0]}…{_eci[1]}){_span}.")
+    if M.get("n_long", 0) and M.get("n_short", 0):
+        _x = M.get("excess_vs_short"); _xci = M.get("excess_ci") or (None, None)
+        L.append(f"Excess vs always-short drift baseline: {_x:+.1f}% (95% CI {_xci[0]}…{_xci[1]}).")
+    else:
+        _const = "SHORT" if M.get("n_long", 0) == 0 else "LONG"
+        L.append(f"All resolved episodes were {_const} — the engine is mathematically a constant "
+                 f"always-{_const.lower()} rule so far; winrate measures drift, NOT skill.")
+    # 3) Winrate vs the correct (drift) null
+    _drift_side = "short" if M.get("n_short", 0) >= M.get("n_long", 0) else "long"
+    L.append(f"Episode winrate {M.get('episode_winrate')}% ({M.get('n_ep_wins')}/{M.get('n_episodes')} eps); "
+             f"tick winrate {M.get('tick_winrate')}% vs always-{_drift_side} drift null {M.get('drift_null_wr')}% "
+             f"→ edge {M.get('edge_vs_drift_pp')}pp over drift.")
+    # 4) Probabilistic calibration
+    if M.get("brier_skill") is not None:
+        L.append(f"Brier skill (bull_prob vs base rate, n={M.get('n_bull_prob')}): {M['brier_skill']:+.2f} "
+                 f"(>0 ⇒ probabilities beat the base rate; ≤0 ⇒ bull_prob is miscalibrated).")
+    # 5) Vs the 2-signal baseline
+    if bcmp.get("ready"):
+        _bd = (M.get("episode_winrate") or 0) - (bcmp.get("ep_winrate") or 0)
+        L.append(f"Engine vs 2-signal EMA+OI baseline: {_bd:+.0f}pp over {bcmp.get('n_episodes')} eps "
+                 f"(≤0 ⇒ the 28 extra signals add no episode-level edge).")
+    if M.get("verdict"):
+        L.append(f"Scorecard verdict: {M['verdict']}")
+    return "\n".join(L)
+
+
 def _call_claude_interpretation(
     price: float,
     bias_score: float,
@@ -1433,6 +1598,10 @@ def _call_claude_interpretation(
     liq_ask_clusters: "list | None" = None,
     hunt_zones: "list | None" = None,
     cascade_direction: str = "N/A",
+    # Measured engine skill (forward IC, expectancy, drift/baseline, Brier)
+    track_record: str = "N/A",
+    # Independent meta-model second opinion: P(up) in [0,1], or None
+    meta_pup: "float | None" = None,
 ) -> str:
     """Call Claude with full system prompt to interpret all dashboard signals."""
     weights = signal_weights or {}
@@ -1520,6 +1689,13 @@ def _call_claude_interpretation(
             pass
     _hz_block = "\n".join(_hz_lines) if _hz_lines else "  (no active hunt zones)"
 
+    if isinstance(meta_pup, (int, float)):
+        _meta_line = (f"{meta_pup*100:.0f}% P(up) — independent LogReg second opinion trained on "
+                      f"resolved engine outputs. Informational cross-check only; it NEVER overrides "
+                      f"the engine score. Flag it when it disagrees sharply with the 72h direction.")
+    else:
+        _meta_line = "N/A (model not yet trained — needs more resolved rows)."
+
     user_msg = f"""=== MACRO CONTEXT ===
 BTC Price: ${price:,.0f}
 Fear & Greed: {fear_greed}
@@ -1539,6 +1715,10 @@ Strongest bullish cycle inputs:
 Strongest bearish cycle inputs:
 {_cyc_neg_block}
 
+=== ENGINE TRACK RECORD — CALIBRATE YOUR CONFIDENCE AGAINST THIS ===
+Measured skill of THIS engine on its own resolved signals (not priors). Read this BEFORE you weigh the score below.
+{track_record}
+
 === 72h DIRECTIONAL BIAS: {bias_score:+.0f}/100 ({bias_label}) ===
 Signal breakdown (weight → influence on composite score):
 {chr(10).join(signal_lines) or "  (no signal data)"}
@@ -1546,6 +1726,9 @@ Signal breakdown (weight → influence on composite score):
 === 24h DIRECTIONAL BIAS: {bias_24h_score:+.0f}/100 ({bias_24h_label}) · regime: {bias_24h_regime} ===
 Intraday engine — separate from 72h. Use to confirm/contradict 72h direction and set entry timing.
 {chr(10).join(sig24_lines) or "  (no signal data)"}
+
+=== META-MODEL SECOND OPINION ===
+{_meta_line}
 
 === POLYMARKET CROWD THESIS: {pm_thesis:+.2f}/10 ({pm_label}) ===
 Real money at risk — treat as highest-conviction external signal.
@@ -3768,12 +3951,26 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
     except Exception:
         _adx_1h = float("nan")
     _adx_ok = not np.isnan(_adx_1h)
-    if _adx_ok and _adx_1h > 28:
-        regime = "trend"
-    elif _adx_ok and _adx_1h < 18:
-        regime = "range"
+    # CONTINUOUS regime membership — the old hard cutoffs at ADX 18/28 swapped the
+    # ENTIRE weight vector the instant ADX ticked across a boundary (EMA Structure
+    # alone jumps 28%→10% trend→range), moving the score 20–40 points with no price
+    # change. Instead, build a partition-of-unity over ADX so weights blend smoothly
+    # across the boundaries (each ramp spans an 8-point ADX band):
+    #   range  membership: 1 at ADX≤14 → 0 at ADX≥22
+    #   trend  membership: 0 at ADX≤24 → 1 at ADX≥32
+    #   transition: whatever is left (pure transition ~ADX 22–24)
+    # The ramps never overlap, so the three always sum to 1.
+    if _adx_ok:
+        _w_range_r = float(np.clip((22.0 - _adx_1h) / 8.0, 0.0, 1.0))
+        _w_trend_r = float(np.clip((_adx_1h - 24.0) / 8.0, 0.0, 1.0))
+        _w_trans_r = max(0.0, 1.0 - _w_range_r - _w_trend_r)
     else:
-        regime = "transition"
+        # ADX unavailable → behave like the old fallback: pure transition.
+        _w_range_r, _w_trend_r, _w_trans_r = 0.0, 0.0, 1.0
+    _regime_mix = {"range": _w_range_r, "transition": _w_trans_r, "trend": _w_trend_r}
+    # Discrete label kept for display / logging / downstream regime checks:
+    # the dominant membership. Scoring uses the blended weights, not this label.
+    regime = max(_regime_mix, key=_regime_mix.get)
 
     # ── Volatility conditioning via ATR percentile on daily candles ───────────
     # ATR percentile > 70 → high vol → dampen mean-reversion signals
@@ -3914,7 +4111,15 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
         "Options PC OI":        0.005,
         "Options Term":         0.010,
     }
-    WEIGHTS = {"trend": _W_TREND, "range": _W_RANGE, "transition": _W_BASE}[regime]
+    # Blend the three weight tables by ADX membership instead of hard-selecting
+    # one. At a regime boundary this ramps weights over an 8-point ADX band
+    # rather than snapping them, which removes the no-price-change score cliffs.
+    # Pure-regime ADX values reproduce the old single-table weights exactly.
+    _W_TABLES = {"trend": _W_TREND, "range": _W_RANGE, "transition": _W_BASE}
+    WEIGHTS = {
+        _k: sum(_regime_mix[_rname] * _tbl[_k] for _rname, _tbl in _W_TABLES.items())
+        for _k in _W_BASE
+    }
 
     # ── Horizon-decay: microstructure signals decay fast vs 72h target ────────
     # Order book, cascade, and hunt zones have effective horizons of hours–1 day.
@@ -4315,16 +4520,23 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
         bull_x   = e20_now > e50_now and e20_prev <= e50_prev
         bear_x   = e20_now < e50_now and e20_prev >= e50_prev
         e20_slope = (e20_now - float(ema20.iloc[-3])) / e20_now * 100 if len(ema20) >= 3 else 0
-        if   bull_x:            raw, note = +1.0, f"EMA20/50 bull cross [{_tf_label}] ({e20_now:,.0f} vs {e50_now:,.0f})"
-        elif bear_x:            raw, note = -1.0, f"EMA20/50 bear cross [{_tf_label}] ({e20_now:,.0f} vs {e50_now:,.0f})"
-        elif e20_now > e50_now:
-            bonus = min(0.4, abs(e20_slope) * 20)
-            raw   = min(1.0, 0.5 + bonus)
-            note  = f"EMA20 above EMA50 [{_tf_label}], slope {e20_slope:+.3f}%/bar"
-        else:
-            bonus = min(0.4, abs(e20_slope) * 20)
-            raw   = max(-1.0, -0.5 - bonus)
-            note  = f"EMA20 below EMA50 [{_tf_label}], slope {e20_slope:+.3f}%/bar"
+        # CONTINUOUS structural read — the old logic floored this at ±0.5 the
+        # instant EMA20 crossed EMA50 and slammed to ±1.0 on a fresh cross, so a
+        # tiny price wiggle through the cross point produced a ~1.5 step in a
+        # 20–28%-weight signal → the 40-point cliffs seen on the chart. Instead,
+        # read the signed EMA separation through a tanh: it glides smoothly
+        # through zero as the EMAs converge/diverge (no sign-flip discontinuity),
+        # and sits near 0 in chop (gap≈0) instead of a misleading ±0.5.
+        #   gap ±1.3% → ±0.76 ; saturates by ~±2.6%.
+        _gap = (e20_now - e50_now) / e50_now * 100 if e50_now else 0.0
+        raw  = float(np.tanh(_gap / 1.3))
+        # Small continuous slope nudge (lead), capped so it can't dominate the
+        # structural separation read.
+        raw  = float(np.clip(raw + float(np.clip(e20_slope * 8.0, -0.15, 0.15)), -1.0, 1.0))
+        if   bull_x:           note = f"EMA20/50 bull cross [{_tf_label}] (gap {_gap:+.2f}%, raw {raw:+.2f})"
+        elif bear_x:           note = f"EMA20/50 bear cross [{_tf_label}] (gap {_gap:+.2f}%, raw {raw:+.2f})"
+        elif e20_now > e50_now: note = f"EMA20 above EMA50 [{_tf_label}], gap {_gap:+.2f}%, slope {e20_slope:+.3f}%/bar (raw {raw:+.2f})"
+        else:                   note = f"EMA20 below EMA50 [{_tf_label}], gap {_gap:+.2f}%, slope {e20_slope:+.3f}%/bar (raw {raw:+.2f})"
     except Exception:
         raw, note = 0.0, "EMA N/A"
     signals["EMA Structure"] = (raw, note)
@@ -9462,6 +9674,8 @@ _chg24_chip = (
 # its P(up) beside the gauge — purely informational, never replaces engine score.
 # Cached in session_state so disk load happens once per session, not per rerun.
 _meta_chip = ""
+_meta_pup = None   # meta-model P(up) [0..1]; stays None if model not loaded/trained
+_meta_pct = None
 if _meta_model is not None:
     _meta_loaded = st.session_state.get("_meta_model_loaded", "unset")
     if _meta_loaded == "unset":
@@ -10350,6 +10564,23 @@ if _ai_interp_key and not _public_mode():
 
     if _ask_claude or st.session_state.get("_claude_interp"):
         if _ask_claude:
+            # ── Build the measured-skill summary so Claude calibrates its
+            # confidence against the engine's real forward IC / expectancy
+            # rather than its priors. Reuse the prior rerun's resolved rows
+            # (cached in session_state) so this doesn't re-hit the network;
+            # evaluate/baseline/forecast are all @st.cache_data-memoised.
+            _track_record = "N/A"
+            try:
+                _tr_rows = st.session_state.get("_sig_rows_last")
+                if _tr_rows is None:
+                    _tr_rows = _resolve_signal_outcomes(price)
+                _tr_bt    = _filter_bt_rows(_tr_rows)
+                _tr_M     = _bt_metrics.evaluate(_tr_bt) if _bt_metrics else {}
+                _tr_bcmp  = _bt_metrics.baseline_comparison(_tr_bt) if _bt_metrics else {}
+                _tr_fdiag = _forecast_diagnostic(_tr_rows)
+                _track_record = _format_track_record_for_claude(_tr_M, _tr_bcmp, _tr_fdiag)
+            except Exception as _e:
+                _track_record = f"(track record unavailable: {_e})"
             with st.spinner("Claude is reading the dashboard…"):
                 _interp_text = _call_claude_interpretation(
                     price        = price,
@@ -10398,6 +10629,9 @@ if _ai_interp_key and not _public_mode():
                     liq_ask_clusters  = (btc_liq or {}).get("liq_ask_clusters"),
                     hunt_zones        = (btc_liq or {}).get("hunt_zones"),
                     cascade_direction = str((btc_liq or {}).get("cascade_direction", "N/A")),
+                    # Measured engine skill + independent meta-model opinion
+                    track_record      = _track_record,
+                    meta_pup          = _meta_pup,
                 )
             st.session_state["_claude_interp"]  = _interp_text
             st.session_state["_ai_calls_used"] = _ai_calls_used + 1
@@ -10508,11 +10742,16 @@ with st.expander(
 
 # Resolve any outstanding signals and log current reading (max every 5 min)
 _sig_rows = _resolve_signal_outcomes(price)
+# Cache for the Claude plugin: it runs earlier in the page than this line, so
+# it reuses the previous rerun's rows instead of re-hitting the network.
+st.session_state["_sig_rows_last"] = _sig_rows
 _now_ts   = _dt.now(_tz.utc).timestamp()
 _last_log = st.session_state.get("_last_log_ts", 0)
 if _now_ts - _last_log >= _LOG_INTERVAL:
-    # Log the raw (unsmoothed) score + label so values match what the
-    # headless cron writes — calibration must be environment-independent.
+    # Log the engine score + label. _log_bias_signal applies a durable
+    # slew-rate limit (anchored to the last Supabase row) so the logged/charted
+    # series can't teleport; that limiter reads durable storage, not session
+    # state, so cron and local stay identical — calibration is environment-independent.
     # Also pass bias_72h + poly_sentiment so per-signal and per-market
     # detail rows are written for IC weighting / SHAP / velocity later.
     _log_bias_signal(_b12_score_raw, bias_72h.get("label", _b12_label), price,
@@ -10540,20 +10779,8 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
     # ── Backtest cutoff: only count rows from the current scoring engine. ──
     # Pre-cutoff rows came from an older engine (double-EMA bug) and would
     # poison the winrate. They still appear on the history chart below.
-    try:
-        _cutoff_dt = _dt.fromisoformat(_BACKTEST_CUTOFF_UTC_ISO)
-    except Exception:
-        _cutoff_dt = None
-
-    def _post_cutoff(_r):
-        if _cutoff_dt is None:
-            return True
-        try:
-            return _dt.fromisoformat(_r.get("ts", "")) >= _cutoff_dt
-        except Exception:
-            return False
-
-    _bt_rows = [r for r in _sig_rows if _post_cutoff(r)]
+    # Filter shared with the Claude plugin via _filter_bt_rows (module-level).
+    _bt_rows = _filter_bt_rows(_sig_rows)
 
     # Live log winrate: all logged signals (already filtered to |score| >= 40 at log time)
     _live_wins = sum(1 for r in _bt_rows if r.get("correct") in ("1", "2"))
@@ -10570,7 +10797,7 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
     # in/out. Pre-cutoff rows came from older scoring engines.
     _excluded    = sum(1 for r in _sig_rows
                        if r.get("correct") in ("0", "1", "2")
-                       and not _post_cutoff(r))
+                       and not _post_backtest_cutoff(r))
     if _live_n > 0:
         _live_note = f"{_live_n} trades resolved"
         if _excluded > 0:
