@@ -21,11 +21,34 @@ import urllib.parse
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+# Windows consoles default to cp1252, which can't encode the ✓/… chars in our
+# log prints — that raised UnicodeEncodeError mid-run (before the row insert),
+# silently killing local logging. Force UTF-8 (replace on failure) so prints
+# never crash the logger. No-op on GitHub Actions (already UTF-8).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 
 SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY") or ""
 TABLE        = "signal_log"
 OUTCOME_HRS  = 72.0
+
+# Local fallback: when run on this machine (not GitHub Actions) the env vars
+# aren't set, so read them from .streamlit/secrets.toml next to this file.
+# Keeps creds in ONE place — no duplicating the service key into a launcher.
+if not (SUPABASE_URL and SUPABASE_KEY):
+    _secrets = Path(__file__).resolve().parent / ".streamlit" / "secrets.toml"
+    if _secrets.exists():
+        for _ln in _secrets.read_text(encoding="utf-8").splitlines():
+            _ln = _ln.strip()
+            if _ln.startswith("SUPABASE_URL") and not SUPABASE_URL:
+                SUPABASE_URL = _ln.split("=", 1)[1].strip().strip('"').strip("'").rstrip("/")
+            elif _ln.startswith("SUPABASE_KEY") and not SUPABASE_KEY:
+                SUPABASE_KEY = _ln.split("=", 1)[1].strip().strip('"').strip("'")
 
 if not (SUPABASE_URL and SUPABASE_KEY):
     print("ERROR: SUPABASE_URL or SUPABASE_KEY env var missing")
