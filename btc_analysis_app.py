@@ -2412,6 +2412,54 @@ def fetch_polymarket_btc_sentiment(current_price: float) -> dict:
             "hours_left":       round(hl, 1) if hl is not None else None,
         }
 
+    def _macro_entry(evt_name, sub_mkts, evt_liq, evt_hours):
+        """Build a NON-directional 'macro / structural' market entry for display.
+
+        These are BTC event-risk markets (reserves, Satoshi, quantum, dominance,
+        outperform-gold, corporate events) that aren't price-direction bets. They
+        never enter scored_markets, the thesis, or public_opinion — purely an
+        informational panel. Returns a dict with the top outcomes by probability,
+        or None if nothing parseable."""
+        opts = []   # (label, prob)
+        if len(sub_mkts) == 1 and len(sub_mkts[0]["outcomes"]) == 2:
+            sm = sub_mkts[0]
+            _yi = 0
+            for _i, _o in enumerate(sm["outcomes"]):
+                if str(_o).lower() in ("yes", "true"):
+                    _yi = _i; break
+            opts = [("Yes", sm["probs"][_yi]), ("No", sm["probs"][1 - _yi])]
+        elif len(sub_mkts) == 1:
+            opts = [(str(_o), _p) for _o, _p in zip(sub_mkts[0]["outcomes"], sub_mkts[0]["probs"])]
+        else:
+            # date-ladder / multi-condition: each sub-market's YES prob. If the
+            # sub-markets differ by resolution DATE (a "by ___?" ladder), label
+            # by that date; otherwise fall back to the (shortened) sub-question.
+            from datetime import timedelta as _td
+            _hls = [s.get("hours_left") for s in sub_mkts if s.get("hours_left") is not None]
+            _is_date_ladder = len(_hls) >= 2 and len(set(_hls)) > 1
+            for sm in sub_mkts:
+                _yi = 0
+                for _i, _o in enumerate(sm["outcomes"]):
+                    if str(_o).lower() in ("yes", "true"):
+                        _yi = _i; break
+                _hl = sm.get("hours_left")
+                if _is_date_ladder and _hl is not None:
+                    _end = now + _td(hours=_hl)
+                    _lbl = _end.strftime("By %b %d" if _hl <= 72 * 24 else "By %b %Y")
+                else:
+                    _lbl = (sm["question"] or evt_name).strip()
+                opts.append((_lbl, sm["probs"][_yi]))
+        opts = [(l, p) for l, p in opts if p is not None]
+        if not opts:
+            return None
+        opts.sort(key=lambda x: x[1], reverse=True)
+        return {
+            "question":   evt_name,
+            "options":    opts[:5],
+            "liquidity":  evt_liq,
+            "hours_left": round(evt_hours, 1) if evt_hours is not None else None,
+        }
+
     try:
         # ascending=true (oldest first) surfaces price-target and perpetual Up/Down
         # markets which have old startDates.  ascending=false floods the list with
@@ -2986,6 +3034,59 @@ def fetch_polymarket_btc_sentiment(current_price: float) -> dict:
             "long": _opinion([m for m in _op_src if _opinion_bucket(m.get("hours_left")) == "long"]),
         }
 
+        # ── Macro / structural markets (non-directional, display only) ──────────
+        # Qualifying BTC events that produced NO directional price market —
+        # reserves, Satoshi, quantum, dominance, outperform-gold, corporate
+        # events. Captured for a separate informational panel; never scored.
+        _scored_names = {m["question"] for m in scored_markets}
+        _dir_title_kw = ("up or down", "price on", "price range", "what price",
+                         "when will", "between $", "above $")
+        macro_markets = []
+        for ev in events:
+            try:
+                _mt = (ev.get("title") or "").strip()
+                if not _mt or _mt in _scored_names:
+                    continue
+                _mtl = _mt.lower()
+                # Skip price-directional shapes: if they produced nothing it was a
+                # deliberate skip (expired / thin / sub-threshold), not a macro mkt.
+                if any(_k in _mtl for _k in _dir_title_kw):
+                    continue
+                if re.search(r'\babove\b.*\bon\b', _mtl):   # "Bitcoin above ___ on <date>"
+                    continue
+                _msub = []
+                for _m in _parse_list(ev.get("markets", [])):
+                    if not isinstance(_m, dict):
+                        continue
+                    _mo = _parse_list(_m.get("outcomes"))
+                    _mp = _parse_list(_m.get("outcomePrices"))
+                    _ml = float(_m.get("liquidityNum") or _m.get("liquidity") or 0)
+                    if len(_mo) < 2 or len(_mp) < 2 or _ml < 200:
+                        continue
+                    _mhl = None
+                    _me  = _m.get("endDateIso") or _m.get("endDate") or ""
+                    if _me:
+                        try:
+                            _men = (_me + "T23:59:59+00:00") if "T" not in _me else _me.replace("Z", "+00:00")
+                            _mhl = (datetime.fromisoformat(_men) - now).total_seconds() / 3600
+                            if _mhl < 0:
+                                continue
+                        except Exception:
+                            pass
+                    _msub.append({"question": (_m.get("question") or "").strip(),
+                                  "outcomes": _mo, "probs": [float(p) for p in _mp],
+                                  "liquidity": _ml, "hours_left": _mhl})
+                if not _msub:
+                    continue
+                _mhls = [s["hours_left"] for s in _msub if s["hours_left"] is not None]
+                _ment = _macro_entry(_mt, _msub, sum(s["liquidity"] for s in _msub),
+                                     min(_mhls) if _mhls else None)
+                if _ment:
+                    macro_markets.append(_ment)
+            except Exception:
+                continue
+        macro_markets.sort(key=lambda m: m["liquidity"], reverse=True)
+
         total_weight = sum(m["weight"] for m in scored_markets)
         weighted_agreement = confidence * total_weight  # approximate for legacy compat
 
@@ -3008,6 +3109,7 @@ def fetch_polymarket_btc_sentiment(current_price: float) -> dict:
             "thesis_score": round(thesis_score, 2),
             "thesis_label": thesis_label,
             "public_opinion": public_opinion,
+            "macro_markets": macro_markets,
             "detail":       (f"72h Thesis: {thesis_label} ({thesis_score:+.2f}/10) "
                              f"| {n} mkts, {confidence:.0%} agree"),
         })
@@ -10445,6 +10547,7 @@ _pm_thlabel   = poly_sentiment.get("thesis_label", "NEUTRAL")
 _pm_conf      = poly_sentiment.get("confidence", 0.0)
 _pm_detail    = poly_sentiment.get("detail", "N/A")
 _pm_opinion   = poly_sentiment.get("public_opinion", {}) or {}
+_pm_macro     = poly_sentiment.get("macro_markets", []) or []
 _pm_color     = ("#3fb950" if _pm_thesis >= 1.0 else
                  "#f85149" if _pm_thesis <= -1.0 else "#8b949e")
 
@@ -10502,6 +10605,35 @@ def _pm_card_updown(mk):
         f'{bar}'
         f'<div style="font-size:9px; color:#484f58;">{exp} · {liq} · {_pm_q_safe(mk["rationale"])}{ref_html}</div>'
         f'</div>'
+    )
+
+def _pm_card_macro(mk):
+    """Compact informational card for a non-directional macro/structural market.
+    Shows the top outcomes by probability — no score, no bull/bear colouring."""
+    exp = (f"{mk['hours_left']/24:.0f}d" if mk.get("hours_left") and mk["hours_left"] >= 48
+           else (f"{mk['hours_left']:.0f}h" if mk.get("hours_left") else "—"))
+    liq = f"&#36;{mk['liquidity']/1000:.0f}k" if mk.get("liquidity") else ""
+    rows = ""
+    for _lbl, _p in mk.get("options", [])[:4]:
+        _pct = round(_p * 100)
+        _disp = _lbl if len(_lbl) <= 38 else _lbl[:36] + "…"
+        rows += (
+            f'<div style="display:flex; align-items:center; gap:8px; margin:3px 0;">'
+            f'<div style="font-size:10px; color:#8b949e; width:160px; white-space:nowrap;'
+            f' overflow:hidden; text-overflow:ellipsis;">{_pm_q_safe(_disp)}</div>'
+            f'<div style="flex:1; background:#21262d; border-radius:3px; height:8px;">'
+            f'<div style="width:{_pct}%; height:100%; background:#6e7681; border-radius:3px;"></div>'
+            f'</div>'
+            f'<div style="font-size:10px; color:#c9d1d9; width:30px; text-align:right;">{_pct}%</div>'
+            f'</div>'
+        )
+    return (
+        f'<div style="background:#0d1117; border:1px solid #30363d; border-radius:8px;'
+        f' padding:9px 13px; margin-bottom:7px;">'
+        f'<div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:4px;">'
+        f'<div style="font-size:11.5px; color:#adbac7; font-weight:600; line-height:1.35; max-width:80%;">{_pm_q_safe(mk["question"])}</div>'
+        f'<div style="font-size:9px; color:#484f58; white-space:nowrap;">{exp} · {liq}</div>'
+        f'</div>{rows}</div>'
     )
 
 def _pm_card_yesno(mk):
@@ -10927,6 +11059,18 @@ with st.expander(
             f"<b style='color:{_pm_color}; font-size:13px;'>{_pm_thesis:+.2f} / 10</b>"
             f"</div>",
             unsafe_allow_html=True)
+
+        # ── Macro / structural markets (non-directional) ───────────────────
+        # Event-risk BTC markets that aren't price-direction bets — shown for
+        # context, deliberately kept OUT of the thesis and horizon opinion.
+        if _pm_macro:
+            st.markdown(
+                '<div style="font-size:11px; color:#8b949e; font-weight:600; margin:16px 0 6px;">'
+                'MACRO / STRUCTURAL MARKETS '
+                '<span style="color:#484f58; font-weight:400;">· event risk, not in the directional read</span></div>',
+                unsafe_allow_html=True)
+            for _mm in _pm_macro[:12]:
+                st.markdown(_pm_card_macro(_mm), unsafe_allow_html=True)
 
 # ── Signal outcome logging + stability + accuracy ─────────────────
 
