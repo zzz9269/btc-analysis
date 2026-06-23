@@ -54,6 +54,15 @@ if not (SUPABASE_URL and SUPABASE_KEY):
     print("ERROR: SUPABASE_URL or SUPABASE_KEY env var missing")
     sys.exit(1)
 
+# Make the resolved creds visible to the app module's Supabase helpers. They
+# read st.secrets -> os.environ; on GitHub Actions these are real env vars, but
+# locally they came from secrets.toml into the vars above, so without this the
+# app module's _supa_available() is False and _recenter_offset() /
+# _slew_limit_score() silently no-op (offset 0.0, no slew limiting). setdefault
+# so a real env var is never clobbered.
+os.environ.setdefault("SUPABASE_URL", SUPABASE_URL)
+os.environ.setdefault("SUPABASE_KEY", SUPABASE_KEY)
+
 
 # ─────────────────────────────────────────────────────────────────
 # Stub Streamlit so importing btc_analysis_app.py doesn't crash on
