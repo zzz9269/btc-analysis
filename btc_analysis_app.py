@@ -3012,16 +3012,18 @@ def fetch_polymarket_btc_sentiment(current_price: float) -> dict:
 
         def _opinion(markets):
             # Liquidity-weighted mean score (with a $1k floor so a thin market
-            # still counts a little); bull share = liq-weighted fraction score>0.
+            # still counts a little).
             tw = sum(max(m.get("liquidity") or 0, 1000) for m in markets)
             if not markets or tw <= 0:
                 return None
             sc = sum(m["individual_score"] * max(m.get("liquidity") or 0, 1000)
                      for m in markets) / tw
-            bull = sum(max(m.get("liquidity") or 0, 1000)
-                       for m in markets if m["individual_score"] > 0.2) / tw
-            bear = sum(max(m.get("liquidity") or 0, 1000)
-                       for m in markets if m["individual_score"] < -0.2) / tw
+            # Bull/bear split from the aggregate directional INTENSITY (score in
+            # -10..+10 → 0..100%), NOT a market count. Otherwise a single
+            # moderately-bullish market reads a misleading "100% bull" instead of
+            # its actual lean (e.g. +5.2 → 76% bull).
+            bull = max(0.0, min(1.0, (sc + 10.0) / 20.0))
+            bear = 1.0 - bull
             if   sc >=  3.0: lbl = "BULLISH"
             elif sc >=  1.0: lbl = "Leaning bullish"
             elif sc >  -1.0: lbl = "Split / neutral"
