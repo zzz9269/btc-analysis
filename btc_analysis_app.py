@@ -2922,11 +2922,15 @@ def fetch_polymarket_btc_sentiment(current_price: float) -> dict:
                             reverse=True
                         )
 
-                    if bull_dir and bear_hits:
-                        summary = f"↑{p_bull:.0%} above vs ↓{p_bear:.0%} below"
-                    elif bull_dir:
+                    if bull_dir:
+                        # The score above came from the NEAREST-RESISTANCE method,
+                        # so the summary must reflect that — not a sum of year-long
+                        # touch probabilities, which for a multi-level market
+                        # exceeds 100% on BOTH sides and reads as the opposite
+                        # direction of the score. Keeps display == score logic.
                         _near_t2, _near_p2 = min(bull_dir, key=lambda x: x[0])
-                        summary = f"Nearest resistance ${_near_t2:,.0f}: {_near_p2:.0%}"
+                        _pct2 = (_near_t2 - current_price) / current_price
+                        summary = f"Nearest upside ${_near_t2:,.0f} (+{_pct2:.0%}): {_near_p2:.0%} touch"
                     elif bull_floor:
                         summary = f"Floor support only"
                     else:
