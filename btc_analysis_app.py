@@ -2203,7 +2203,9 @@ def fetch_polymarket_btc_sentiment(current_price: float) -> dict:
             elif hours_left is not None and hours_left <= 720:
                 w, rat = 1, "Monthly price range — marginal relevance to 72h"
             elif hours_left is not None and hours_left > 720:
-                return None  # exclude markets resolving >30 days out
+                # Captured for the long-term public-opinion summary; the horizon
+                # multiplier keeps it ~0 in the 72h/24h trading signal.
+                w, rat = 1, "Long-term price range (>30d) — sentiment context only"
             else:
                 w, rat = 1, "Price range — unknown horizon"
             return {
@@ -2903,18 +2905,24 @@ def fetch_polymarket_btc_sentiment(current_price: float) -> dict:
         #             are forward of the window → discounted.
 
         def _horizon_mul(hl, window):
-            """Return weight multiplier for a market given hours_left and target window."""
+            """Return weight multiplier for a market given hours_left and target window.
+
+            Long-dated (>30d) markets are now CAPTURED for the public-opinion
+            display, but they must barely touch the trading signal — so they get
+            a near-zero multiplier here. Everything <=30d is unchanged."""
             if hl is None:
-                return 0.5
+                return 0.05                  # undated → treat as long-horizon macro
             if window == 24:
                 if hl <= 24:   return 1.5   # primary window
                 if hl <= 48:   return 0.6
-                return 0.15                  # too far out for 24h
+                if hl <= 720:  return 0.15   # forward of the 24h window
+                return 0.02                  # >30d: display only, ~0 in signal
             else:  # 72h
                 if hl <= 24:   return 0.2   # resolves before half the window
                 if hl <= 72:   return 1.5   # sweet spot
                 if hl <= 168:  return 1.0   # still relevant
-                return 0.2                   # too far out for 72h
+                if hl <= 720:  return 0.2    # this month — marginal
+                return 0.03                  # >30d: display only, ~0 in signal
 
         def _aggregate(markets, window):
             ws = sum(m["weight"] * _horizon_mul(m.get("hours_left"), window) for m in markets)
@@ -2934,6 +2942,49 @@ def fetch_polymarket_btc_sentiment(current_price: float) -> dict:
         thesis_score24, conf24,    _  = _aggregate(scored_markets, 24)
         signal    = thesis_score   / 10.0
         signal_24 = thesis_score24 / 10.0
+
+        # ── Public-opinion summary, bucketed by horizon ─────────────────────────
+        # Independent of the trading signal: this reads what the crowd thinks
+        # across ALL horizons (incl. the long-dated markets the 72h engine zeroes
+        # out), weighted by real money (liquidity) rather than the trading-horizon
+        # weights. Gives a "near term / this month / big picture" sentiment read.
+        def _opinion_bucket(hl):
+            if hl is None:       return "long"   # undated BTC markets are macro
+            if hl <= 72:         return "near"
+            if hl <= 720:        return "mid"
+            return "long"
+
+        def _opinion(markets):
+            # Liquidity-weighted mean score (with a $1k floor so a thin market
+            # still counts a little); bull share = liq-weighted fraction score>0.
+            tw = sum(max(m.get("liquidity") or 0, 1000) for m in markets)
+            if not markets or tw <= 0:
+                return None
+            sc = sum(m["individual_score"] * max(m.get("liquidity") or 0, 1000)
+                     for m in markets) / tw
+            bull = sum(max(m.get("liquidity") or 0, 1000)
+                       for m in markets if m["individual_score"] > 0.2) / tw
+            bear = sum(max(m.get("liquidity") or 0, 1000)
+                       for m in markets if m["individual_score"] < -0.2) / tw
+            if   sc >=  3.0: lbl = "BULLISH"
+            elif sc >=  1.0: lbl = "Leaning bullish"
+            elif sc >  -1.0: lbl = "Split / neutral"
+            elif sc >  -3.0: lbl = "Leaning bearish"
+            else:            lbl = "BEARISH"
+            return {
+                "score":  round(sc, 2), "label": lbl,
+                "bull_pct": round(bull * 100), "bear_pct": round(bear * 100),
+                "n": len(markets), "liq": round(tw),
+            }
+
+        # "When will" / context-only markets carry weight 0; exclude them from the
+        # directional opinion read (they're informational timeframe ladders).
+        _op_src = [m for m in scored_markets if m.get("weight", 0) > 0]
+        public_opinion = {
+            "near": _opinion([m for m in _op_src if _opinion_bucket(m.get("hours_left")) == "near"]),
+            "mid":  _opinion([m for m in _op_src if _opinion_bucket(m.get("hours_left")) == "mid"]),
+            "long": _opinion([m for m in _op_src if _opinion_bucket(m.get("hours_left")) == "long"]),
+        }
 
         total_weight = sum(m["weight"] for m in scored_markets)
         weighted_agreement = confidence * total_weight  # approximate for legacy compat
@@ -2956,6 +3007,7 @@ def fetch_polymarket_btc_sentiment(current_price: float) -> dict:
             "markets":      scored_markets,
             "thesis_score": round(thesis_score, 2),
             "thesis_label": thesis_label,
+            "public_opinion": public_opinion,
             "detail":       (f"72h Thesis: {thesis_label} ({thesis_score:+.2f}/10) "
                              f"| {n} mkts, {confidence:.0%} agree"),
         })
@@ -10392,6 +10444,7 @@ _pm_thesis    = poly_sentiment.get("thesis_score", 0.0)
 _pm_thlabel   = poly_sentiment.get("thesis_label", "NEUTRAL")
 _pm_conf      = poly_sentiment.get("confidence", 0.0)
 _pm_detail    = poly_sentiment.get("detail", "N/A")
+_pm_opinion   = poly_sentiment.get("public_opinion", {}) or {}
 _pm_color     = ("#3fb950" if _pm_thesis >= 1.0 else
                  "#f85149" if _pm_thesis <= -1.0 else "#8b949e")
 
@@ -10788,6 +10841,48 @@ with st.expander(
   </div>
 </div>
 """, unsafe_allow_html=True)
+
+        # ── Public-opinion summary by horizon (near / this month / long term) ──
+        # Liquidity-weighted crowd read across ALL horizons — independent of the
+        # trading-weighted thesis above. Answers "what does the money think over
+        # the next few days vs this month vs the big picture?"
+        def _op_card(title, sub, op):
+            if not op:
+                return (f'<div style="flex:1; background:#161b22; border:1px solid #30363d;'
+                        f' border-radius:8px; padding:10px 12px; text-align:center;">'
+                        f'<div style="font-size:11px; color:#8b949e; font-weight:600;">{title}</div>'
+                        f'<div style="font-size:9px; color:#484f58; margin:2px 0 6px;">{sub}</div>'
+                        f'<div style="font-size:12px; color:#6e7681; margin-top:8px;">no markets</div></div>')
+            _sc = op["score"]
+            _c  = "#3fb950" if _sc >= 1.0 else ("#f85149" if _sc <= -1.0 else "#8b949e")
+            _bull = op["bull_pct"]; _bear = op["bear_pct"]
+            _bar = (f'<div style="display:flex; height:6px; border-radius:3px; overflow:hidden; margin:7px 0 5px;">'
+                    f'<div style="width:{_bull}%; background:#3fb950;"></div>'
+                    f'<div style="width:{max(0,100-_bull-_bear)}%; background:#30363d;"></div>'
+                    f'<div style="width:{_bear}%; background:#f85149;"></div></div>')
+            return (f'<div style="flex:1; background:#161b22; border:1px solid #30363d;'
+                    f' border-left:3px solid {_c}; border-radius:8px; padding:10px 12px;">'
+                    f'<div style="display:flex; justify-content:space-between; align-items:baseline;">'
+                    f'<span style="font-size:11px; color:#e6edf3; font-weight:700;">{title}</span>'
+                    f'<span style="font-size:9px; color:#484f58;">{sub}</span></div>'
+                    f'<div style="font-size:13px; font-weight:800; color:{_c}; margin-top:4px;">{op["label"]}</div>'
+                    f'{_bar}'
+                    f'<div style="display:flex; justify-content:space-between; font-size:9px; color:#8b949e;">'
+                    f'<span style="color:#3fb950;">{_bull}% bull</span>'
+                    f'<span style="color:#484f58;">{op["n"]} mkts &middot; &#36;{op["liq"]/1000:.0f}k</span>'
+                    f'<span style="color:#f85149;">{_bear}% bear</span></div></div>')
+
+        if any(_pm_opinion.get(_k) for _k in ("near", "mid", "long")):
+            st.markdown(
+                '<div style="font-size:11px; color:#8b949e; font-weight:600; margin:2px 0 6px;">'
+                'PUBLIC OPINION BY HORIZON <span style="color:#484f58; font-weight:400;">'
+                '· liquidity-weighted crowd lean, all markets</span></div>'
+                '<div style="display:flex; gap:8px; margin-bottom:14px;">'
+                + _op_card("Next 72h", "days", _pm_opinion.get("near"))
+                + _op_card("This month", "3–30d", _pm_opinion.get("mid"))
+                + _op_card("Long term", "30d+ / 2026+", _pm_opinion.get("long"))
+                + '</div>',
+                unsafe_allow_html=True)
 
         # ── Chronological order: nearest expiry first, None/long-term last ──
         _sorted_mkts = sorted(
