@@ -3058,6 +3058,13 @@ def fetch_polymarket_btc_sentiment(current_price: float) -> dict:
                     continue
                 if re.search(r'\babove\b.*\bon\b', _mtl):   # "Bitcoin above ___ on <date>"
                     continue
+                # BTC-relevance gate: some generic multi-entity markets (e.g.
+                # "Which companies announce bankruptcy?") are bitcoin-tagged but
+                # mostly non-crypto noise. Require a BTC reference in the title;
+                # MicroStrategy/STRC are kept as recognised BTC proxies.
+                if not any(_k in _mtl for _k in
+                           ("bitcoin", "btc", "satoshi", "microstrategy", "mstr", "strc")):
+                    continue
                 _msub = []
                 for _m in _parse_list(ev.get("markets", [])):
                     if not isinstance(_m, dict):
