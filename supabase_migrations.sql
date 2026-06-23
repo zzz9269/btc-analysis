@@ -44,6 +44,17 @@ ALTER TABLE signal_log ADD COLUMN IF NOT EXISTS score_24h   NUMERIC;
 -- blend beats a dumb baseline at episode level.
 ALTER TABLE signal_log ADD COLUMN IF NOT EXISTS score_baseline NUMERIC;
 
+-- Shadow re-centered score (audit 2026-06-23). The raw 72h score carries a
+-- persistent ~-8 negative bias that pins it in SHORT/HOLD, so its SIGN is
+-- meaningless and the win/loss scorecard never fills. score_recentered =
+-- score - recenter_offset, where recenter_offset is the causal median of the
+-- last ~3 days of scores. SHADOW ONLY — it does NOT drive live direction; it
+-- accumulates so a de-biased, two-sided series can be skill-tested across
+-- regimes before any live threshold change. See _recenter_offset /
+-- calibrate_threshold.py.
+ALTER TABLE signal_log ADD COLUMN IF NOT EXISTS score_recentered NUMERIC;
+ALTER TABLE signal_log ADD COLUMN IF NOT EXISTS recenter_offset  NUMERIC;
+
 -- ============================================================
 -- Time × price liquidation heatmap history (Coinglass-style panel).
 -- Cron logs top-25 synthetic-map bins per side every ~15 min, plus one

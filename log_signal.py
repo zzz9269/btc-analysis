@@ -269,7 +269,21 @@ if _slew is not None:
         print(f"  · slew-limited score {_raw_score:+.1f} → {score:+.1f}")
 direction = "LONG" if score >= 25 else ("SHORT" if score <= -25 else "HOLD")
 
-print(f"  price=${price:,.2f}  score={score:+.1f}  label={label}  direction={direction}")
+# Shadow re-centered score — de-biases the persistent ~-8 offset for auditing.
+# Shared helper so cron + local app produce an identical series. Does NOT affect
+# `direction` above (live call stays on the raw score). Best-effort: passthrough
+# (offset 0) if the helper or its Supabase read fails.
+_recenter = getattr(mod, "_recenter_offset", None)
+_rc_off = 0.0
+if _recenter is not None:
+    try:
+        _rc_off = float(_recenter())
+    except Exception:
+        _rc_off = 0.0
+score_recentered = round(score - _rc_off, 1)
+
+print(f"  price=${price:,.2f}  score={score:+.1f}  label={label}  direction={direction}"
+      f"  score_rc={score_recentered:+.1f} (offset {_rc_off:+.1f})")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -301,17 +315,28 @@ row = {
     "score_24h":      _rnd(bias_24h.get("score"), 1),
     # 2-signal audit baseline (EMA Structure + OI Funding) on the same scale.
     "score_baseline": _rnd(bias_72h.get("score_baseline"), 1),
+    # Shadow de-biased score (audit 2026-06-23) — see _recenter_offset.
+    "score_recentered": score_recentered,
+    "recenter_offset":  round(_rc_off, 1),
 }
 inserted = _supa("POST", f"/{TABLE}", body=row)
 if inserted is None:
-    # Schema lag (e.g. score_baseline migration not run yet) → 4xx on the
-    # extended row. Retry with the original core fields so no tick is lost.
-    core_fields = ["ts", "score", "label", "direction",
-                   "entry_price", "exit_price", "pct_move", "correct"]
-    inserted = _supa("POST", f"/{TABLE}", body={k: row[k] for k in core_fields})
+    # Schema lag → 4xx on the extended row. Drop ONLY the newest columns first
+    # (score_recentered/recenter_offset migration not run yet) so we don't also
+    # lose the Phase-B fields that DO exist. Core-fields is the last-resort net.
+    _row2 = {k: v for k, v in row.items()
+             if k not in ("score_recentered", "recenter_offset")}
+    inserted = _supa("POST", f"/{TABLE}", body=_row2)
     if inserted:
-        print("  ⚠ extended insert failed — core-fields fallback succeeded "
-              "(run supabase_migrations.sql to add new columns)")
+        print("  ⚠ shadow-column insert failed — logged without "
+              "score_recentered/recenter_offset (run supabase_migrations.sql)")
+    else:
+        core_fields = ["ts", "score", "label", "direction",
+                       "entry_price", "exit_price", "pct_move", "correct"]
+        inserted = _supa("POST", f"/{TABLE}", body={k: row[k] for k in core_fields})
+        if inserted:
+            print("  ⚠ extended insert failed — core-fields fallback succeeded "
+                  "(run supabase_migrations.sql to add new columns)")
 if inserted:
     print(f"  ✓ logged signal id={inserted[0].get('id') if isinstance(inserted, list) else '?'}")
 else:

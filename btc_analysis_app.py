@@ -104,7 +104,16 @@ _SIGNAL_LOG    = _Path(__file__).parent / "signal_log.csv"
 _LOG_FIELDS    = ["ts", "score", "label", "direction",
                   "entry_price", "exit_price", "pct_move", "correct",
                   "bull_prob", "conviction", "regime", "score_24h",
-                  "score_baseline"]
+                  "score_baseline",
+                  # Shadow re-centered score (audit 2026-06-23): the raw 72h
+                  # score carries a persistent ~-8 negative bias that pins it in
+                  # SHORT/HOLD, so its SIGN is meaningless and the win/loss
+                  # scorecard never fills. score_recentered = score - a causal
+                  # trailing-median offset; it does NOT drive live direction
+                  # (shadow only) — it accumulates so a two-sided, de-biased
+                  # series can be skill-tested across regimes before any live
+                  # threshold change. See calibrate_threshold.py / _recenter_offset.
+                  "score_recentered", "recenter_offset"]
 _LOG_INTERVAL  = 300    # seconds between log writes (5 min)
 _OUTCOME_HOURS = 72.0   # hours to wait before resolving outcome (matches "72h bias" name)
 # Anti-teleport slew limit for the logged/charted 72h score. A 72h forecast must
@@ -205,6 +214,13 @@ def _log_bias_signal(score: float, label: str, price: float,
     direction = "LONG" if score >= 25 else ("SHORT" if score <= -25 else "HOLD")
     ts = _dt.now(_tz.utc).isoformat()
 
+    # Shadow re-centered score — de-biases the persistent ~-8 offset for
+    # auditing. NOT used for `direction` above (live call stays on the raw
+    # score); purely logged so a two-sided series accumulates. See _recenter_offset.
+    _rc_off = _recenter_offset()
+    _score_rc = round(score - _rc_off, 1)
+    _rc_off_n = round(_rc_off, 1)
+
     # ── Phase-B fields (improvements.txt items 1, 2, 4, 6) ────────────────
     # Pulled from bias_72h / bias_24h dicts when present; left as None/"" when
     # not, so old code paths that don't pass these dicts still work.
@@ -236,11 +252,15 @@ def _log_bias_signal(score: float, label: str, price: float,
                 "regime":         _rg_n,
                 "score_24h":      _s24n,
                 "score_baseline": _sbln,
+                "score_recentered": _score_rc,
+                "recenter_offset":  _rc_off_n,
             }
             _ins = _supa_request("POST", "/rest/v1/signal_log", body=_row_body)
             if _ins is None:
-                # Schema lag (score_baseline migration not run yet) → retry
-                # without the new column so the tick isn't lost.
+                # Schema lag (new-column migration not run yet) → retry without
+                # the newest columns so the tick isn't lost.
+                _row_body.pop("score_recentered", None)
+                _row_body.pop("recenter_offset", None)
                 _row_body.pop("score_baseline", None)
                 _supa_request("POST", "/rest/v1/signal_log", body=_row_body)
         except Exception:
@@ -258,7 +278,8 @@ def _log_bias_signal(score: float, label: str, price: float,
                         "" if _cv_n  is None else _cv_n,
                         "" if _rg_n  is None else _rg_n,
                         "" if _s24n  is None else _s24n,
-                        "" if _sbln  is None else _sbln])
+                        "" if _sbln  is None else _sbln,
+                        _score_rc, _rc_off_n])
     except Exception:
         pass
 
@@ -331,14 +352,29 @@ def _supa_fetch_signals() -> "list | None":
     if not _supa_available():
         return None
     try:
-        # Pull up to 10k rows ordered by ts ascending — plenty for live history.
-        raw = _supa_request(
-            "GET",
-            "/rest/v1/signal_log?select=ts,score,label,direction,entry_price,"
-            "exit_price,pct_move,correct,bull_prob,conviction,regime,score_24h"
-            "&order=ts.asc&limit=10000",
-        )
-        if not isinstance(raw, list):
+        # Paginate past PostgREST's 1000-row cap. signal_log has grown well past
+        # 1000 rows, and a plain limit=10000 is silently capped to the OLDEST
+        # 1000 (order=ts.asc) — which froze the live view weeks in the past and
+        # made it look like logging had stalled. Same pattern as
+        # _fetch_liq_heatmap_history. See [[signal_log_two_writers]].
+        raw, offset = [], 0
+        while True:
+            batch = _supa_request(
+                "GET",
+                "/rest/v1/signal_log?select=ts,score,label,direction,entry_price,"
+                "exit_price,pct_move,correct,bull_prob,conviction,regime,score_24h"
+                f"&order=ts.asc&limit=1000&offset={offset}",
+            )
+            if not isinstance(batch, list):
+                # Mid-pagination failure: keep the (older) rows we already have
+                # rather than wiping everything; only signal total failure if the
+                # very first page failed.
+                break
+            raw.extend(batch)
+            if len(batch) < 1000:
+                break
+            offset += 1000
+        if not raw:
             return None
         rows = []
         for r in raw:
@@ -437,6 +473,39 @@ def _slew_limit_score(score: float) -> float:
     except Exception:
         pass
     return float(score)
+
+
+_RECENTER_WINDOW_ROWS = 864   # ~3 days at 5-min cadence
+
+
+def _recenter_offset() -> float:
+    """Causal de-mean offset for the 72h score (SHADOW use only).
+
+    The post-anti-churn 72h score has carried a persistent negative bias
+    (~-8): median -8.3, it never crossed +1 over 4 days, so it logged 100%
+    HOLD and its raw SIGN scored 22% vs the +72h move (de-meaned: ~61%). This
+    returns the median of the last ~3 days of DURABLE (Supabase) scores, which
+    subtracted from the live score yields a two-sided `score_recentered` for
+    accumulation/auditing. It NEVER drives live direction — the live LONG/SHORT
+    call still uses the raw score's ±25 threshold. Validated in
+    calibrate_threshold.py (1–4 day windows all give ~61% causal sign acc).
+    Returns 0.0 (passthrough) on any failure or <20 rows so the shadow value
+    degrades gracefully and the raw score is logged unchanged in score_recentered."""
+    if not _supa_available():
+        return 0.0
+    try:
+        raw = _supa_request(
+            "GET", f"/rest/v1/signal_log?select=score&order=ts.desc&limit={_RECENTER_WINDOW_ROWS}")
+        if not isinstance(raw, list):
+            return 0.0
+        vals = sorted(float(r["score"]) for r in raw
+                      if isinstance(r, dict) and r.get("score") is not None)
+        if len(vals) < 20:
+            return 0.0
+        n = len(vals)
+        return float(vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2.0)
+    except Exception:
+        return 0.0
 
 
 def _resolve_signal_outcomes(current_price: float) -> list:
@@ -771,12 +840,38 @@ def _forecast_diagnostic(rows: list) -> "dict | None":
         half  = len(sc) // 2
         early = _rho(sc[:half], fwd72[:half])
         late  = _rho(sc[half:], fwd72[half:])
+        # Score-SIGN accuracy: does the score's sign call the +72h move sign?
+        # Works even when |score| never crosses the ±25 LONG/SHORT threshold
+        # (i.e. the engine logs HOLD), so it can grade an all-HOLD engine that
+        # the win/loss scorecard discards. Note it measures LEVEL calibration
+        # (a persistent bull/bear lean tanks it) whereas the IC above measures
+        # RANK skill — the two can diverge, so we report both.
+        _sg = pd.DataFrame({"s": sc, "f": fwd72}).dropna()
+        _sg = _sg[_sg["s"] != 0]
+        sign_acc = round(float((np.sign(_sg["s"]) == np.sign(_sg["f"])).mean()) * 100, 1) if len(_sg) else None
+        # Re-centered sign accuracy: subtract a CAUSAL trailing-median offset
+        # (no lookahead) before reading the sign. The raw score carries a
+        # persistent bias that tanks sign_acc; this isolates whether the bias
+        # (fixable by re-centering) or the information is the problem. Also
+        # report the DRIFT NULL (always-pick-the-majority-move) — the re-centered
+        # sign must BEAT this to claim real directional skill. See _recenter_offset.
+        _scs = pd.Series(sc, dtype=float)
+        _off = _scs.rolling(_RECENTER_WINDOW_ROWS, min_periods=20).median().shift(1).fillna(0.0)
+        _rc  = (_scs - _off).values
+        _rg2 = pd.DataFrame({"s": _rc, "f": fwd72}).dropna()
+        _rg2 = _rg2[_rg2["s"] != 0]
+        sign_acc_rc = round(float((np.sign(_rg2["s"]) == np.sign(_rg2["f"])).mean()) * 100, 1) if len(_rg2) else None
+        _fv = _sg["f"]
+        drift_null = round(float(max((_fv > 0).mean(), (_fv < 0).mean())) * 100, 1) if len(_sg) else None
         return {
             "n": n_fwd,
-            "score_vs_fwd72":   full,                 # forecast power
+            "score_vs_fwd72":   full,                 # forecast power (rank)
             "score_vs_trail24": _rho(sc, trail24),    # how momentum-like
             "trail24_vs_fwd72": _rho(trail24, fwd72), # momentum baseline's own edge
             "early_fwd": early, "late_fwd": late,     # regime-robustness
+            "sign_acc": sign_acc, "n_sign": int(len(_sg)),  # level calibration
+            "sign_acc_rc": sign_acc_rc,               # de-biased (causal re-center)
+            "drift_null": drift_null,                 # beat-this null for sign skill
         }
     except Exception:
         return None
@@ -10745,15 +10840,18 @@ _sig_rows = _resolve_signal_outcomes(price)
 # Cache for the Claude plugin: it runs earlier in the page than this line, so
 # it reuses the previous rerun's rows instead of re-hitting the network.
 st.session_state["_sig_rows_last"] = _sig_rows
+# The headless scheduled task (log_signal.py, every 5 min) is now the SOLE
+# writer of signal_log. The app used to ALSO log here whenever a tab was open,
+# which (a) created duplicate rows and (b) made it look like opening the
+# dashboard "started" logging. Disabled 2026-06-21 so the dashboard is purely a
+# VIEW — logging is 100% independent of the browser/terminal. Flip to True only
+# if you ever want the app to log again as a fallback. See [[signal_log_two_writers]].
+_APP_WRITES_SIGNAL_LOG = False
 _now_ts   = _dt.now(_tz.utc).timestamp()
 _last_log = st.session_state.get("_last_log_ts", 0)
-if _now_ts - _last_log >= _LOG_INTERVAL:
-    # Log the engine score + label. _log_bias_signal applies a durable
-    # slew-rate limit (anchored to the last Supabase row) so the logged/charted
-    # series can't teleport; that limiter reads durable storage, not session
-    # state, so cron and local stay identical — calibration is environment-independent.
-    # Also pass bias_72h + poly_sentiment so per-signal and per-market
-    # detail rows are written for IC weighting / SHAP / velocity later.
+if _APP_WRITES_SIGNAL_LOG and _now_ts - _last_log >= _LOG_INTERVAL:
+    # _log_bias_signal applies a durable slew-rate limit anchored to the last
+    # Supabase row, plus per-signal/per-market detail rows for IC/SHAP later.
     _log_bias_signal(_b12_score_raw, bias_72h.get("label", _b12_label), price,
                      bias_72h=bias_72h, poly=poly_sentiment,
                      bias_24h=bias_24h)
@@ -10845,10 +10943,53 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
                 f'<div style="font-size:9px; color:#6e7681; margin-top:4px; line-height:1.35;">{sub}</div></div>')
 
     if _M.get("n_signals", 0) == 0:
-        st.markdown('<div style="background:#161b22; border:1px solid #30363d; '
-                    'border-radius:10px; padding:16px 22px; color:#8b949e; font-size:13px;">'
-                    'Scorecard builds once signals resolve (≥72h after logging).</div>',
-                    unsafe_allow_html=True)
+        # The win/loss scorecard needs resolved LONG/SHORT signals. When the
+        # engine's score sits inside the ±25 dead-zone it logs HOLD, which
+        # grades to N/A — so the scorecard can read empty for a long stretch
+        # even with hundreds of matured rows. Don't dead-end there: the score's
+        # SIGN and RANK skill are gradeable on those rows right now. Measure
+        # them on the CURRENT engine (post-cutoff) so the number reflects today.
+        _fdiag_cur = _forecast_diagnostic(_bt_rows)
+        if _fdiag_cur and (_fdiag_cur.get("sign_acc") is not None
+                           or _fdiag_cur.get("score_vs_fwd72") is not None):
+            _ic   = _fdiag_cur.get("score_vs_fwd72")
+            _sa   = _fdiag_cur.get("sign_acc")
+            _sarc = _fdiag_cur.get("sign_acc_rc")
+            _dnull = _fdiag_cur.get("drift_null")
+            _nsg  = _fdiag_cur.get("n_sign", 0)
+            _ic_t = f"{_ic:+.2f}" if _ic is not None else "n/a"
+            _sa_t = f"{_sa:.0f}%" if _sa is not None else "n/a"
+            _sarc_t = f"{_sarc:.0f}%" if _sarc is not None else "n/a"
+            _dn_t = f"{_dnull:.0f}%" if _dnull is not None else "n/a"
+            # Colour the re-centered sign acc by whether it BEATS the drift null —
+            # that's the bar for claiming real directional skill, not 50%.
+            _rc_col = ("#8b949e" if (_sarc is None or _dnull is None)
+                       else "#3fb950" if _sarc > _dnull
+                       else "#f85149")
+            st.markdown(
+                f'<div style="background:#161b22; border:1px solid #30363d; '
+                f'border-radius:10px; padding:14px 20px; font-size:12.5px; color:#c9d1d9; line-height:1.6;">'
+                f'<b>No LONG/SHORT signals to win/loss-grade yet</b> — the current engine has been '
+                f'inside the ±25 HOLD dead-zone, so the win/loss card is empty. But the score is still '
+                f'gradeable on {_nsg} matured ticks:<br>'
+                f'• <b>Forward IC</b> (rank skill, score→+72h move): <b>{_ic_t}</b> '
+                f'<span style="color:#6e7681;">— ≥0.15 real edge · 0.05–0.15 marginal · &lt;0.05 coincident · offset-invariant</span><br>'
+                f'• <b>Sign accuracy</b>, raw score: <b>{_sa_t}</b> → <b>re-centered</b> '
+                f'<span style="color:{_rc_col}; font-weight:700;">{_sarc_t}</span> '
+                f'<span style="color:#6e7681;">vs drift null {_dn_t} '
+                f'(must beat the null for real skill; the jump from raw⇒re-centered = how much is just a persistent lean)</span><br>'
+                f'<span style="color:#8b949e; font-size:11px;">⚠ 5-min ticks over a few days are heavily '
+                f'autocorrelated (≈one independent episode) — treat as directional, not a verdict. A '
+                f'<i>shadow</i> de-biased score (score_recentered) is now being logged so this can be '
+                f'skill-tested across regimes before any live threshold change. The win/loss card fills '
+                f'once the score crosses ±25 across several independent episodes.</span>'
+                f'</div>',
+                unsafe_allow_html=True)
+        else:
+            st.markdown('<div style="background:#161b22; border:1px solid #30363d; '
+                        'border-radius:10px; padding:16px 22px; color:#8b949e; font-size:13px;">'
+                        'Scorecard builds once signals resolve (≥72h after logging).</div>',
+                        unsafe_allow_html=True)
     else:
         _vcode = _M.get("verdict_code", "inconclusive")
         _vcol  = {"edge": "#3fb950", "negative": "#f85149",
@@ -11059,6 +11200,34 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
     st.markdown(
         f"<div style='font-size:10px; color:#6e7681; padding:2px 4px 0;'>"
         f"{'  •  '.join(_diag_parts)}</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Freshness stamp ─────────────────────────────────────────────
+    # A backgrounded/discarded browser tab silently stops auto-refreshing, so
+    # the chart freezes at its last render — which looks exactly like a logging
+    # gap on the right edge. Stamp the render time so a frozen page is obvious
+    # (the clock here lags your real time), and flag if the newest row is truly
+    # old. Logging itself runs in the scheduled task regardless of this page.
+    _SGT2     = _tz(offset=__import__("datetime").timedelta(hours=8))
+    _now_sgt  = _dt.now(_SGT2)
+    _fresh_txt = (f"⏱ chart rendered {_now_sgt:%H:%M:%S SGT} — if this is behind "
+                  f"your clock, the tab is frozen: click 🔄 Refresh Data (sidebar) "
+                  f"or press R")
+    _fresh_col = "#6e7681"
+    if _hist_n >= 1:
+        try:
+            _age = (_now_sgt.replace(tzinfo=None) - _last.replace(tzinfo=None)).total_seconds() / 60
+            if _age > 15:
+                _fresh_txt = (f"⚠ newest logged row is {_age:.0f} min old "
+                              f"(chart rendered {_now_sgt:%H:%M:%S SGT}). If this keeps "
+                              f"growing, logging may be stalled — run check_logging.bat")
+                _fresh_col = "#d29922"
+        except Exception:
+            pass
+    st.markdown(
+        f"<div style='font-size:10px; color:{_fresh_col}; padding:0 4px 2px;'>"
+        f"{_fresh_txt}</div>",
         unsafe_allow_html=True,
     )
 
