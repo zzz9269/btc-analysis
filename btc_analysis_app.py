@@ -11019,15 +11019,22 @@ with st.expander(
                     f'<span style="color:#f85149;">{_bear}% bear</span></div></div>')
 
         if any(_pm_opinion.get(_k) for _k in ("near", "mid", "long")):
+            _macro_n = len(_pm_macro)
             st.markdown(
                 '<div style="font-size:11px; color:#8b949e; font-weight:600; margin:2px 0 6px;">'
                 'PUBLIC OPINION BY HORIZON <span style="color:#484f58; font-weight:400;">'
-                '· liquidity-weighted crowd lean, all markets</span></div>'
-                '<div style="display:flex; gap:8px; margin-bottom:14px;">'
+                '· liquidity-weighted lean of <b>price-direction</b> markets only</span></div>'
+                '<div style="display:flex; gap:8px; margin-bottom:6px;">'
                 + _op_card("Next 72h", "days", _pm_opinion.get("near"))
                 + _op_card("This month", "3–30d", _pm_opinion.get("mid"))
                 + _op_card("Long term", "30d+ / 2026+", _pm_opinion.get("long"))
-                + '</div>',
+                + '</div>'
+                + (f'<div style="font-size:10px; color:#6e7681; margin-bottom:14px; line-height:1.5;">'
+                   f'Polymarket has few long-dated <i>price-direction</i> markets, so the long-term '
+                   f'card is thin. The {_macro_n} long-horizon <b>structural / event</b> markets '
+                   f'(Satoshi, reserve, China, dominance…) are shown in the panel below — they carry '
+                   f'real crowd sentiment but aren\'t a clean price up/down signal, so they\'re kept '
+                   f'out of this directional read.</div>' if _macro_n else ''),
                 unsafe_allow_html=True)
 
         # ── Chronological order: nearest expiry first, None/long-term last ──
