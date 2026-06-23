@@ -2453,9 +2453,13 @@ def fetch_polymarket_btc_sentiment(current_price: float) -> dict:
         if not opts:
             return None
         opts.sort(key=lambda x: x[1], reverse=True)
+        # Keep ALL outcomes (capped generously) so the displayed options are
+        # complete — for a partition market (e.g. "best month": 12 options) the
+        # shown probs then sum to ~100%. (Cumulative "by date" ladders and
+        # independent multi-condition events legitimately won't sum to 100%.)
         return {
             "question":   evt_name,
-            "options":    opts[:5],
+            "options":    opts[:16],
             "liquidity":  evt_liq,
             "hours_left": round(evt_hours, 1) if evt_hours is not None else None,
         }
@@ -3061,7 +3065,10 @@ def fetch_polymarket_btc_sentiment(current_price: float) -> dict:
                     _mo = _parse_list(_m.get("outcomes"))
                     _mp = _parse_list(_m.get("outcomePrices"))
                     _ml = float(_m.get("liquidityNum") or _m.get("liquidity") or 0)
-                    if len(_mo) < 2 or len(_mp) < 2 or _ml < 200:
+                    # No liquidity gate here (unlike the directional path): this
+                    # is a display-only panel and dropping thin sub-markets would
+                    # hide options, making a partition market not sum to ~100%.
+                    if len(_mo) < 2 or len(_mp) < 2:
                         continue
                     _mhl = None
                     _me  = _m.get("endDateIso") or _m.get("endDate") or ""
@@ -10614,7 +10621,7 @@ def _pm_card_macro(mk):
            else (f"{mk['hours_left']:.0f}h" if mk.get("hours_left") else "—"))
     liq = f"&#36;{mk['liquidity']/1000:.0f}k" if mk.get("liquidity") else ""
     rows = ""
-    for _lbl, _p in mk.get("options", [])[:4]:
+    for _lbl, _p in mk.get("options", []):
         _pct = round(_p * 100)
         _disp = _lbl if len(_lbl) <= 38 else _lbl[:36] + "…"
         rows += (
