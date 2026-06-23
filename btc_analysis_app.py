@@ -9227,7 +9227,11 @@ def fig_obv_expanded(a: dict) -> plt.Figure:
     ax1.set_title("On-Balance Volume (OBV)  ·  Accumulation / Distribution flow", color="#8b949e", fontsize=9, loc="left", pad=4)
     ax1.set_ylabel("OBV (cumulative)", color="#8b949e", fontsize=8)
     ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v/1e9:,.1f}B"))
-    ax1.legend(fontsize=7, facecolor="#161b22", labelcolor="#c9d1d9", loc="lower right", framealpha=0.85)
+    # Legend OUTSIDE the panel (top-right, horizontal) so it never covers the OBV
+    # line — which is densest on the right (most recent bars). Title is top-left,
+    # so they don't collide.
+    ax1.legend(fontsize=7, facecolor="#161b22", labelcolor="#c9d1d9", framealpha=0.85,
+               ncol=2, loc="lower right", bbox_to_anchor=(1.0, 1.0), borderaxespad=0.1)
     _add_price_panel(axp, plot_df, price)
     plt.tight_layout(pad=0.5)
     return fig
