@@ -104,9 +104,24 @@ _SIGNAL_LOG    = _Path(__file__).parent / "signal_log.csv"
 _LOG_FIELDS    = ["ts", "score", "label", "direction",
                   "entry_price", "exit_price", "pct_move", "correct",
                   "bull_prob", "conviction", "regime", "score_24h",
-                  "score_baseline"]
+                  "score_baseline",
+                  # Shadow re-centered score (audit 2026-06-23): the raw 72h
+                  # score carries a persistent ~-8 negative bias that pins it in
+                  # SHORT/HOLD, so its SIGN is meaningless and the win/loss
+                  # scorecard never fills. score_recentered = score - a causal
+                  # trailing-median offset; it does NOT drive live direction
+                  # (shadow only) — it accumulates so a two-sided, de-biased
+                  # series can be skill-tested across regimes before any live
+                  # threshold change. See calibrate_threshold.py / _recenter_offset.
+                  "score_recentered", "recenter_offset"]
 _LOG_INTERVAL  = 300    # seconds between log writes (5 min)
 _OUTCOME_HOURS = 72.0   # hours to wait before resolving outcome (matches "72h bias" name)
+# Anti-teleport slew limit for the logged/charted 72h score. A 72h forecast must
+# not jump tens of points between 5-min ticks; the score may move at most this
+# many points per log interval (scaled by elapsed time so a cron gap can still
+# catch up). Source-level fixes (continuous EMA Structure + regime blend) mean
+# this rarely binds — it's a backstop so a single artifact can't produce a cliff.
+_SCORE_SLEW_PER_TICK = 12.0   # points per _LOG_INTERVAL
 
 # Backtest cutoff: rows logged BEFORE this UTC timestamp were produced by an
 # older scoring engine (e.g. the double-EMA-smoothing bug fixed in commit
@@ -115,7 +130,30 @@ _OUTCOME_HOURS = 72.0   # hours to wait before resolving outcome (matches "72h b
 # reflect ONLY the current engine.
 # Bump this whenever you change the scoring engine in a way that breaks
 # comparability with prior logs.
-_BACKTEST_CUTOFF_UTC_ISO = "2026-05-30T16:24:19+00:00"  # = 2026-05-31 00:24 SGT
+_BACKTEST_CUTOFF_UTC_ISO = "2026-06-19T16:00:00+00:00"  # = 2026-06-20 00:00 SGT
+# ^ bumped for the anti-churn engine change (2026-06-19): EMA Structure made
+#   continuous (tanh of EMA gap, no sign-flip cliff), regime weights blended
+#   continuously across ADX instead of hard-switching at 18/28, and a durable
+#   score slew-limiter added in _log_bias_signal. These change tick-to-tick
+#   score dynamics, so pre-cutoff rows aren't comparable for winrate/IC.
+
+
+def _post_backtest_cutoff(_r) -> bool:
+    """True if a signal row is from the current scoring engine (post-cutoff).
+    Shared by the accuracy panel AND the Claude plugin's track-record summary
+    so both measure the engine on exactly the same rows."""
+    try:
+        _c = _dt.fromisoformat(_BACKTEST_CUTOFF_UTC_ISO)
+    except Exception:
+        return True
+    try:
+        return _dt.fromisoformat(_r.get("ts", "")) >= _c
+    except Exception:
+        return False
+
+
+def _filter_bt_rows(rows: list) -> list:
+    return [r for r in (rows or []) if _post_backtest_cutoff(r)]
 
 
 # ════════════════════════════════════════════════════════════════
@@ -169,8 +207,19 @@ def _log_bias_signal(score: float, label: str, price: float,
 
     All writes are best-effort. Missing tables / failures don't crash the app.
     """
+    # Anti-teleport: clamp the logged value's per-tick change (durable, shared
+    # with the headless cron). See _slew_limit_score. direction/label below are
+    # derived from the limited score so the logged row is self-consistent.
+    score = _slew_limit_score(score)
     direction = "LONG" if score >= 25 else ("SHORT" if score <= -25 else "HOLD")
     ts = _dt.now(_tz.utc).isoformat()
+
+    # Shadow re-centered score — de-biases the persistent ~-8 offset for
+    # auditing. NOT used for `direction` above (live call stays on the raw
+    # score); purely logged so a two-sided series accumulates. See _recenter_offset.
+    _rc_off = _recenter_offset()
+    _score_rc = round(score - _rc_off, 1)
+    _rc_off_n = round(_rc_off, 1)
 
     # ── Phase-B fields (improvements.txt items 1, 2, 4, 6) ────────────────
     # Pulled from bias_72h / bias_24h dicts when present; left as None/"" when
@@ -203,11 +252,15 @@ def _log_bias_signal(score: float, label: str, price: float,
                 "regime":         _rg_n,
                 "score_24h":      _s24n,
                 "score_baseline": _sbln,
+                "score_recentered": _score_rc,
+                "recenter_offset":  _rc_off_n,
             }
             _ins = _supa_request("POST", "/rest/v1/signal_log", body=_row_body)
             if _ins is None:
-                # Schema lag (score_baseline migration not run yet) → retry
-                # without the new column so the tick isn't lost.
+                # Schema lag (new-column migration not run yet) → retry without
+                # the newest columns so the tick isn't lost.
+                _row_body.pop("score_recentered", None)
+                _row_body.pop("recenter_offset", None)
                 _row_body.pop("score_baseline", None)
                 _supa_request("POST", "/rest/v1/signal_log", body=_row_body)
         except Exception:
@@ -225,7 +278,8 @@ def _log_bias_signal(score: float, label: str, price: float,
                         "" if _cv_n  is None else _cv_n,
                         "" if _rg_n  is None else _rg_n,
                         "" if _s24n  is None else _s24n,
-                        "" if _sbln  is None else _sbln])
+                        "" if _sbln  is None else _sbln,
+                        _score_rc, _rc_off_n])
     except Exception:
         pass
 
@@ -298,14 +352,29 @@ def _supa_fetch_signals() -> "list | None":
     if not _supa_available():
         return None
     try:
-        # Pull up to 10k rows ordered by ts ascending — plenty for live history.
-        raw = _supa_request(
-            "GET",
-            "/rest/v1/signal_log?select=ts,score,label,direction,entry_price,"
-            "exit_price,pct_move,correct,bull_prob,conviction,regime,score_24h"
-            "&order=ts.asc&limit=10000",
-        )
-        if not isinstance(raw, list):
+        # Paginate past PostgREST's 1000-row cap. signal_log has grown well past
+        # 1000 rows, and a plain limit=10000 is silently capped to the OLDEST
+        # 1000 (order=ts.asc) — which froze the live view weeks in the past and
+        # made it look like logging had stalled. Same pattern as
+        # _fetch_liq_heatmap_history. See [[signal_log_two_writers]].
+        raw, offset = [], 0
+        while True:
+            batch = _supa_request(
+                "GET",
+                "/rest/v1/signal_log?select=ts,score,label,direction,entry_price,"
+                "exit_price,pct_move,correct,bull_prob,conviction,regime,score_24h"
+                f"&order=ts.asc&limit=1000&offset={offset}",
+            )
+            if not isinstance(batch, list):
+                # Mid-pagination failure: keep the (older) rows we already have
+                # rather than wiping everything; only signal total failure if the
+                # very first page failed.
+                break
+            raw.extend(batch)
+            if len(batch) < 1000:
+                break
+            offset += 1000
+        if not raw:
             return None
         rows = []
         for r in raw:
@@ -351,6 +420,92 @@ def _supa_last_signal_age_min() -> "float | None":
         return (_dt.now(_tz.utc) - ts).total_seconds() / 60.0
     except Exception:
         return None
+
+
+def _supa_last_score() -> "tuple | None":
+    """(score, age_minutes) of the most recent signal_log row, or None.
+
+    Lightweight 1-row fetch used by the score slew-limiter in _log_bias_signal.
+    Reads DURABLE storage (Supabase) rather than st.session_state, so the
+    headless cron and the local app anchor to the exact same previous value and
+    the logged/charted series stays identical across both environments."""
+    if not _supa_available():
+        return None
+    try:
+        raw = _supa_request(
+            "GET", "/rest/v1/signal_log?select=ts,score&order=ts.desc&limit=1")
+        if not isinstance(raw, list) or not raw:
+            return None
+        r = raw[0]
+        if r.get("score") is None:
+            return None
+        ts = _dt.fromisoformat(str(r.get("ts", "")).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=_tz.utc)
+        age_min = (_dt.now(_tz.utc) - ts).total_seconds() / 60.0
+        return float(r["score"]), age_min
+    except Exception:
+        return None
+
+
+def _slew_limit_score(score: float) -> float:
+    """Anti-teleport limiter for the logged/charted 72h score.
+
+    A 72h forecast must not jump tens of points between 5-min ticks. Clamp the
+    fresh score's change vs the last DURABLE reading (Supabase) so the logged
+    series ramps over a few ticks instead of cliff-stepping. The cap scales with
+    elapsed time, so a genuine gap (cron outage) still lets the score catch up;
+    a cold start or a stale/very-old anchor (>40 min) passes through unclamped.
+
+    Shared by BOTH writers — the local app (_log_bias_signal) and the headless
+    cron (log_signal.py) — so the single Supabase series they share stays smooth
+    regardless of which process wrote a given tick. Best-effort: any failure
+    returns the score unchanged. NOTE: applied only to the *logged* value; the
+    live in-memory bias_72h['score'] stays raw so the gauge/AI remain responsive."""
+    try:
+        prev = _supa_last_score()
+        if prev is not None:
+            pscore, age_min = prev
+            if 0.0 < age_min <= 40.0:
+                ticks    = max(1.0, age_min / (_LOG_INTERVAL / 60.0))
+                max_step = _SCORE_SLEW_PER_TICK * ticks
+                return float(np.clip(score, pscore - max_step, pscore + max_step))
+    except Exception:
+        pass
+    return float(score)
+
+
+_RECENTER_WINDOW_ROWS = 864   # ~3 days at 5-min cadence
+
+
+def _recenter_offset() -> float:
+    """Causal de-mean offset for the 72h score (SHADOW use only).
+
+    The post-anti-churn 72h score has carried a persistent negative bias
+    (~-8): median -8.3, it never crossed +1 over 4 days, so it logged 100%
+    HOLD and its raw SIGN scored 22% vs the +72h move (de-meaned: ~61%). This
+    returns the median of the last ~3 days of DURABLE (Supabase) scores, which
+    subtracted from the live score yields a two-sided `score_recentered` for
+    accumulation/auditing. It NEVER drives live direction — the live LONG/SHORT
+    call still uses the raw score's ±25 threshold. Validated in
+    calibrate_threshold.py (1–4 day windows all give ~61% causal sign acc).
+    Returns 0.0 (passthrough) on any failure or <20 rows so the shadow value
+    degrades gracefully and the raw score is logged unchanged in score_recentered."""
+    if not _supa_available():
+        return 0.0
+    try:
+        raw = _supa_request(
+            "GET", f"/rest/v1/signal_log?select=score&order=ts.desc&limit={_RECENTER_WINDOW_ROWS}")
+        if not isinstance(raw, list):
+            return 0.0
+        vals = sorted(float(r["score"]) for r in raw
+                      if isinstance(r, dict) and r.get("score") is not None)
+        if len(vals) < 20:
+            return 0.0
+        n = len(vals)
+        return float(vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2.0)
+    except Exception:
+        return 0.0
 
 
 def _resolve_signal_outcomes(current_price: float) -> list:
@@ -685,12 +840,38 @@ def _forecast_diagnostic(rows: list) -> "dict | None":
         half  = len(sc) // 2
         early = _rho(sc[:half], fwd72[:half])
         late  = _rho(sc[half:], fwd72[half:])
+        # Score-SIGN accuracy: does the score's sign call the +72h move sign?
+        # Works even when |score| never crosses the ±25 LONG/SHORT threshold
+        # (i.e. the engine logs HOLD), so it can grade an all-HOLD engine that
+        # the win/loss scorecard discards. Note it measures LEVEL calibration
+        # (a persistent bull/bear lean tanks it) whereas the IC above measures
+        # RANK skill — the two can diverge, so we report both.
+        _sg = pd.DataFrame({"s": sc, "f": fwd72}).dropna()
+        _sg = _sg[_sg["s"] != 0]
+        sign_acc = round(float((np.sign(_sg["s"]) == np.sign(_sg["f"])).mean()) * 100, 1) if len(_sg) else None
+        # Re-centered sign accuracy: subtract a CAUSAL trailing-median offset
+        # (no lookahead) before reading the sign. The raw score carries a
+        # persistent bias that tanks sign_acc; this isolates whether the bias
+        # (fixable by re-centering) or the information is the problem. Also
+        # report the DRIFT NULL (always-pick-the-majority-move) — the re-centered
+        # sign must BEAT this to claim real directional skill. See _recenter_offset.
+        _scs = pd.Series(sc, dtype=float)
+        _off = _scs.rolling(_RECENTER_WINDOW_ROWS, min_periods=20).median().shift(1).fillna(0.0)
+        _rc  = (_scs - _off).values
+        _rg2 = pd.DataFrame({"s": _rc, "f": fwd72}).dropna()
+        _rg2 = _rg2[_rg2["s"] != 0]
+        sign_acc_rc = round(float((np.sign(_rg2["s"]) == np.sign(_rg2["f"])).mean()) * 100, 1) if len(_rg2) else None
+        _fv = _sg["f"]
+        drift_null = round(float(max((_fv > 0).mean(), (_fv < 0).mean())) * 100, 1) if len(_sg) else None
         return {
             "n": n_fwd,
-            "score_vs_fwd72":   full,                 # forecast power
+            "score_vs_fwd72":   full,                 # forecast power (rank)
             "score_vs_trail24": _rho(sc, trail24),    # how momentum-like
             "trail24_vs_fwd72": _rho(trail24, fwd72), # momentum baseline's own edge
             "early_fwd": early, "late_fwd": late,     # regime-robustness
+            "sign_acc": sign_acc, "n_sign": int(len(_sg)),  # level calibration
+            "sign_acc_rc": sign_acc_rc,               # de-biased (causal re-center)
+            "drift_null": drift_null,                 # beat-this null for sign skill
         }
     except Exception:
         return None
@@ -1251,6 +1432,21 @@ _CLAUDE_SYSTEM_PROMPT = """You are an expert Bitcoin trading analyst embedded in
 ## ENGINE ARCHITECTURE
 Two parallel engines: **72h bias** (24–72h horizon, score ±100, 16 signals) and **24h bias** (intraday, score ±100, 13 signals). Both use ADX-based regime switching (TREND / RANGE / TRANSITION) which dynamically shifts signal weights. The actual current weights (post-regime, post-decay) are shown next to each signal in the data — trust those numbers, not generic priors.
 
+## CALIBRATE AGAINST THE MEASURED TRACK RECORD (read this before trusting the score)
+The payload contains an `ENGINE TRACK RECORD` block with THIS engine's measured skill on its own resolved signals. It overrides the architecture's optimism — the weights above describe *intent*, the track record describes *realised performance*. Apply it as a hard governor on confidence and size:
+- **Forward IC is the master number.** It is Spearman corr(score → realised +72h return). The 72h score is NOT guaranteed to be forward-looking — it is measured each run.
+  - Forward IC ≥ 0.15 → the score has genuine predictive edge; you may treat its magnitude as forecast strength and let HIGH confidence stand when other rules allow.
+  - Forward IC 0.05–0.15 → marginal; cap confidence at MEDIUM and prefer structure (liq clusters, Polymarket, invalidation) over score magnitude.
+  - Forward IC < 0.05 (or "coincident momentum mirror") → the score mostly **echoes the last 24h of price** and adds little over raw momentum. Do NOT read a high |score| as a strong forecast. Cap confidence at MEDIUM (LOW if it also fails to beat the momentum/baseline lines), and say so plainly in the defensibility step. A big bullish score after a big up-move is the engine describing the past, not predicting the future.
+- **Expectancy / excess-vs-drift with CIs that span 0 → no demonstrated edge.** Treat the direction as a coin-flip-plus-structure read; lean on R:R and invalidation, not conviction.
+- **All-one-direction track record (n_long=0 or n_short=0)** → the engine equals a constant always-long/short rule; its winrate is drift, not skill. Discount the headline winrate accordingly.
+- **Brier skill ≤ 0** → bull_prob is miscalibrated; don't quote it as a probability in the win-rate step.
+- **Engine ≤ baseline (EMA+OI)** → the extra signals aren't adding episode-level edge; don't over-credit the Tier-3/4 machinery.
+When the track record and the live score disagree about how confident to be, the track record wins. State the governing number in the defensibility line (e.g. "forward IC +0.04 → score is coincident, capping at MEDIUM").
+
+## META-MODEL SECOND OPINION
+The payload may include a `META-MODEL SECOND OPINION` P(up). It is an independent LogReg cross-check, NOT part of the engine score and it never overrides it. Use it only as a tie-breaker / disagreement flag: if it diverges sharply from the 72h direction, note the conflict and shade confidence down one notch; if it confirms, you may note the agreement but do not inflate size on it alone.
+
 ## 72h SIGNAL HIERARCHY (BASE weights — TREND/RANGE shift them, then horizon-decay applies)
 
 **Tier 1 — Structural anchors:**
@@ -1387,6 +1583,70 @@ Reduce one band if `liq_map_source` = orderbook_proxy AND liq-cluster signals ar
 Under 500 words total."""
 
 
+def _format_track_record_for_claude(M: "dict | None",
+                                    bcmp: "dict | None",
+                                    fdiag: "dict | None") -> str:
+    """Compact, honest summary of the engine's MEASURED skill for the plugin to
+    calibrate against. Leads with forward IC (the forecast-vs-coincident
+    finding) because that decides how much the headline 72h score is worth as a
+    *prediction* versus a coincident momentum echo. All values are already
+    None-gated by the metrics layer; we just narrate them."""
+    M = M or {}; bcmp = bcmp or {}; fdiag = fdiag or {}
+    if M.get("n_signals", 0) == 0:
+        return ("(No resolved track record yet — the scorecard builds once "
+                "signals age ≥72h. Treat the engine as UNVALIDATED: cap "
+                "confidence at MEDIUM and lean on liquidation structure + "
+                "Polymarket + invalidation, not the raw score magnitude.)")
+    L = []
+    # 1) Forward IC — the decisive forecast-vs-coincident numbers
+    ic   = fdiag.get("score_vs_fwd72")
+    coin = fdiag.get("score_vs_trail24")
+    mom  = fdiag.get("trail24_vs_fwd72")
+    if ic is not None:
+        if   ic >= 0.15: _v = "genuine forward edge"
+        elif ic < 0.05:  _v = "WEAK/NO forward edge — the score is largely a COINCIDENT momentum mirror, not a predictor"
+        else:            _v = "marginal forward edge"
+        L.append(f"Forward IC (score → +72h return, Spearman, n={fdiag.get('n')}): {ic:+.2f} — {_v}.")
+        if coin is not None or mom is not None:
+            L.append(f"  · score↔trailing-24h momentum: {coin:+.2f} (high ⇒ score mostly echoes recent price); "
+                     f"raw-momentum's own forward IC: {mom:+.2f} (beat THIS to add value).")
+        _e, _l = fdiag.get("early_fwd"), fdiag.get("late_fwd")
+        if _e is not None and _l is not None:
+            L.append(f"  · regime-split forward IC: early {_e:+.2f} / late {_l:+.2f} "
+                     f"(sign flip ⇒ the 'edge' is regime-confounded, not real).")
+    else:
+        L.append("Forward IC: still accumulating (<250 forward points) — the score's predictive value is UNPROVEN; do not treat magnitude as forecast strength.")
+    # 2) Expectancy + excess over the drift baseline (the money metrics)
+    _exp = M.get("expectancy"); _eci = M.get("expectancy_ci") or (None, None)
+    if _exp is not None:
+        _span = " — CI spans 0, not distinguishable from zero" if (_eci[0] is not None and _eci[0] <= 0 <= _eci[1]) else ""
+        L.append(f"Expectancy: {_exp:+.2f}% mean signed return per episode (95% CI {_eci[0]}…{_eci[1]}){_span}.")
+    if M.get("n_long", 0) and M.get("n_short", 0):
+        _x = M.get("excess_vs_short"); _xci = M.get("excess_ci") or (None, None)
+        L.append(f"Excess vs always-short drift baseline: {_x:+.1f}% (95% CI {_xci[0]}…{_xci[1]}).")
+    else:
+        _const = "SHORT" if M.get("n_long", 0) == 0 else "LONG"
+        L.append(f"All resolved episodes were {_const} — the engine is mathematically a constant "
+                 f"always-{_const.lower()} rule so far; winrate measures drift, NOT skill.")
+    # 3) Winrate vs the correct (drift) null
+    _drift_side = "short" if M.get("n_short", 0) >= M.get("n_long", 0) else "long"
+    L.append(f"Episode winrate {M.get('episode_winrate')}% ({M.get('n_ep_wins')}/{M.get('n_episodes')} eps); "
+             f"tick winrate {M.get('tick_winrate')}% vs always-{_drift_side} drift null {M.get('drift_null_wr')}% "
+             f"→ edge {M.get('edge_vs_drift_pp')}pp over drift.")
+    # 4) Probabilistic calibration
+    if M.get("brier_skill") is not None:
+        L.append(f"Brier skill (bull_prob vs base rate, n={M.get('n_bull_prob')}): {M['brier_skill']:+.2f} "
+                 f"(>0 ⇒ probabilities beat the base rate; ≤0 ⇒ bull_prob is miscalibrated).")
+    # 5) Vs the 2-signal baseline
+    if bcmp.get("ready"):
+        _bd = (M.get("episode_winrate") or 0) - (bcmp.get("ep_winrate") or 0)
+        L.append(f"Engine vs 2-signal EMA+OI baseline: {_bd:+.0f}pp over {bcmp.get('n_episodes')} eps "
+                 f"(≤0 ⇒ the 28 extra signals add no episode-level edge).")
+    if M.get("verdict"):
+        L.append(f"Scorecard verdict: {M['verdict']}")
+    return "\n".join(L)
+
+
 def _call_claude_interpretation(
     price: float,
     bias_score: float,
@@ -1433,6 +1693,10 @@ def _call_claude_interpretation(
     liq_ask_clusters: "list | None" = None,
     hunt_zones: "list | None" = None,
     cascade_direction: str = "N/A",
+    # Measured engine skill (forward IC, expectancy, drift/baseline, Brier)
+    track_record: str = "N/A",
+    # Independent meta-model second opinion: P(up) in [0,1], or None
+    meta_pup: "float | None" = None,
 ) -> str:
     """Call Claude with full system prompt to interpret all dashboard signals."""
     weights = signal_weights or {}
@@ -1520,6 +1784,13 @@ def _call_claude_interpretation(
             pass
     _hz_block = "\n".join(_hz_lines) if _hz_lines else "  (no active hunt zones)"
 
+    if isinstance(meta_pup, (int, float)):
+        _meta_line = (f"{meta_pup*100:.0f}% P(up) — independent LogReg second opinion trained on "
+                      f"resolved engine outputs. Informational cross-check only; it NEVER overrides "
+                      f"the engine score. Flag it when it disagrees sharply with the 72h direction.")
+    else:
+        _meta_line = "N/A (model not yet trained — needs more resolved rows)."
+
     user_msg = f"""=== MACRO CONTEXT ===
 BTC Price: ${price:,.0f}
 Fear & Greed: {fear_greed}
@@ -1539,6 +1810,10 @@ Strongest bullish cycle inputs:
 Strongest bearish cycle inputs:
 {_cyc_neg_block}
 
+=== ENGINE TRACK RECORD — CALIBRATE YOUR CONFIDENCE AGAINST THIS ===
+Measured skill of THIS engine on its own resolved signals (not priors). Read this BEFORE you weigh the score below.
+{track_record}
+
 === 72h DIRECTIONAL BIAS: {bias_score:+.0f}/100 ({bias_label}) ===
 Signal breakdown (weight → influence on composite score):
 {chr(10).join(signal_lines) or "  (no signal data)"}
@@ -1546,6 +1821,9 @@ Signal breakdown (weight → influence on composite score):
 === 24h DIRECTIONAL BIAS: {bias_24h_score:+.0f}/100 ({bias_24h_label}) · regime: {bias_24h_regime} ===
 Intraday engine — separate from 72h. Use to confirm/contradict 72h direction and set entry timing.
 {chr(10).join(sig24_lines) or "  (no signal data)"}
+
+=== META-MODEL SECOND OPINION ===
+{_meta_line}
 
 === POLYMARKET CROWD THESIS: {pm_thesis:+.2f}/10 ({pm_label}) ===
 Real money at risk — treat as highest-conviction external signal.
@@ -1925,7 +2203,9 @@ def fetch_polymarket_btc_sentiment(current_price: float) -> dict:
             elif hours_left is not None and hours_left <= 720:
                 w, rat = 1, "Monthly price range — marginal relevance to 72h"
             elif hours_left is not None and hours_left > 720:
-                return None  # exclude markets resolving >30 days out
+                # Captured for the long-term public-opinion summary; the horizon
+                # multiplier keeps it ~0 in the 72h/24h trading signal.
+                w, rat = 1, "Long-term price range (>30d) — sentiment context only"
             else:
                 w, rat = 1, "Price range — unknown horizon"
             return {
@@ -2130,6 +2410,58 @@ def fetch_polymarket_btc_sentiment(current_price: float) -> dict:
             "target_price":     tprice,
             "liquidity":        liq,
             "hours_left":       round(hl, 1) if hl is not None else None,
+        }
+
+    def _macro_entry(evt_name, sub_mkts, evt_liq, evt_hours):
+        """Build a NON-directional 'macro / structural' market entry for display.
+
+        These are BTC event-risk markets (reserves, Satoshi, quantum, dominance,
+        outperform-gold, corporate events) that aren't price-direction bets. They
+        never enter scored_markets, the thesis, or public_opinion — purely an
+        informational panel. Returns a dict with the top outcomes by probability,
+        or None if nothing parseable."""
+        opts = []   # (label, prob)
+        if len(sub_mkts) == 1 and len(sub_mkts[0]["outcomes"]) == 2:
+            sm = sub_mkts[0]
+            _yi = 0
+            for _i, _o in enumerate(sm["outcomes"]):
+                if str(_o).lower() in ("yes", "true"):
+                    _yi = _i; break
+            opts = [("Yes", sm["probs"][_yi]), ("No", sm["probs"][1 - _yi])]
+        elif len(sub_mkts) == 1:
+            opts = [(str(_o), _p) for _o, _p in zip(sub_mkts[0]["outcomes"], sub_mkts[0]["probs"])]
+        else:
+            # date-ladder / multi-condition: each sub-market's YES prob. If the
+            # sub-markets differ by resolution DATE (a "by ___?" ladder), label
+            # by that date; otherwise fall back to the (shortened) sub-question.
+            from datetime import timedelta as _td
+            _hls = [s.get("hours_left") for s in sub_mkts if s.get("hours_left") is not None]
+            _is_date_ladder = len(_hls) >= 2 and len(set(_hls)) > 1
+            for sm in sub_mkts:
+                _yi = 0
+                for _i, _o in enumerate(sm["outcomes"]):
+                    if str(_o).lower() in ("yes", "true"):
+                        _yi = _i; break
+                _hl = sm.get("hours_left")
+                if _is_date_ladder and _hl is not None:
+                    _end = now + _td(hours=_hl)
+                    _lbl = _end.strftime("By %b %d" if _hl <= 72 * 24 else "By %b %Y")
+                else:
+                    _lbl = (sm["question"] or evt_name).strip()
+                opts.append((_lbl, sm["probs"][_yi]))
+        opts = [(l, p) for l, p in opts if p is not None]
+        if not opts:
+            return None
+        opts.sort(key=lambda x: x[1], reverse=True)
+        # Keep ALL outcomes (capped generously) so the displayed options are
+        # complete — for a partition market (e.g. "best month": 12 options) the
+        # shown probs then sum to ~100%. (Cumulative "by date" ladders and
+        # independent multi-condition events legitimately won't sum to 100%.)
+        return {
+            "question":   evt_name,
+            "options":    opts[:16],
+            "liquidity":  evt_liq,
+            "hours_left": round(evt_hours, 1) if evt_hours is not None else None,
         }
 
     try:
@@ -2590,11 +2922,15 @@ def fetch_polymarket_btc_sentiment(current_price: float) -> dict:
                             reverse=True
                         )
 
-                    if bull_dir and bear_hits:
-                        summary = f"↑{p_bull:.0%} above vs ↓{p_bear:.0%} below"
-                    elif bull_dir:
+                    if bull_dir:
+                        # The score above came from the NEAREST-RESISTANCE method,
+                        # so the summary must reflect that — not a sum of year-long
+                        # touch probabilities, which for a multi-level market
+                        # exceeds 100% on BOTH sides and reads as the opposite
+                        # direction of the score. Keeps display == score logic.
                         _near_t2, _near_p2 = min(bull_dir, key=lambda x: x[0])
-                        summary = f"Nearest resistance ${_near_t2:,.0f}: {_near_p2:.0%}"
+                        _pct2 = (_near_t2 - current_price) / current_price
+                        summary = f"Nearest upside ${_near_t2:,.0f} (+{_pct2:.0%}): {_near_p2:.0%} touch"
                     elif bull_floor:
                         summary = f"Floor support only"
                     else:
@@ -2625,18 +2961,24 @@ def fetch_polymarket_btc_sentiment(current_price: float) -> dict:
         #             are forward of the window → discounted.
 
         def _horizon_mul(hl, window):
-            """Return weight multiplier for a market given hours_left and target window."""
+            """Return weight multiplier for a market given hours_left and target window.
+
+            Long-dated (>30d) markets are now CAPTURED for the public-opinion
+            display, but they must barely touch the trading signal — so they get
+            a near-zero multiplier here. Everything <=30d is unchanged."""
             if hl is None:
-                return 0.5
+                return 0.05                  # undated → treat as long-horizon macro
             if window == 24:
                 if hl <= 24:   return 1.5   # primary window
                 if hl <= 48:   return 0.6
-                return 0.15                  # too far out for 24h
+                if hl <= 720:  return 0.15   # forward of the 24h window
+                return 0.02                  # >30d: display only, ~0 in signal
             else:  # 72h
                 if hl <= 24:   return 0.2   # resolves before half the window
                 if hl <= 72:   return 1.5   # sweet spot
                 if hl <= 168:  return 1.0   # still relevant
-                return 0.2                   # too far out for 72h
+                if hl <= 720:  return 0.2    # this month — marginal
+                return 0.03                  # >30d: display only, ~0 in signal
 
         def _aggregate(markets, window):
             ws = sum(m["weight"] * _horizon_mul(m.get("hours_left"), window) for m in markets)
@@ -2656,6 +2998,114 @@ def fetch_polymarket_btc_sentiment(current_price: float) -> dict:
         thesis_score24, conf24,    _  = _aggregate(scored_markets, 24)
         signal    = thesis_score   / 10.0
         signal_24 = thesis_score24 / 10.0
+
+        # ── Public-opinion summary, bucketed by horizon ─────────────────────────
+        # Independent of the trading signal: this reads what the crowd thinks
+        # across ALL horizons (incl. the long-dated markets the 72h engine zeroes
+        # out), weighted by real money (liquidity) rather than the trading-horizon
+        # weights. Gives a "near term / this month / big picture" sentiment read.
+        def _opinion_bucket(hl):
+            if hl is None:       return "long"   # undated BTC markets are macro
+            if hl <= 72:         return "near"
+            if hl <= 720:        return "mid"
+            return "long"
+
+        def _opinion(markets):
+            # Liquidity-weighted mean score (with a $1k floor so a thin market
+            # still counts a little).
+            tw = sum(max(m.get("liquidity") or 0, 1000) for m in markets)
+            if not markets or tw <= 0:
+                return None
+            sc = sum(m["individual_score"] * max(m.get("liquidity") or 0, 1000)
+                     for m in markets) / tw
+            # Bull/bear split from the aggregate directional INTENSITY (score in
+            # -10..+10 → 0..100%), NOT a market count. Otherwise a single
+            # moderately-bullish market reads a misleading "100% bull" instead of
+            # its actual lean (e.g. +5.2 → 76% bull).
+            bull = max(0.0, min(1.0, (sc + 10.0) / 20.0))
+            bear = 1.0 - bull
+            if   sc >=  3.0: lbl = "BULLISH"
+            elif sc >=  1.0: lbl = "Leaning bullish"
+            elif sc >  -1.0: lbl = "Split / neutral"
+            elif sc >  -3.0: lbl = "Leaning bearish"
+            else:            lbl = "BEARISH"
+            return {
+                "score":  round(sc, 2), "label": lbl,
+                "bull_pct": round(bull * 100), "bear_pct": round(bear * 100),
+                "n": len(markets), "liq": round(tw),
+            }
+
+        # "When will" / context-only markets carry weight 0; exclude them from the
+        # directional opinion read (they're informational timeframe ladders).
+        _op_src = [m for m in scored_markets if m.get("weight", 0) > 0]
+        public_opinion = {
+            "near": _opinion([m for m in _op_src if _opinion_bucket(m.get("hours_left")) == "near"]),
+            "mid":  _opinion([m for m in _op_src if _opinion_bucket(m.get("hours_left")) == "mid"]),
+            "long": _opinion([m for m in _op_src if _opinion_bucket(m.get("hours_left")) == "long"]),
+        }
+
+        # ── Macro / structural markets (non-directional, display only) ──────────
+        # Qualifying BTC events that produced NO directional price market —
+        # reserves, Satoshi, quantum, dominance, outperform-gold, corporate
+        # events. Captured for a separate informational panel; never scored.
+        _scored_names = {m["question"] for m in scored_markets}
+        _dir_title_kw = ("up or down", "price on", "price range", "what price",
+                         "when will", "between $", "above $")
+        macro_markets = []
+        for ev in events:
+            try:
+                _mt = (ev.get("title") or "").strip()
+                if not _mt or _mt in _scored_names:
+                    continue
+                _mtl = _mt.lower()
+                # Skip price-directional shapes: if they produced nothing it was a
+                # deliberate skip (expired / thin / sub-threshold), not a macro mkt.
+                if any(_k in _mtl for _k in _dir_title_kw):
+                    continue
+                if re.search(r'\babove\b.*\bon\b', _mtl):   # "Bitcoin above ___ on <date>"
+                    continue
+                # BTC-relevance gate: some generic multi-entity markets (e.g.
+                # "Which companies announce bankruptcy?") are bitcoin-tagged but
+                # mostly non-crypto noise. Require a BTC reference in the title;
+                # MicroStrategy/STRC are kept as recognised BTC proxies.
+                if not any(_k in _mtl for _k in
+                           ("bitcoin", "btc", "satoshi", "microstrategy", "mstr", "strc")):
+                    continue
+                _msub = []
+                for _m in _parse_list(ev.get("markets", [])):
+                    if not isinstance(_m, dict):
+                        continue
+                    _mo = _parse_list(_m.get("outcomes"))
+                    _mp = _parse_list(_m.get("outcomePrices"))
+                    _ml = float(_m.get("liquidityNum") or _m.get("liquidity") or 0)
+                    # No liquidity gate here (unlike the directional path): this
+                    # is a display-only panel and dropping thin sub-markets would
+                    # hide options, making a partition market not sum to ~100%.
+                    if len(_mo) < 2 or len(_mp) < 2:
+                        continue
+                    _mhl = None
+                    _me  = _m.get("endDateIso") or _m.get("endDate") or ""
+                    if _me:
+                        try:
+                            _men = (_me + "T23:59:59+00:00") if "T" not in _me else _me.replace("Z", "+00:00")
+                            _mhl = (datetime.fromisoformat(_men) - now).total_seconds() / 3600
+                            if _mhl < 0:
+                                continue
+                        except Exception:
+                            pass
+                    _msub.append({"question": (_m.get("question") or "").strip(),
+                                  "outcomes": _mo, "probs": [float(p) for p in _mp],
+                                  "liquidity": _ml, "hours_left": _mhl})
+                if not _msub:
+                    continue
+                _mhls = [s["hours_left"] for s in _msub if s["hours_left"] is not None]
+                _ment = _macro_entry(_mt, _msub, sum(s["liquidity"] for s in _msub),
+                                     min(_mhls) if _mhls else None)
+                if _ment:
+                    macro_markets.append(_ment)
+            except Exception:
+                continue
+        macro_markets.sort(key=lambda m: m["liquidity"], reverse=True)
 
         total_weight = sum(m["weight"] for m in scored_markets)
         weighted_agreement = confidence * total_weight  # approximate for legacy compat
@@ -2678,6 +3128,8 @@ def fetch_polymarket_btc_sentiment(current_price: float) -> dict:
             "markets":      scored_markets,
             "thesis_score": round(thesis_score, 2),
             "thesis_label": thesis_label,
+            "public_opinion": public_opinion,
+            "macro_markets": macro_markets,
             "detail":       (f"72h Thesis: {thesis_label} ({thesis_score:+.2f}/10) "
                              f"| {n} mkts, {confidence:.0%} agree"),
         })
@@ -3768,12 +4220,26 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
     except Exception:
         _adx_1h = float("nan")
     _adx_ok = not np.isnan(_adx_1h)
-    if _adx_ok and _adx_1h > 28:
-        regime = "trend"
-    elif _adx_ok and _adx_1h < 18:
-        regime = "range"
+    # CONTINUOUS regime membership — the old hard cutoffs at ADX 18/28 swapped the
+    # ENTIRE weight vector the instant ADX ticked across a boundary (EMA Structure
+    # alone jumps 28%→10% trend→range), moving the score 20–40 points with no price
+    # change. Instead, build a partition-of-unity over ADX so weights blend smoothly
+    # across the boundaries (each ramp spans an 8-point ADX band):
+    #   range  membership: 1 at ADX≤14 → 0 at ADX≥22
+    #   trend  membership: 0 at ADX≤24 → 1 at ADX≥32
+    #   transition: whatever is left (pure transition ~ADX 22–24)
+    # The ramps never overlap, so the three always sum to 1.
+    if _adx_ok:
+        _w_range_r = float(np.clip((22.0 - _adx_1h) / 8.0, 0.0, 1.0))
+        _w_trend_r = float(np.clip((_adx_1h - 24.0) / 8.0, 0.0, 1.0))
+        _w_trans_r = max(0.0, 1.0 - _w_range_r - _w_trend_r)
     else:
-        regime = "transition"
+        # ADX unavailable → behave like the old fallback: pure transition.
+        _w_range_r, _w_trend_r, _w_trans_r = 0.0, 0.0, 1.0
+    _regime_mix = {"range": _w_range_r, "transition": _w_trans_r, "trend": _w_trend_r}
+    # Discrete label kept for display / logging / downstream regime checks:
+    # the dominant membership. Scoring uses the blended weights, not this label.
+    regime = max(_regime_mix, key=_regime_mix.get)
 
     # ── Volatility conditioning via ATR percentile on daily candles ───────────
     # ATR percentile > 70 → high vol → dampen mean-reversion signals
@@ -3914,7 +4380,15 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
         "Options PC OI":        0.005,
         "Options Term":         0.010,
     }
-    WEIGHTS = {"trend": _W_TREND, "range": _W_RANGE, "transition": _W_BASE}[regime]
+    # Blend the three weight tables by ADX membership instead of hard-selecting
+    # one. At a regime boundary this ramps weights over an 8-point ADX band
+    # rather than snapping them, which removes the no-price-change score cliffs.
+    # Pure-regime ADX values reproduce the old single-table weights exactly.
+    _W_TABLES = {"trend": _W_TREND, "range": _W_RANGE, "transition": _W_BASE}
+    WEIGHTS = {
+        _k: sum(_regime_mix[_rname] * _tbl[_k] for _rname, _tbl in _W_TABLES.items())
+        for _k in _W_BASE
+    }
 
     # ── Horizon-decay: microstructure signals decay fast vs 72h target ────────
     # Order book, cascade, and hunt zones have effective horizons of hours–1 day.
@@ -4315,16 +4789,23 @@ def compute_72h_bias(df: pd.DataFrame, liq: dict,
         bull_x   = e20_now > e50_now and e20_prev <= e50_prev
         bear_x   = e20_now < e50_now and e20_prev >= e50_prev
         e20_slope = (e20_now - float(ema20.iloc[-3])) / e20_now * 100 if len(ema20) >= 3 else 0
-        if   bull_x:            raw, note = +1.0, f"EMA20/50 bull cross [{_tf_label}] ({e20_now:,.0f} vs {e50_now:,.0f})"
-        elif bear_x:            raw, note = -1.0, f"EMA20/50 bear cross [{_tf_label}] ({e20_now:,.0f} vs {e50_now:,.0f})"
-        elif e20_now > e50_now:
-            bonus = min(0.4, abs(e20_slope) * 20)
-            raw   = min(1.0, 0.5 + bonus)
-            note  = f"EMA20 above EMA50 [{_tf_label}], slope {e20_slope:+.3f}%/bar"
-        else:
-            bonus = min(0.4, abs(e20_slope) * 20)
-            raw   = max(-1.0, -0.5 - bonus)
-            note  = f"EMA20 below EMA50 [{_tf_label}], slope {e20_slope:+.3f}%/bar"
+        # CONTINUOUS structural read — the old logic floored this at ±0.5 the
+        # instant EMA20 crossed EMA50 and slammed to ±1.0 on a fresh cross, so a
+        # tiny price wiggle through the cross point produced a ~1.5 step in a
+        # 20–28%-weight signal → the 40-point cliffs seen on the chart. Instead,
+        # read the signed EMA separation through a tanh: it glides smoothly
+        # through zero as the EMAs converge/diverge (no sign-flip discontinuity),
+        # and sits near 0 in chop (gap≈0) instead of a misleading ±0.5.
+        #   gap ±1.3% → ±0.76 ; saturates by ~±2.6%.
+        _gap = (e20_now - e50_now) / e50_now * 100 if e50_now else 0.0
+        raw  = float(np.tanh(_gap / 1.3))
+        # Small continuous slope nudge (lead), capped so it can't dominate the
+        # structural separation read.
+        raw  = float(np.clip(raw + float(np.clip(e20_slope * 8.0, -0.15, 0.15)), -1.0, 1.0))
+        if   bull_x:           note = f"EMA20/50 bull cross [{_tf_label}] (gap {_gap:+.2f}%, raw {raw:+.2f})"
+        elif bear_x:           note = f"EMA20/50 bear cross [{_tf_label}] (gap {_gap:+.2f}%, raw {raw:+.2f})"
+        elif e20_now > e50_now: note = f"EMA20 above EMA50 [{_tf_label}], gap {_gap:+.2f}%, slope {e20_slope:+.3f}%/bar (raw {raw:+.2f})"
+        else:                   note = f"EMA20 below EMA50 [{_tf_label}], gap {_gap:+.2f}%, slope {e20_slope:+.3f}%/bar (raw {raw:+.2f})"
     except Exception:
         raw, note = 0.0, "EMA N/A"
     signals["EMA Structure"] = (raw, note)
@@ -8746,7 +9227,11 @@ def fig_obv_expanded(a: dict) -> plt.Figure:
     ax1.set_title("On-Balance Volume (OBV)  ·  Accumulation / Distribution flow", color="#8b949e", fontsize=9, loc="left", pad=4)
     ax1.set_ylabel("OBV (cumulative)", color="#8b949e", fontsize=8)
     ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v/1e9:,.1f}B"))
-    ax1.legend(fontsize=7, facecolor="#161b22", labelcolor="#c9d1d9", loc="lower right", framealpha=0.85)
+    # Legend OUTSIDE the panel (top-right, horizontal) so it never covers the OBV
+    # line — which is densest on the right (most recent bars). Title is top-left,
+    # so they don't collide.
+    ax1.legend(fontsize=7, facecolor="#161b22", labelcolor="#c9d1d9", framealpha=0.85,
+               ncol=2, loc="lower right", bbox_to_anchor=(1.0, 1.0), borderaxespad=0.1)
     _add_price_panel(axp, plot_df, price)
     plt.tight_layout(pad=0.5)
     return fig
@@ -9462,6 +9947,8 @@ _chg24_chip = (
 # its P(up) beside the gauge — purely informational, never replaces engine score.
 # Cached in session_state so disk load happens once per session, not per rerun.
 _meta_chip = ""
+_meta_pup = None   # meta-model P(up) [0..1]; stays None if model not loaded/trained
+_meta_pct = None
 if _meta_model is not None:
     _meta_loaded = st.session_state.get("_meta_model_loaded", "unset")
     if _meta_loaded == "unset":
@@ -10083,6 +10570,8 @@ _pm_thesis    = poly_sentiment.get("thesis_score", 0.0)
 _pm_thlabel   = poly_sentiment.get("thesis_label", "NEUTRAL")
 _pm_conf      = poly_sentiment.get("confidence", 0.0)
 _pm_detail    = poly_sentiment.get("detail", "N/A")
+_pm_opinion   = poly_sentiment.get("public_opinion", {}) or {}
+_pm_macro     = poly_sentiment.get("macro_markets", []) or []
 _pm_color     = ("#3fb950" if _pm_thesis >= 1.0 else
                  "#f85149" if _pm_thesis <= -1.0 else "#8b949e")
 
@@ -10140,6 +10629,35 @@ def _pm_card_updown(mk):
         f'{bar}'
         f'<div style="font-size:9px; color:#484f58;">{exp} · {liq} · {_pm_q_safe(mk["rationale"])}{ref_html}</div>'
         f'</div>'
+    )
+
+def _pm_card_macro(mk):
+    """Compact informational card for a non-directional macro/structural market.
+    Shows the top outcomes by probability — no score, no bull/bear colouring."""
+    exp = (f"{mk['hours_left']/24:.0f}d" if mk.get("hours_left") and mk["hours_left"] >= 48
+           else (f"{mk['hours_left']:.0f}h" if mk.get("hours_left") else "—"))
+    liq = f"&#36;{mk['liquidity']/1000:.0f}k" if mk.get("liquidity") else ""
+    rows = ""
+    for _lbl, _p in mk.get("options", []):
+        _pct = round(_p * 100)
+        _disp = _lbl if len(_lbl) <= 38 else _lbl[:36] + "…"
+        rows += (
+            f'<div style="display:flex; align-items:center; gap:8px; margin:3px 0;">'
+            f'<div style="font-size:10px; color:#8b949e; width:160px; white-space:nowrap;'
+            f' overflow:hidden; text-overflow:ellipsis;">{_pm_q_safe(_disp)}</div>'
+            f'<div style="flex:1; background:#21262d; border-radius:3px; height:8px;">'
+            f'<div style="width:{_pct}%; height:100%; background:#6e7681; border-radius:3px;"></div>'
+            f'</div>'
+            f'<div style="font-size:10px; color:#c9d1d9; width:30px; text-align:right;">{_pct}%</div>'
+            f'</div>'
+        )
+    return (
+        f'<div style="background:#0d1117; border:1px solid #30363d; border-radius:8px;'
+        f' padding:9px 13px; margin-bottom:7px;">'
+        f'<div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:4px;">'
+        f'<div style="font-size:11.5px; color:#adbac7; font-weight:600; line-height:1.35; max-width:80%;">{_pm_q_safe(mk["question"])}</div>'
+        f'<div style="font-size:9px; color:#484f58; white-space:nowrap;">{exp} · {liq}</div>'
+        f'</div>{rows}</div>'
     )
 
 def _pm_card_yesno(mk):
@@ -10350,6 +10868,23 @@ if _ai_interp_key and not _public_mode():
 
     if _ask_claude or st.session_state.get("_claude_interp"):
         if _ask_claude:
+            # ── Build the measured-skill summary so Claude calibrates its
+            # confidence against the engine's real forward IC / expectancy
+            # rather than its priors. Reuse the prior rerun's resolved rows
+            # (cached in session_state) so this doesn't re-hit the network;
+            # evaluate/baseline/forecast are all @st.cache_data-memoised.
+            _track_record = "N/A"
+            try:
+                _tr_rows = st.session_state.get("_sig_rows_last")
+                if _tr_rows is None:
+                    _tr_rows = _resolve_signal_outcomes(price)
+                _tr_bt    = _filter_bt_rows(_tr_rows)
+                _tr_M     = _bt_metrics.evaluate(_tr_bt) if _bt_metrics else {}
+                _tr_bcmp  = _bt_metrics.baseline_comparison(_tr_bt) if _bt_metrics else {}
+                _tr_fdiag = _forecast_diagnostic(_tr_rows)
+                _track_record = _format_track_record_for_claude(_tr_M, _tr_bcmp, _tr_fdiag)
+            except Exception as _e:
+                _track_record = f"(track record unavailable: {_e})"
             with st.spinner("Claude is reading the dashboard…"):
                 _interp_text = _call_claude_interpretation(
                     price        = price,
@@ -10398,6 +10933,9 @@ if _ai_interp_key and not _public_mode():
                     liq_ask_clusters  = (btc_liq or {}).get("liq_ask_clusters"),
                     hunt_zones        = (btc_liq or {}).get("hunt_zones"),
                     cascade_direction = str((btc_liq or {}).get("cascade_direction", "N/A")),
+                    # Measured engine skill + independent meta-model opinion
+                    track_record      = _track_record,
+                    meta_pup          = _meta_pup,
                 )
             st.session_state["_claude_interp"]  = _interp_text
             st.session_state["_ai_calls_used"] = _ai_calls_used + 1
@@ -10460,6 +10998,55 @@ with st.expander(
 </div>
 """, unsafe_allow_html=True)
 
+        # ── Public-opinion summary by horizon (near / this month / long term) ──
+        # Liquidity-weighted crowd read across ALL horizons — independent of the
+        # trading-weighted thesis above. Answers "what does the money think over
+        # the next few days vs this month vs the big picture?"
+        def _op_card(title, sub, op):
+            if not op:
+                return (f'<div style="flex:1; background:#161b22; border:1px solid #30363d;'
+                        f' border-radius:8px; padding:10px 12px; text-align:center;">'
+                        f'<div style="font-size:11px; color:#8b949e; font-weight:600;">{title}</div>'
+                        f'<div style="font-size:9px; color:#484f58; margin:2px 0 6px;">{sub}</div>'
+                        f'<div style="font-size:12px; color:#6e7681; margin-top:8px;">no markets</div></div>')
+            _sc = op["score"]
+            _c  = "#3fb950" if _sc >= 1.0 else ("#f85149" if _sc <= -1.0 else "#8b949e")
+            _bull = op["bull_pct"]; _bear = op["bear_pct"]
+            _bar = (f'<div style="display:flex; height:6px; border-radius:3px; overflow:hidden; margin:7px 0 5px;">'
+                    f'<div style="width:{_bull}%; background:#3fb950;"></div>'
+                    f'<div style="width:{max(0,100-_bull-_bear)}%; background:#30363d;"></div>'
+                    f'<div style="width:{_bear}%; background:#f85149;"></div></div>')
+            return (f'<div style="flex:1; background:#161b22; border:1px solid #30363d;'
+                    f' border-left:3px solid {_c}; border-radius:8px; padding:10px 12px;">'
+                    f'<div style="display:flex; justify-content:space-between; align-items:baseline;">'
+                    f'<span style="font-size:11px; color:#e6edf3; font-weight:700;">{title}</span>'
+                    f'<span style="font-size:9px; color:#484f58;">{sub}</span></div>'
+                    f'<div style="font-size:13px; font-weight:800; color:{_c}; margin-top:4px;">{op["label"]}</div>'
+                    f'{_bar}'
+                    f'<div style="display:flex; justify-content:space-between; font-size:9px; color:#8b949e;">'
+                    f'<span style="color:#3fb950;">{_bull}% bull</span>'
+                    f'<span style="color:#484f58;">{op["n"]} mkts &middot; &#36;{op["liq"]/1000:.0f}k</span>'
+                    f'<span style="color:#f85149;">{_bear}% bear</span></div></div>')
+
+        if any(_pm_opinion.get(_k) for _k in ("near", "mid", "long")):
+            _macro_n = len(_pm_macro)
+            st.markdown(
+                '<div style="font-size:11px; color:#8b949e; font-weight:600; margin:2px 0 6px;">'
+                'PUBLIC OPINION BY HORIZON <span style="color:#484f58; font-weight:400;">'
+                '· liquidity-weighted lean of <b>price-direction</b> markets only</span></div>'
+                '<div style="display:flex; gap:8px; margin-bottom:6px;">'
+                + _op_card("Next 72h", "days", _pm_opinion.get("near"))
+                + _op_card("This month", "3–30d", _pm_opinion.get("mid"))
+                + _op_card("Long term", "30d+ / 2026+", _pm_opinion.get("long"))
+                + '</div>'
+                + (f'<div style="font-size:10px; color:#6e7681; margin-bottom:14px; line-height:1.5;">'
+                   f'Polymarket has few long-dated <i>price-direction</i> markets, so the long-term '
+                   f'card is thin. The {_macro_n} long-horizon <b>structural / event</b> markets '
+                   f'(Satoshi, reserve, China, dominance…) are shown in the panel below — they carry '
+                   f'real crowd sentiment but aren\'t a clean price up/down signal, so they\'re kept '
+                   f'out of this directional read.</div>' if _macro_n else ''),
+                unsafe_allow_html=True)
+
         # ── Chronological order: nearest expiry first, None/long-term last ──
         _sorted_mkts = sorted(
             _pm_mkts,
@@ -10504,17 +11091,37 @@ with st.expander(
             f"</div>",
             unsafe_allow_html=True)
 
+        # ── Macro / structural markets (non-directional) ───────────────────
+        # Event-risk BTC markets that aren't price-direction bets — shown for
+        # context, deliberately kept OUT of the thesis and horizon opinion.
+        if _pm_macro:
+            st.markdown(
+                '<div style="font-size:11px; color:#8b949e; font-weight:600; margin:16px 0 6px;">'
+                'MACRO / STRUCTURAL MARKETS '
+                '<span style="color:#484f58; font-weight:400;">· event risk, not in the directional read</span></div>',
+                unsafe_allow_html=True)
+            for _mm in _pm_macro[:12]:
+                st.markdown(_pm_card_macro(_mm), unsafe_allow_html=True)
+
 # ── Signal outcome logging + stability + accuracy ─────────────────
 
 # Resolve any outstanding signals and log current reading (max every 5 min)
 _sig_rows = _resolve_signal_outcomes(price)
+# Cache for the Claude plugin: it runs earlier in the page than this line, so
+# it reuses the previous rerun's rows instead of re-hitting the network.
+st.session_state["_sig_rows_last"] = _sig_rows
+# The headless scheduled task (log_signal.py, every 5 min) is now the SOLE
+# writer of signal_log. The app used to ALSO log here whenever a tab was open,
+# which (a) created duplicate rows and (b) made it look like opening the
+# dashboard "started" logging. Disabled 2026-06-21 so the dashboard is purely a
+# VIEW — logging is 100% independent of the browser/terminal. Flip to True only
+# if you ever want the app to log again as a fallback. See [[signal_log_two_writers]].
+_APP_WRITES_SIGNAL_LOG = False
 _now_ts   = _dt.now(_tz.utc).timestamp()
 _last_log = st.session_state.get("_last_log_ts", 0)
-if _now_ts - _last_log >= _LOG_INTERVAL:
-    # Log the raw (unsmoothed) score + label so values match what the
-    # headless cron writes — calibration must be environment-independent.
-    # Also pass bias_72h + poly_sentiment so per-signal and per-market
-    # detail rows are written for IC weighting / SHAP / velocity later.
+if _APP_WRITES_SIGNAL_LOG and _now_ts - _last_log >= _LOG_INTERVAL:
+    # _log_bias_signal applies a durable slew-rate limit anchored to the last
+    # Supabase row, plus per-signal/per-market detail rows for IC/SHAP later.
     _log_bias_signal(_b12_score_raw, bias_72h.get("label", _b12_label), price,
                      bias_72h=bias_72h, poly=poly_sentiment,
                      bias_24h=bias_24h)
@@ -10540,20 +11147,8 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
     # ── Backtest cutoff: only count rows from the current scoring engine. ──
     # Pre-cutoff rows came from an older engine (double-EMA bug) and would
     # poison the winrate. They still appear on the history chart below.
-    try:
-        _cutoff_dt = _dt.fromisoformat(_BACKTEST_CUTOFF_UTC_ISO)
-    except Exception:
-        _cutoff_dt = None
-
-    def _post_cutoff(_r):
-        if _cutoff_dt is None:
-            return True
-        try:
-            return _dt.fromisoformat(_r.get("ts", "")) >= _cutoff_dt
-        except Exception:
-            return False
-
-    _bt_rows = [r for r in _sig_rows if _post_cutoff(r)]
+    # Filter shared with the Claude plugin via _filter_bt_rows (module-level).
+    _bt_rows = _filter_bt_rows(_sig_rows)
 
     # Live log winrate: all logged signals (already filtered to |score| >= 40 at log time)
     _live_wins = sum(1 for r in _bt_rows if r.get("correct") in ("1", "2"))
@@ -10570,7 +11165,7 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
     # in/out. Pre-cutoff rows came from older scoring engines.
     _excluded    = sum(1 for r in _sig_rows
                        if r.get("correct") in ("0", "1", "2")
-                       and not _post_cutoff(r))
+                       and not _post_backtest_cutoff(r))
     if _live_n > 0:
         _live_note = f"{_live_n} trades resolved"
         if _excluded > 0:
@@ -10618,10 +11213,53 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
                 f'<div style="font-size:9px; color:#6e7681; margin-top:4px; line-height:1.35;">{sub}</div></div>')
 
     if _M.get("n_signals", 0) == 0:
-        st.markdown('<div style="background:#161b22; border:1px solid #30363d; '
-                    'border-radius:10px; padding:16px 22px; color:#8b949e; font-size:13px;">'
-                    'Scorecard builds once signals resolve (≥72h after logging).</div>',
-                    unsafe_allow_html=True)
+        # The win/loss scorecard needs resolved LONG/SHORT signals. When the
+        # engine's score sits inside the ±25 dead-zone it logs HOLD, which
+        # grades to N/A — so the scorecard can read empty for a long stretch
+        # even with hundreds of matured rows. Don't dead-end there: the score's
+        # SIGN and RANK skill are gradeable on those rows right now. Measure
+        # them on the CURRENT engine (post-cutoff) so the number reflects today.
+        _fdiag_cur = _forecast_diagnostic(_bt_rows)
+        if _fdiag_cur and (_fdiag_cur.get("sign_acc") is not None
+                           or _fdiag_cur.get("score_vs_fwd72") is not None):
+            _ic   = _fdiag_cur.get("score_vs_fwd72")
+            _sa   = _fdiag_cur.get("sign_acc")
+            _sarc = _fdiag_cur.get("sign_acc_rc")
+            _dnull = _fdiag_cur.get("drift_null")
+            _nsg  = _fdiag_cur.get("n_sign", 0)
+            _ic_t = f"{_ic:+.2f}" if _ic is not None else "n/a"
+            _sa_t = f"{_sa:.0f}%" if _sa is not None else "n/a"
+            _sarc_t = f"{_sarc:.0f}%" if _sarc is not None else "n/a"
+            _dn_t = f"{_dnull:.0f}%" if _dnull is not None else "n/a"
+            # Colour the re-centered sign acc by whether it BEATS the drift null —
+            # that's the bar for claiming real directional skill, not 50%.
+            _rc_col = ("#8b949e" if (_sarc is None or _dnull is None)
+                       else "#3fb950" if _sarc > _dnull
+                       else "#f85149")
+            st.markdown(
+                f'<div style="background:#161b22; border:1px solid #30363d; '
+                f'border-radius:10px; padding:14px 20px; font-size:12.5px; color:#c9d1d9; line-height:1.6;">'
+                f'<b>No LONG/SHORT signals to win/loss-grade yet</b> — the current engine has been '
+                f'inside the ±25 HOLD dead-zone, so the win/loss card is empty. But the score is still '
+                f'gradeable on {_nsg} matured ticks:<br>'
+                f'• <b>Forward IC</b> (rank skill, score→+72h move): <b>{_ic_t}</b> '
+                f'<span style="color:#6e7681;">— ≥0.15 real edge · 0.05–0.15 marginal · &lt;0.05 coincident · offset-invariant</span><br>'
+                f'• <b>Sign accuracy</b>, raw score: <b>{_sa_t}</b> → <b>re-centered</b> '
+                f'<span style="color:{_rc_col}; font-weight:700;">{_sarc_t}</span> '
+                f'<span style="color:#6e7681;">vs drift null {_dn_t} '
+                f'(must beat the null for real skill; the jump from raw⇒re-centered = how much is just a persistent lean)</span><br>'
+                f'<span style="color:#8b949e; font-size:11px;">⚠ 5-min ticks over a few days are heavily '
+                f'autocorrelated (≈one independent episode) — treat as directional, not a verdict. A '
+                f'<i>shadow</i> de-biased score (score_recentered) is now being logged so this can be '
+                f'skill-tested across regimes before any live threshold change. The win/loss card fills '
+                f'once the score crosses ±25 across several independent episodes.</span>'
+                f'</div>',
+                unsafe_allow_html=True)
+        else:
+            st.markdown('<div style="background:#161b22; border:1px solid #30363d; '
+                        'border-radius:10px; padding:16px 22px; color:#8b949e; font-size:13px;">'
+                        'Scorecard builds once signals resolve (≥72h after logging).</div>',
+                        unsafe_allow_html=True)
     else:
         _vcode = _M.get("verdict_code", "inconclusive")
         _vcol  = {"edge": "#3fb950", "negative": "#f85149",
@@ -10832,6 +11470,34 @@ with st.expander(f"📈 72h Bias Accuracy", expanded=False):
     st.markdown(
         f"<div style='font-size:10px; color:#6e7681; padding:2px 4px 0;'>"
         f"{'  •  '.join(_diag_parts)}</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Freshness stamp ─────────────────────────────────────────────
+    # A backgrounded/discarded browser tab silently stops auto-refreshing, so
+    # the chart freezes at its last render — which looks exactly like a logging
+    # gap on the right edge. Stamp the render time so a frozen page is obvious
+    # (the clock here lags your real time), and flag if the newest row is truly
+    # old. Logging itself runs in the scheduled task regardless of this page.
+    _SGT2     = _tz(offset=__import__("datetime").timedelta(hours=8))
+    _now_sgt  = _dt.now(_SGT2)
+    _fresh_txt = (f"⏱ chart rendered {_now_sgt:%H:%M:%S SGT} — if this is behind "
+                  f"your clock, the tab is frozen: click 🔄 Refresh Data (sidebar) "
+                  f"or press R")
+    _fresh_col = "#6e7681"
+    if _hist_n >= 1:
+        try:
+            _age = (_now_sgt.replace(tzinfo=None) - _last.replace(tzinfo=None)).total_seconds() / 60
+            if _age > 15:
+                _fresh_txt = (f"⚠ newest logged row is {_age:.0f} min old "
+                              f"(chart rendered {_now_sgt:%H:%M:%S SGT}). If this keeps "
+                              f"growing, logging may be stalled — run check_logging.bat")
+                _fresh_col = "#d29922"
+        except Exception:
+            pass
+    st.markdown(
+        f"<div style='font-size:10px; color:{_fresh_col}; padding:0 4px 2px;'>"
+        f"{_fresh_txt}</div>",
         unsafe_allow_html=True,
     )
 

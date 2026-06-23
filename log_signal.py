@@ -21,15 +21,47 @@ import urllib.parse
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+# Windows consoles default to cp1252, which can't encode the ✓/… chars in our
+# log prints — that raised UnicodeEncodeError mid-run (before the row insert),
+# silently killing local logging. Force UTF-8 (replace on failure) so prints
+# never crash the logger. No-op on GitHub Actions (already UTF-8).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 
 SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY") or ""
 TABLE        = "signal_log"
 OUTCOME_HRS  = 72.0
 
+# Local fallback: when run on this machine (not GitHub Actions) the env vars
+# aren't set, so read them from .streamlit/secrets.toml next to this file.
+# Keeps creds in ONE place — no duplicating the service key into a launcher.
+if not (SUPABASE_URL and SUPABASE_KEY):
+    _secrets = Path(__file__).resolve().parent / ".streamlit" / "secrets.toml"
+    if _secrets.exists():
+        for _ln in _secrets.read_text(encoding="utf-8").splitlines():
+            _ln = _ln.strip()
+            if _ln.startswith("SUPABASE_URL") and not SUPABASE_URL:
+                SUPABASE_URL = _ln.split("=", 1)[1].strip().strip('"').strip("'").rstrip("/")
+            elif _ln.startswith("SUPABASE_KEY") and not SUPABASE_KEY:
+                SUPABASE_KEY = _ln.split("=", 1)[1].strip().strip('"').strip("'")
+
 if not (SUPABASE_URL and SUPABASE_KEY):
     print("ERROR: SUPABASE_URL or SUPABASE_KEY env var missing")
     sys.exit(1)
+
+# Make the resolved creds visible to the app module's Supabase helpers. They
+# read st.secrets -> os.environ; on GitHub Actions these are real env vars, but
+# locally they came from secrets.toml into the vars above, so without this the
+# app module's _supa_available() is False and _recenter_offset() /
+# _slew_limit_score() silently no-op (offset 0.0, no slew limiting). setdefault
+# so a real env var is never clobbered.
+os.environ.setdefault("SUPABASE_URL", SUPABASE_URL)
+os.environ.setdefault("SUPABASE_KEY", SUPABASE_KEY)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -234,9 +266,33 @@ price    = float(result.get("price") or 0)
 bias_72h = result.get("bias_72h") or {}
 score    = float(bias_72h.get("score") or 0)
 label    = str(bias_72h.get("label") or "N/A")
+# Anti-teleport on the charted series: clamp this tick's change vs the last
+# durable Supabase row (shared limiter so cron + local app stay identical).
+# This is the authoritative server-side writer, so it's where the slew limit
+# matters most. Best-effort — returns score unchanged if the read fails.
+_slew = getattr(mod, "_slew_limit_score", None)
+if _slew is not None:
+    _raw_score = score
+    score = float(_slew(score))
+    if abs(score - _raw_score) >= 0.05:
+        print(f"  · slew-limited score {_raw_score:+.1f} → {score:+.1f}")
 direction = "LONG" if score >= 25 else ("SHORT" if score <= -25 else "HOLD")
 
-print(f"  price=${price:,.2f}  score={score:+.1f}  label={label}  direction={direction}")
+# Shadow re-centered score — de-biases the persistent ~-8 offset for auditing.
+# Shared helper so cron + local app produce an identical series. Does NOT affect
+# `direction` above (live call stays on the raw score). Best-effort: passthrough
+# (offset 0) if the helper or its Supabase read fails.
+_recenter = getattr(mod, "_recenter_offset", None)
+_rc_off = 0.0
+if _recenter is not None:
+    try:
+        _rc_off = float(_recenter())
+    except Exception:
+        _rc_off = 0.0
+score_recentered = round(score - _rc_off, 1)
+
+print(f"  price=${price:,.2f}  score={score:+.1f}  label={label}  direction={direction}"
+      f"  score_rc={score_recentered:+.1f} (offset {_rc_off:+.1f})")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -268,17 +324,28 @@ row = {
     "score_24h":      _rnd(bias_24h.get("score"), 1),
     # 2-signal audit baseline (EMA Structure + OI Funding) on the same scale.
     "score_baseline": _rnd(bias_72h.get("score_baseline"), 1),
+    # Shadow de-biased score (audit 2026-06-23) — see _recenter_offset.
+    "score_recentered": score_recentered,
+    "recenter_offset":  round(_rc_off, 1),
 }
 inserted = _supa("POST", f"/{TABLE}", body=row)
 if inserted is None:
-    # Schema lag (e.g. score_baseline migration not run yet) → 4xx on the
-    # extended row. Retry with the original core fields so no tick is lost.
-    core_fields = ["ts", "score", "label", "direction",
-                   "entry_price", "exit_price", "pct_move", "correct"]
-    inserted = _supa("POST", f"/{TABLE}", body={k: row[k] for k in core_fields})
+    # Schema lag → 4xx on the extended row. Drop ONLY the newest columns first
+    # (score_recentered/recenter_offset migration not run yet) so we don't also
+    # lose the Phase-B fields that DO exist. Core-fields is the last-resort net.
+    _row2 = {k: v for k, v in row.items()
+             if k not in ("score_recentered", "recenter_offset")}
+    inserted = _supa("POST", f"/{TABLE}", body=_row2)
     if inserted:
-        print("  ⚠ extended insert failed — core-fields fallback succeeded "
-              "(run supabase_migrations.sql to add new columns)")
+        print("  ⚠ shadow-column insert failed — logged without "
+              "score_recentered/recenter_offset (run supabase_migrations.sql)")
+    else:
+        core_fields = ["ts", "score", "label", "direction",
+                       "entry_price", "exit_price", "pct_move", "correct"]
+        inserted = _supa("POST", f"/{TABLE}", body={k: row[k] for k in core_fields})
+        if inserted:
+            print("  ⚠ extended insert failed — core-fields fallback succeeded "
+                  "(run supabase_migrations.sql to add new columns)")
 if inserted:
     print(f"  ✓ logged signal id={inserted[0].get('id') if isinstance(inserted, list) else '?'}")
 else:

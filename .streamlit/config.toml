@@ -1,0 +1,12 @@
+[server]
+# Always-on background dashboard: no browser auto-launch, no dev file-watcher.
+headless = true
+runOnSave = false
+fileWatcherType = "none"   # kills the watchdog threads that scan the project dir
+port = 8501
+
+[browser]
+gatherUsageStats = false   # no telemetry phone-home
+
+[client]
+toolbarMode = "minimal"
